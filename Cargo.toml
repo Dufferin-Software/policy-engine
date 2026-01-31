@@ -1,0 +1,43 @@
+[package]
+name = "policy_engine"
+version = "0.1.0"
+edition = "2021"
+description = "XDP/TC policy-based packet processing engine with tail call dispatcher"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+libbpf-rs = "0.24"
+libbpf-sys = "1.0"
+libc = "0.2"
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.10"
+nix = { version = "0.27", features = ["net", "ioctl"] }
+plain = "0.2"
+ipnetwork = "0.20"
+prettytable-rs = "0.10"
+chrono = "0.4"
+ctrlc = "3.4"
+
+# GraphQL server/client dependencies
+tokio = { version = "1", features = ["full"] }
+async-graphql = { version = "7", features = ["log"] }
+async-graphql-actix-web = "7"
+actix-web = "4"
+actix-rt = "2"
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+
+[build-dependencies]
+libbpf-cargo = "0.24"
+
+[[bin]]
+name = "policy-engine"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "policy-client"
+path = "src/bin/client.rs"
