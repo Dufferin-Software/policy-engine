@@ -1,26 +1,31 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
+
 //! Library module for policy engine
 //!
 //! The library is organized into logical submodules:
 //! - `server` - Server-only code (BPF management, GraphQL schema, HTTP server)
-//! - `client` - Client-only code (GraphQL HTTP client)  
 //! - `types` - Shared BPF and core types
-//! - `shared_types` - Shared GraphQL types for client/server serialization
 //! - `output` - Output formatting utilities
+//! - `traits` - Trait definitions for testability (BpfOperations, NetworkOperations)
 
 // Shared types and utilities (used by both client and server)
-pub mod types;
-pub mod shared_types;
+pub mod config;
 pub mod output;
+pub mod paths;
+pub mod traits;
+pub mod types;
 
 // Server module (only use in server binary)
 // Contains BpfManager, GraphQL schema, and HTTP server
 pub mod server;
 
-// Client module (only use in client binary)
-// Contains GraphQL HTTP client
-pub mod client;
+// Shared types used by both server logic and BPF manager
+pub mod shared_types {
+    pub use crate::server::graphql::InterfaceAttachment;
+}
 
 // Re-exports for convenience
+pub use paths::*;
+pub use traits::*;
 pub use types::*;
-pub use shared_types::*;
-

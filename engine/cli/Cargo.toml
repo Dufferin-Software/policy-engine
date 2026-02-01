@@ -1,0 +1,20 @@
+[package]
+name = "policy-client"
+version = "0.1.0"
+edition = "2021"
+description = "CLI client for the policy engine"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+policy-engine-dev = { path = "../client-lib" }
+clap = { version = "4.4", features = ["derive"] }
+prettytable-rs = "0.10"
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[[bin]]
+name = "policy-client"
+path = "src/main.rs"

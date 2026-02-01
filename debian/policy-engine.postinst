@@ -1,0 +1,10 @@
+#!/bin/bash
+set -e
+
+#DEBHELPER#
+
+# Restart the service so the new BPF programs are loaded and any previously
+# attached XDP programs on interfaces are replaced via restore_from_store.
+if [ "$1" = "configure" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl restart policy-engine.service || true
+fi

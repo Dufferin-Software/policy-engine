@@ -1,0 +1,50 @@
+[Unit]
+Description=Policy Node Agent
+Documentation=https://github.com/dufferinsw/policy_engine
+After=network.target policy-engine.service
+Wants=policy-engine.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/policy-node-agent --config /etc/policy-node-agent/config.toml
+Restart=on-failure
+RestartSec=10
+DynamicUser=yes
+SupplementaryGroups=tss
+Environment=RUST_LOG=info
+# Silence the libtss2 TCTI stderr noise; Rust-side errors are still logged.
+Environment=TSS2_LOG=all+NONE
+RuntimeDirectory=policy-node-agent
+StateDirectory=policy-node-agent
+ConfigurationDirectory=policy-node-agent
+
+# TPM access (membership of the tss group is granted via SupplementaryGroups
+# above; DeviceAllow is only enforced if a stricter DevicePolicy is set, but
+# we list it explicitly to document intent and survive future hardening).
+DeviceAllow=/dev/tpmrm0 rw
+DeviceAllow=/dev/tpm0 rw
+
+# Capabilities required for BPF program loading and TC/XDP attachment.
+# CAP_DAC_READ_SEARCH lets us read /sys/class/dmi/id/product_uuid, which is
+# mode 0400 root:root — without it, DynamicUser=yes makes the DMI UUID
+# unreadable and the controller-side `dmi_uuid` column stays NULL forever.
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/sys/fs/bpf
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallFilter=@system-service bpf
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,903 @@
+{
+  "__requires": [
+    {
+      "type": "panel",
+      "id": "timeseries",
+      "name": "Time series",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "stat",
+      "name": "Stat",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "table",
+      "name": "Table",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "row",
+      "name": "Row",
+      "version": ""
+    },
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": "1.0.0"
+    },
+    {
+      "type": "datasource",
+      "id": "yesoreyeram-infinity-datasource",
+      "name": "Infinity",
+      "version": "2.0.0"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "name": "Alerts",
+        "enable": true,
+        "iconColor": "red",
+        "datasource": {
+          "type": "yesoreyeram-infinity-datasource"
+        },
+        "target": {
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "/api/v1/alerts/history?format=annotations&since=${__from:date:iso}&until=${__to:date:iso}&limit=500",
+          "url_options": {
+            "method": "GET"
+          },
+          "root_selector": "",
+          "columns": []
+        }
+      }
+    ]
+  },
+  "description": "Controller event + alert pipeline overview (Prometheus) plus REST drill-in (Infinity). Upper section uses the controller's /metrics; lower section queries /api/v1/events* and /api/v1/alerts/history through the Infinity datasource.",
+  "editable": true,
+  "graphTooltip": 1,
+  "id": null,
+  "schemaVersion": 39,
+  "tags": [
+    "dufferin",
+    "controller",
+    "events",
+    "alerts"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "tenant",
+        "label": "Tenant",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus"
+        },
+        "query": {
+          "query": "label_values(event_ingest_received_total, tenant)",
+          "refId": "tenant"
+        },
+        "current": {
+          "selected": false,
+          "text": "default",
+          "value": "default"
+        },
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "action",
+        "label": "Action",
+        "type": "custom",
+        "query": "all : ,drop : drop,log : log",
+        "current": {
+          "selected": false,
+          "text": "all",
+          "value": ""
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "all",
+            "value": ""
+          },
+          {
+            "selected": false,
+            "text": "drop",
+            "value": "drop"
+          },
+          {
+            "selected": false,
+            "text": "log",
+            "value": "log"
+          }
+        ]
+      },
+      {
+        "name": "rule_id",
+        "label": "Rule ID (blank = any)",
+        "type": "textbox",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "query": ""
+      },
+      {
+        "name": "src_ip",
+        "label": "Source IP (blank = any)",
+        "type": "textbox",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "query": ""
+      },
+      {
+        "name": "node_id",
+        "label": "Node ID (blank = any)",
+        "type": "textbox",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "query": ""
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "title": "Controller Fleet \u2014 events & alerts",
+  "uid": "duf-controller-events",
+  "panels": [
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Pipeline overview (Prometheus)",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Events received (1m rate)",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(event_ingest_received_total{tenant=\"$tenant\"}[1m]))",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Events persisted (1m rate)",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(event_persist_inserted_total{tenant=\"$tenant\"}[1m]))",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Active alert groups",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(alert_groups_active{tenant=\"$tenant\"})",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Dispatch failures (5m)",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 1,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(alert_dispatch_failed_total{tenant=\"$tenant\"}[5m]))",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Ingest vs persist (events/sec)",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(event_ingest_received_total{tenant=\"$tenant\"}[1m]))",
+          "legendFormat": "received",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(event_persist_inserted_total{tenant=\"$tenant\"}[1m]))",
+          "legendFormat": "persisted",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Dropped + skipped (by reason)",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(event_ingest_dropped_total{tenant=\"$tenant\"}[1m]))",
+          "legendFormat": "dropped/{{reason}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (reason) (rate(event_ingest_skipped_total{tenant=\"$tenant\"}[1m]))",
+          "legendFormat": "skipped/{{reason}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Persist batch duration (avg seconds)",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(event_persist_batch_seconds_sum{tenant=\"$tenant\"}[1m]) / clamp_min(rate(event_persist_batch_seconds_count{tenant=\"$tenant\"}[1m]), 1e-9)",
+          "legendFormat": "avg",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Retention pruned (rows/sec)",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 13,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(event_retention_pruned_total{tenant=\"$tenant\"}[5m]))",
+          "legendFormat": "pruned",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "rps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Alert notifications fired (by kind)",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (kind) (rate(alert_fired_total{tenant=\"$tenant\"}[5m]))",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Dispatched (by provider + result)",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum by (kind, result) (rate(alert_dispatched_total{tenant=\"$tenant\"}[5m]))",
+          "legendFormat": "{{kind}}/{{result}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (kind) (rate(alert_dispatch_retries_total{tenant=\"$tenant\"}[5m]))",
+          "legendFormat": "retries/{{kind}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Silenced notifications (rate)",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(notifications_silenced_total{tenant=\"$tenant\"}[5m]))",
+          "legendFormat": "silenced",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Dispatcher queue depth",
+      "datasource": {
+        "type": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 29,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "sum(alert_dispatcher_queue_depth{tenant=\"$tenant\"})",
+          "legendFormat": "depth",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 200,
+      "type": "row",
+      "title": "REST drill-in (requires Infinity datasource)",
+      "gridPos": {
+        "x": 0,
+        "y": 35,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 201,
+      "type": "timeseries",
+      "title": "Events per minute (filtered)",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "timeseries",
+          "url": "/api/v1/events/aggregate?group_by=minute&format=timeseries&since=${__from:date:iso}&until=${__to:date:iso}&action=${action}&rule_id=${rule_id}&node_id=${node_id}",
+          "url_options": {
+            "method": "GET"
+          },
+          "root_selector": "0.datapoints",
+          "columns": [
+            {
+              "selector": "1",
+              "text": "time",
+              "type": "timestamp_epoch"
+            },
+            {
+              "selector": "0",
+              "text": "count",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 202,
+      "type": "stat",
+      "title": "Events in range (filtered)",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "/api/v1/events/aggregate?group_by=action&since=${__from:date:iso}&until=${__to:date:iso}&action=${action}&rule_id=${rule_id}&node_id=${node_id}",
+          "url_options": {
+            "method": "GET"
+          },
+          "root_selector": "rows",
+          "columns": [
+            {
+              "selector": "0",
+              "text": "action",
+              "type": "string"
+            },
+            {
+              "selector": "1",
+              "text": "count",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "sum"
+          ],
+          "fields": "/^count$/"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 203,
+      "type": "stat",
+      "title": "Drops vs logs (range)",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 44,
+        "w": 18,
+        "h": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "/api/v1/events/aggregate?group_by=action&since=${__from:date:iso}&until=${__to:date:iso}&rule_id=${rule_id}&node_id=${node_id}",
+          "url_options": {
+            "method": "GET"
+          },
+          "root_selector": "rows",
+          "columns": [
+            {
+              "selector": "0",
+              "text": "action",
+              "type": "string"
+            },
+            {
+              "selector": "1",
+              "text": "count",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 210,
+      "type": "table",
+      "title": "Events (newest first)",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 24,
+        "h": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "/api/v1/events?since=${__from:date:iso}&until=${__to:date:iso}&action=${action}&rule_id=${rule_id}&node_id=${node_id}&limit=500",
+          "url_options": {
+            "method": "GET"
+          },
+          "root_selector": "rows",
+          "columns": [
+            {
+              "selector": "0",
+              "text": "id",
+              "type": "string"
+            },
+            {
+              "selector": "1",
+              "text": "timestamp",
+              "type": "timestamp_epoch"
+            },
+            {
+              "selector": "2",
+              "text": "node_id",
+              "type": "string"
+            },
+            {
+              "selector": "3",
+              "text": "rule_id",
+              "type": "string"
+            },
+            {
+              "selector": "4",
+              "text": "action",
+              "type": "string"
+            },
+            {
+              "selector": "5",
+              "text": "direction",
+              "type": "string"
+            },
+            {
+              "selector": "6",
+              "text": "src_ip",
+              "type": "string"
+            },
+            {
+              "selector": "7",
+              "text": "dst_ip",
+              "type": "string"
+            },
+            {
+              "selector": "8",
+              "text": "sport",
+              "type": "number"
+            },
+            {
+              "selector": "9",
+              "text": "dport",
+              "type": "number"
+            },
+            {
+              "selector": "10",
+              "text": "proto",
+              "type": "number"
+            },
+            {
+              "selector": "11",
+              "text": "pkt_len",
+              "type": "number"
+            },
+            {
+              "selector": "12",
+              "text": "sni",
+              "type": "string"
+            }
+          ],
+          "filters": [
+            {
+              "field": "src_ip",
+              "operator": "contains",
+              "value": [
+                "${src_ip}"
+              ]
+            }
+          ]
+        }
+      ],
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 211,
+      "type": "table",
+      "title": "Recent alert history (range)",
+      "datasource": {
+        "type": "yesoreyeram-infinity-datasource"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 62,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "type": "json",
+          "source": "url",
+          "format": "table",
+          "url": "/api/v1/alerts/history?since=${__from:date:iso}&until=${__to:date:iso}&rule_id=${rule_id}&limit=200",
+          "url_options": {
+            "method": "GET"
+          },
+          "root_selector": "rows",
+          "columns": [
+            {
+              "selector": "0",
+              "text": "id",
+              "type": "string"
+            },
+            {
+              "selector": "1",
+              "text": "fired_at",
+              "type": "timestamp_epoch"
+            },
+            {
+              "selector": "2",
+              "text": "resolved_at",
+              "type": "timestamp_epoch"
+            },
+            {
+              "selector": "3",
+              "text": "rule_id",
+              "type": "string"
+            },
+            {
+              "selector": "4",
+              "text": "rule_name",
+              "type": "string"
+            },
+            {
+              "selector": "5",
+              "text": "severity",
+              "type": "string"
+            },
+            {
+              "selector": "6",
+              "text": "group_key",
+              "type": "string"
+            },
+            {
+              "selector": "7",
+              "text": "event_count",
+              "type": "number"
+            },
+            {
+              "selector": "8",
+              "text": "silenced",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "options": {
+        "showHeader": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+[package]
+name = "policy-controller-proto"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "GPL-2.0-or-later"
+description = "Protobuf/gRPC definitions for the policy-controller ↔ policy-node-agent protocol"
+
+[dependencies]
+prost = "0.13"
+tonic = { version = "0.12", features = ["transport"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+[build-dependencies]
+# Requires the `protoc` binary to be installed (e.g. apt install protobuf-compiler)
+tonic-build = "0.12"

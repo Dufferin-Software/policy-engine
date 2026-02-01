@@ -1,0 +1,21 @@
+Source: policy-engine-web
+Section: net
+Priority: optional
+Maintainer: Dufferin Software <support@dufferinsw.com>
+Build-Depends: debhelper-compat (= 13),
+               nodejs (>= 18),
+               npm
+Standards-Version: 4.6.2
+Homepage: https://github.com/dufferinsw/policy_engine
+Rules-Requires-Root: no
+
+Package: policy-engine-web
+Architecture: all
+Depends: ${misc:Depends}, policy-engine (>= 0.1.0)
+Description: Web UI for the XDP policy engine
+ A React/TypeScript web interface for managing the XDP policy-based
+ packet processing engine. Provides a dashboard for monitoring,
+ interface management, policy rules editing, and statistics.
+ .
+ Static web assets are installed to /usr/share/policy-engine-web and
+ served directly by the policy-engine backend.

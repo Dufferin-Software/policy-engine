@@ -1,0 +1,12 @@
+[Unit]
+Description=Update Suricata ruleset
+Documentation=https://suricata-update.readthedocs.io
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/bin/suricata-update
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/suricata-update
+ExecStartPost=/bin/sh -c 'systemctl is-active --quiet suricata && systemctl kill -s USR2 suricata.service || true'
+User=root

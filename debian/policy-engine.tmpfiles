@@ -1,0 +1,3 @@
+# Create the BPF pin directory on every boot.
+# bpffs (/sys/fs/bpf) is tmpfs-backed and cleared on reboot.
+d /sys/fs/bpf/policy_engine 0700 policy-engine policy-engine -

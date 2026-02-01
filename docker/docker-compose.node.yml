@@ -1,0 +1,44 @@
+services:
+  policy-engine:
+    image: policy-engine:0.1.0
+    build:
+      context: ../..
+      dockerfile: policy-engine/docker/policy-engine/Dockerfile
+      args:
+        DEB: policy-engine_0.1.0_amd64.deb
+    network_mode: host
+    cap_add:
+      - CAP_BPF
+      - CAP_NET_ADMIN
+      - CAP_SYS_ADMIN
+    volumes:
+      # bpffs: pinned maps and programs must be visible to the host and survive restarts
+      - /sys/fs/bpf:/sys/fs/bpf
+      # Config is host-provided; never baked into the image
+      - /etc/policy-engine:/etc/policy-engine:ro
+      - /var/lib/policy-engine:/var/lib/policy-engine
+      - /var/log/policy-engine:/var/log/policy-engine
+    environment:
+      POLICY_ENGINE_BIND_ADDR: "0.0.0.0"
+      POLICY_ENGINE_BIND_PORT: "8080"
+      RUST_LOG: "info"
+      # Set POLICY_ENGINE_API_TOKEN via a .env file or Docker secret; do not hardcode here
+    restart: unless-stopped
+
+  policy-node-agent:
+    image: policy-node-agent:0.1.0
+    build:
+      context: ../..
+      dockerfile: policy-engine/docker/policy-node-agent/Dockerfile
+      args:
+        DEB: policy-node-agent_0.1.0_amd64.deb
+    # host network so the agent can reach policy-engine on localhost:8080
+    network_mode: host
+    depends_on:
+      - policy-engine
+    volumes:
+      # Identity key, mTLS cert, CA cert, and config.toml all come from the host
+      - /etc/policy-node-agent:/etc/policy-node-agent:ro
+    environment:
+      RUST_LOG: "info"
+    restart: unless-stopped

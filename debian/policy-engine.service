@@ -1,0 +1,44 @@
+[Unit]
+Description=XDP Policy Engine Server
+Documentation=https://github.com/dufferinsw/policy_engine
+After=network.target
+# Ensure bpffs is mounted before we start; the pin directory is created by
+# tmpfiles.d (policy-engine.conf) which runs as part of sysinit.target.
+RequiresMountsFor=/sys/fs/bpf
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/policy-engine --host ${POLICY_ENGINE_BIND_ADDR} --port ${POLICY_ENGINE_BIND_PORT}
+Restart=on-failure
+RestartSec=5
+User=policy-engine
+Group=policy-engine
+# BPF operations require these capabilities for a non-root user.
+# CAP_DAC_READ_SEARCH lets us traverse /sys/fs/bpf (mounted mode=700 root:root
+# by systemd's sys-fs-bpf.mount) to reach our 0700 policy-engine-owned subdir.
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+Environment=POLICY_ENGINE_BIND_ADDR=0.0.0.0
+Environment=POLICY_ENGINE_BIND_PORT=8080
+Environment=RUST_LOG=info
+# Two runtime dirs because the codebase has historically used both spellings:
+#   /run/policy_engine  — bpf_manager mode/attachment metadata
+#   /run/policy-engine  — suricata eve.sock, flow_export_config.json
+RuntimeDirectory=policy_engine policy-engine
+StateDirectory=policy-engine
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=-/etc/suricata -/etc/systemd/system/suricata.service.d /etc/default /sys/fs/bpf
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=false
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

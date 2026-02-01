@@ -1,0 +1,40 @@
+Engine:
+
+Engine Client:
+
+Controller/UI:
+
+* Clear stats support, clear all and clear per interface.
+
+* We should add a troubleshooting tab, the initial functionality should be to check db rule
+state vs agent rule state and we should alert if there are discrepencies. Taking this further
+we should have an option to restore from either DB version or agent version, this should
+push the rules to the node AND reconcile all rule versions (DB should match agent). The second functionality should be a function to export all rules from the DB into json format, offer
+the ability to export per node, per interface, or all.
+
+Agent:
+
+Needs cpu affinity support.
+
+Security / PKI:
+
+* CSR-based mTLS issuance ("Phase 3" in security/ca.rs, node_registry/mod.rs,
+  agent/enrollment/mod.rs; also referenced as "future phase" in docs/tpm.md).
+  Today the controller mints both key and cert on approval and ships them to
+  the agent. The agent already builds and signs a CSR during enrollment with an
+  ephemeral key — that CSR is currently discarded. Pending work: have the agent
+  generate the CSR key inside the TPM (so the on-the-wire mTLS key never leaves
+  hardware) and have the controller sign that CSR instead of generating its own
+  keypair. Touches enrollment proto, agent identity backends, controller CA,
+  and cert-rotation logic.
+
+* TLS-layer cert revocation enforcement (extends "Phase 4"). Serial capture +
+  the connect-time revocation check landed alongside this TODO (mgmt Hello
+  rejects when the stored serial is in revoked_certs). Still missing: extract
+  the serial from the *presented* peer cert at the TLS layer (tonic
+  TlsConnectInfo + an x509 parse of peer_certs) and reject there. Without this,
+  a stale cert presented after a row was tampered back to Active, or a cert
+  whose row has been re-issued with a new serial, would not be caught by the
+  serial check alone — only by the status check.
+
+Controller:

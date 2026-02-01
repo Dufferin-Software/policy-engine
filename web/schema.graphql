@@ -1,0 +1,686 @@
+type AggregateBucketOutput {
+	key: String!
+	count: Int!
+}
+
+type AlertHistoryConnection {
+	items: [AlertHistoryOutput!]!
+	"""
+	`id` of the oldest item in this page; pass as `cursor` for the next
+	page (returns rows with smaller IDs). `None` when no more rows.
+	"""
+	nextCursor: String
+}
+
+input AlertHistoryFilterInput {
+	ruleId: ID
+	since: DateTime
+	until: DateTime
+}
+
+type AlertHistoryOutput {
+	id: ID!
+	ruleId: ID!
+	groupKey: String!
+	firedAt: DateTime!
+	resolvedAt: DateTime
+	eventCount: Int!
+	sampleEventIds: [ID!]!
+	silenced: Boolean!
+}
+
+type AlertRuleOutput {
+	id: ID!
+	name: String!
+	enabled: Boolean!
+	matchJson: String!
+	groupBy: [String!]!
+	thresholdCount: Int
+	thresholdWindowS: Int
+	groupWaitS: Int!
+	groupIntervalS: Int!
+	repeatIntervalS: Int!
+	resolveAfterS: Int!
+	severity: String!
+	receiverIds: [ID!]!
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+type AuditEntryOutput {
+	id: Int!
+	ts: DateTime!
+	operator: String
+	action: String!
+	nodeId: String
+	detail: String
+}
+
+type ControlledNodeOutput {
+	id: ID!
+	label: String
+	hostname: String
+	dmiUuid: String
+	status: String!
+	"""
+	Hex-encoded serial of the currently-issued mTLS client cert, or None if
+	no cert has been issued yet (e.g. node is still pending).
+	"""
+	certSerial: String
+	certExpiry: DateTime
+	lastSeen: DateTime
+	enrolledAt: DateTime
+	"""
+	Timestamp of the most recent successful `RenewClientCert`. `None` until
+	the first renewal; allows the UI to flag nodes whose certs haven't
+	been refreshed in a long time even though they're still within TTL.
+	"""
+	lastRenewedAt: DateTime
+	tpmBacked: Boolean!
+	agentVersion: String
+	osPrettyName: String
+	kernelVersion: String
+	dmiSysVendor: String
+	dmiProductName: String
+	tenantId: String!
+	"""
+	Operator-configured stop behavior: "clear-state" or "preserve-state". None = controller default.
+	"""
+	stopBehavior: String
+	"""
+	JSON-encoded `Capabilities` from the most recent AgentHello. Raw
+	string (not a typed sub-object) so adding fields in the proto
+	doesn't churn the GraphQL schema. `"{}"` until the agent reconnects
+	after step-6 was deployed.
+	"""
+	capabilities: String!
+}
+
+input CreateAlertRuleInput {
+	name: String!
+	enabled: Boolean! = true
+	"""
+	MatchSpec wire JSON; validated server-side via `MatchSpec::compile_json`.
+	"""
+	matchJson: String!
+	groupBy: [String!]!
+	thresholdCount: Int
+	thresholdWindowS: Int
+	groupWaitS: Int! = 30
+	groupIntervalS: Int! = 300
+	repeatIntervalS: Int! = 14400
+	resolveAfterS: Int! = 1500
+	"""
+	One of `info`, `warning`, `critical`.
+	"""
+	severity: String!
+	receiverIds: [ID!]!
+}
+
+input CreateReceiverInput {
+	name: String!
+	"""
+	One of `webhook`, `email`, `alertmanager`.
+	"""
+	kind: String!
+	"""
+	Provider-specific config JSON (e.g. `{"url": "https://..."}` for
+	webhook).
+	"""
+	configJson: String!
+}
+
+input CreateRuleInput {
+	nodeId: String!
+	interfaceName: String!
+	"""
+	"ingress" or "egress"
+	"""
+	direction: String!
+	srcCidr: String
+	dstCidr: String
+	srcPort: Int
+	dstPort: Int
+	"""
+	"tcp", "udp", "icmp", "icmpv6", "any"
+	"""
+	protocol: String
+	sniPattern: String
+	quicVersion: String
+	srcMac: String
+	dstMac: String
+	"""
+	JSON array of actions: [{"action":"drop","priority":0}]
+	"""
+	actionsJson: String!
+	"""
+	Remove rule after this many seconds (TTL lifecycle). Mutually exclusive with schedule_json.
+	"""
+	expiresAfterSecs: Int
+	"""
+	JSON-serialized schedule: {"timezone":"UTC","windows":[{"start":{"dayOfWeek":1,"hour":9,"minute":0},"end":{"dayOfWeek":1,"hour":17,"minute":0}}]}
+	"""
+	scheduleJson: String
+}
+
+input CreateRuleMultiNodeInput {
+	nodeIds: [String!]!
+	interfaceName: String!
+	"""
+	"ingress" or "egress"
+	"""
+	direction: String!
+	srcCidr: String
+	dstCidr: String
+	srcPort: Int
+	dstPort: Int
+	"""
+	"tcp", "udp", "icmp", "icmpv6", "any"
+	"""
+	protocol: String
+	sniPattern: String
+	quicVersion: String
+	srcMac: String
+	dstMac: String
+	"""
+	JSON array of actions: [{"action":"drop","priority":0}]
+	"""
+	actionsJson: String!
+	expiresAfterSecs: Int
+	scheduleJson: String
+}
+
+input CreateSilenceInput {
+	matcherJson: String!
+	startsAt: DateTime!
+	endsAt: DateTime!
+	createdBy: String
+	comment: String
+}
+
+"""
+Implement the DateTime<Utc> scalar
+
+The input/output is a string in RFC3339 format.
+"""
+scalar DateTime
+
+type EnrollmentTokenInfo {
+	tokenId: ID!
+	createdAt: DateTime!
+	createdBy: String
+	expiresAt: DateTime!
+	usesRemaining: Int!
+	cidrScope: String
+	fleetLabel: String
+	revokedAt: DateTime
+}
+
+enum EventAction {
+	DROP
+	LOG
+}
+
+type EventConnection {
+	items: [EventOutput!]!
+	"""
+	`id` of the oldest item in this page; pass as `cursor` to fetch the
+	next page (returns rows with smaller IDs). `None` when no more rows.
+	"""
+	nextCursor: String
+}
+
+input EventFilterInput {
+	"""
+	Earliest event time to include (inclusive).
+	"""
+	since: DateTime
+	"""
+	Latest event time (exclusive).
+	"""
+	until: DateTime
+	action: EventAction
+	ruleId: String
+	nodeId: String
+	sport: Int
+	dport: Int
+	"""
+	Numeric IP protocol (6 = tcp, 17 = udp).
+	"""
+	proto: Int
+	"""
+	Exact-match source IP (dotted IPv4 or IPv6 textual form).
+	"""
+	srcIp: String
+	"""
+	Exact-match destination IP (dotted IPv4 or IPv6 textual form).
+	"""
+	dstIp: String
+	"""
+	SQL LIKE pattern on the SNI column.
+	"""
+	sniLike: String
+}
+
+enum EventGroupBy {
+	RULE_ID
+	ACTION
+	NODE_ID
+	SRC_IP
+	DST_IP
+	MINUTE
+	HOUR
+}
+
+type EventOutput {
+	"""
+	Opaque numeric ID — also the pagination cursor.
+	"""
+	id: String!
+	timestamp: DateTime!
+	nodeId: String!
+	ruleId: String!
+	action: String!
+	verdict: String!
+	direction: String!
+	ifindex: Int!
+	proto: Int!
+	srcIp: String!
+	dstIp: String!
+	sport: Int!
+	dport: Int!
+	pktLen: Int!
+	flags: Int
+	sni: String
+}
+
+"""
+Result of minting a new bootstrap token. `bundle` is shown to the operator
+exactly once and must be distributed to target hosts; the raw token secret
+cannot be retrieved afterwards.
+"""
+type IssuedEnrollmentToken {
+	tokenId: ID!
+	bundle: String!
+	expiresAt: DateTime!
+	usesRemaining: Int!
+}
+
+type MutationRoot {
+	"""
+	Approve a pending enrollment. Optionally sets a human-readable label.
+	"""
+	approveEnrollment(nodeId: ID!, label: String): ControlledNodeOutput!
+	"""
+	Reject a pending enrollment.
+	"""
+	rejectEnrollment(nodeId: ID!, reason: String): OperationResult!
+	"""
+	Decommission an active node (revokes cert, blocks reconnect).
+	"""
+	decommissionNode(nodeId: ID!): OperationResult!
+	"""
+	Remove a decommissioned node from the registry entirely.
+	"""
+	removeNode(nodeId: ID!): OperationResult!
+	"""
+	Set a human-readable label on a node.
+	"""
+	labelNode(nodeId: ID!, label: String!): OperationResult!
+	"""
+	Mint a new ZTP bootstrap token. The returned `bundle` is shown exactly
+	once and must be distributed to nodes at provisioning time. The token
+	secret cannot be retrieved afterwards — only revoked.
+	
+	`enrollmentUrl` and `controllerUrl` are embedded in the bundle so the
+	agent does not need any pre-existing config beyond receiving the bundle.
+	"""
+	createEnrollmentToken(enrollmentUrl: String!, controllerUrl: String!, ttlSeconds: Int!, maxUses: Int!, cidrScope: String, fleetLabel: String): IssuedEnrollmentToken!
+	"""
+	Revoke a previously-issued enrollment token. Returns true if the token
+	existed and was not already revoked.
+	"""
+	revokeEnrollmentToken(tokenId: ID!): OperationResult!
+	"""
+	Set the stop behavior for a node ("clear-state" or "preserve-state").
+	Pass null to clear the override and use the node's local default.
+	"""
+	setNodeStopBehavior(nodeId: ID!, behavior: String): OperationResult!
+	"""
+	Create the same rule on multiple nodes at once. Each node gets its own
+	unique rule ID. Returns the list of all created rules.
+	"""
+	createRulesMultiNode(input: CreateRuleMultiNodeInput!): [RuleOutput!]!
+	"""
+	Create a rule scoped to a specific (node, interface, direction).
+	"""
+	createRule(input: CreateRuleInput!): RuleOutput!
+	"""
+	Delete a rule by ID.
+	"""
+	deleteRule(ruleId: ID!): OperationResult!
+	"""
+	Tag an interface on a node (e.g., "WAN", "LAN").
+	"""
+	tagInterface(nodeId: ID!, interfaceName: String!, tag: String!): OperationResult!
+	"""
+	Remove a tag from an interface.
+	"""
+	untagInterface(nodeId: ID!, interfaceName: String!): OperationResult!
+	"""
+	Push the full desired config to a single online node.
+	"""
+	pushConfig(nodeId: ID!): OperationResult!
+	"""
+	Attach a BPF program to an interface on a node.
+	"""
+	attachProgram(nodeId: ID!, interfaceName: String!, direction: String!, mode: String): OperationResult!
+	"""
+	Enable or disable XDP FIB forwarding on a single ingress interface of a node.
+	Enabling bypasses the kernel stack for transit packets, which also bypasses
+	any TC egress filtering on the outbound interface.
+	"""
+	setFibForwarding(nodeId: ID!, interfaceName: String!, enabled: Boolean!): OperationResult!
+	"""
+	Record a client-initiated audit entry (e.g. events exported).
+	"""
+	logAuditEntry(nodeId: ID, action: String!, detail: String): OperationResult!
+	"""
+	Detach a BPF program from an interface on a node.
+	"""
+	detachProgram(nodeId: ID!, interfaceName: String!, direction: String!): OperationResult!
+	"""
+	Set the default action for unmatched packets on a specific interface+direction of a node.
+	`direction` must be "ingress" or "egress". `action` must be "pass" or "drop".
+	"""
+	setInterfaceDefaultAction(nodeId: ID!, interfaceName: String!, direction: String!, action: String!): OperationResult!
+	"""
+	Trigger an immediate metrics push from the specified node.
+	
+	The controller sends a `MetricsQuery` message to the connected agent,
+	which wakes its metrics forwarder and pushes a fresh `MetricsUpdate`
+	without waiting for the next scheduled interval.  Returns an error if
+	the node is not currently connected.
+	"""
+	refreshNodeMetrics(nodeId: ID!): OperationResult!
+	createAlertRule(input: CreateAlertRuleInput!): AlertRuleOutput!
+	updateAlertRule(id: ID!, input: CreateAlertRuleInput!): AlertRuleOutput!
+	deleteAlertRule(id: ID!): Boolean!
+	createReceiver(input: CreateReceiverInput!): ReceiverOutput!
+	updateReceiver(id: ID!, input: CreateReceiverInput!): ReceiverOutput!
+	deleteReceiver(id: ID!): Boolean!
+	createSilence(input: CreateSilenceInput!): SilenceOutput!
+	deleteSilence(id: ID!): Boolean!
+}
+
+"""
+Ethertype traffic breakdown from the node's most-recent Prometheus snapshot.
+"""
+type NodeEthertypeStatOutput {
+	ethertype: Int!
+	name: String!
+	packets: Int!
+}
+
+type NodeInterfaceOutput {
+	nodeId: String!
+	name: String!
+	"""
+	Linux interface index. Matches the `ifindex` reported on flow events,
+	so the UI can join events to the human-readable interface name.
+	"""
+	ifindex: Int!
+	macAddress: String
+	linkState: String!
+	addressesJson: String!
+	tag: String
+	lastReported: DateTime!
+	xdpAttached: Boolean!
+	tcAttached: Boolean!
+	"""
+	True when XDP FIB forwarding is enabled on this interface (ingress only).
+	Forwarded transit traffic bypasses the kernel stack, which also means
+	any TC egress filtering on the outbound interface is NOT applied.
+	"""
+	fibForwarding: Boolean!
+	"""
+	Controller-set default action for unmatched ingress packets ("pass" or "drop").
+	None means no explicit default has been set (engine default is "pass").
+	"""
+	ingressDefaultAction: String
+	"""
+	Controller-set default action for unmatched egress packets ("pass" or "drop").
+	None means no explicit default has been set (engine default is "pass").
+	"""
+	egressDefaultAction: String
+}
+
+"""
+Per-interface traffic statistics read from the node's most-recent Prometheus
+metrics snapshot.
+"""
+type NodeInterfaceStatsOutput {
+	interface: String!
+	direction: String!
+	packets: Int!
+	bytes: Int!
+	txPackets: Int!
+	txBytes: Int!
+	policyMatches: Int!
+	policyDrops: Int!
+	policyPass: Int!
+	policyRedirects: Int!
+	bumPackets: Int!
+	nonIpUnicast: Int!
+	fragments: Int!
+	parseErrors: Int!
+	tailCalls: Int!
+	inspectRedirects: Int!
+	verdictPassPackets: Int!
+	verdictPassBytes: Int!
+	verdictDropPackets: Int!
+	verdictDropBytes: Int!
+	fibForwardedPackets: Int!
+	fibForwardedBytes: Int!
+	fibFallbackPackets: Int!
+}
+
+"""
+Per-rule packet/byte statistics read from the node's most-recent Prometheus
+metrics snapshot.  Values reflect the state at the last scrape interval
+(every 30 s by default).
+"""
+type NodeRuleStatsOutput {
+	ruleId: String!
+	direction: String!
+	packets: Int!
+	bytes: Int!
+}
+
+type OperationResult {
+	success: Boolean!
+	message: String
+}
+
+"""
+In-flight config mutation awaiting agent confirmation.
+"""
+type PendingGenerationOutput {
+	generationId: String!
+	nodeId: String!
+	"""
+	One of: "create_rule", "delete_rule", "attach", "detach", "set_fib_forwarding".
+	"""
+	opKind: String!
+	issuedAt: DateTime!
+}
+
+type QueryRoot {
+	"""
+	Query persisted policy match events (newest first, cursor paginated).
+	"""
+	events(filter: EventFilterInput, limit: Int, cursor: String): EventConnection!
+	"""
+	Aggregate persisted events into time/dimension buckets.
+	"""
+	eventAggregate(filter: EventFilterInput, groupBy: EventGroupBy!, since: DateTime!, until: DateTime!): [AggregateBucketOutput!]!
+	"""
+	All configured alert rules for the current tenant.
+	"""
+	alertRules: [AlertRuleOutput!]!
+	"""
+	All configured notification receivers.
+	"""
+	receivers: [ReceiverOutput!]!
+	"""
+	Notification silences. `active=true` filters to silences in effect
+	right now; `false` or omitted returns everything.
+	"""
+	silences(active: Boolean): [SilenceOutput!]!
+	"""
+	Cursor-paginated alert-fire history, newest first.
+	"""
+	alertHistory(filter: AlertHistoryFilterInput, limit: Int, cursor: String): AlertHistoryConnection!
+	"""
+	List all controlled nodes, optionally filtered by status.
+	"""
+	nodes(status: String): [ControlledNodeOutput!]!
+	"""
+	Get a single node by ID.
+	"""
+	node(id: ID!): ControlledNodeOutput
+	"""
+	Controller-derived URLs used when minting enrollment bundles via the
+	UI. The UI uses these as form defaults; operators can edit them.
+	"""
+	serviceEndpoints: ServiceEndpoints!
+	"""
+	List all ZTP enrollment tokens, newest first. Includes revoked and
+	expired tokens so operators can audit token usage history.
+	"""
+	enrollmentTokens: [EnrollmentTokenInfo!]!
+	"""
+	All pending enrollment requests.
+	"""
+	pendingEnrollments: [ControlledNodeOutput!]!
+	"""
+	List rules for a node, optionally filtered by interface and direction.
+	"""
+	rules(nodeId: ID!, interfaceName: String, direction: String): [RuleOutput!]!
+	"""
+	List all interfaces discovered on a node.
+	"""
+	nodeInterfaces(nodeId: ID!): [NodeInterfaceOutput!]!
+	"""
+	List all interfaces across all nodes (used by fleet rule creator for interface selection).
+	"""
+	allNodeInterfaces: [NodeInterfaceOutput!]!
+	"""
+	Audit log, newest first.
+	"""
+	auditLog(limit: Int, offset: Int): [AuditEntryOutput!]!
+	"""
+	Controller CA certificate in PEM format. Distribute to agents.
+	"""
+	caCertPem: String!
+	"""
+	IDs of currently connected agent nodes.
+	"""
+	onlineNodes: [String!]!
+	"""
+	The in-flight (unacknowledged) config generation for a node, if any.
+	
+	While non-null, further config mutations targeting this node will be
+	rejected with `BLOCKED_PENDING_CONFIRM` until the generation resolves
+	(commit, revert, or watchdog reap).
+	"""
+	pendingGeneration(nodeId: ID!): PendingGenerationOutput
+	"""
+	All currently in-flight config generations (across all nodes).
+	"""
+	pendingGenerations: [PendingGenerationOutput!]!
+	"""
+	Per-rule packet/byte counters from the node's most-recent Prometheus
+	metrics snapshot.  Returns `None` when no metrics have been received
+	for the node yet.  The rule_id must match the controller-assigned ID
+	(the same value returned by `createRule`).
+	"""
+	nodeRuleStats(nodeId: ID!, ruleId: ID!, direction: String!): NodeRuleStatsOutput
+	"""
+	Per-interface traffic counters from the node's most-recent Prometheus
+	metrics snapshot.  Returns `None` when no metrics have been received
+	for the node yet.
+	"""
+	nodeInterfaceStats(nodeId: ID!, interfaceName: String!, direction: String!): NodeInterfaceStatsOutput
+	"""
+	Ethertype traffic breakdown from the node's most-recent Prometheus snapshot.
+	Returns an empty list when no metrics have been received for the node yet.
+	"""
+	nodeEthertypeStats(nodeId: ID!, interfaceName: String!, direction: String!): [NodeEthertypeStatOutput!]!
+}
+
+type ReceiverOutput {
+	id: ID!
+	name: String!
+	kind: String!
+	configJson: String!
+}
+
+type RuleOutput {
+	id: ID!
+	tenantId: String!
+	nodeId: String!
+	interfaceName: String!
+	direction: String!
+	srcCidr: String
+	dstCidr: String
+	srcPort: Int
+	dstPort: Int
+	protocol: String!
+	sniPattern: String
+	quicVersion: String
+	srcMac: String
+	dstMac: String
+	actionsJson: String!
+	createdAt: DateTime!
+	createdBy: String
+	expiresAfterSecs: Int
+	scheduleJson: String
+}
+
+"""
+Controller-derived service URLs used when minting enrollment bundles via
+the UI. The strings are baked from `server_san` + the ports of
+`enrollment_addr` / `management_addr` in `ControllerConfig`. The operator
+can override them in the mint form (this is just a sensible default).
+"""
+type ServiceEndpoints {
+	controllerUrl: String!
+	enrollmentUrl: String!
+}
+
+type SilenceOutput {
+	id: ID!
+	matcherJson: String!
+	startsAt: DateTime!
+	endsAt: DateTime!
+	createdBy: String
+	comment: String
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Provides a scalar specification URL for specifying the behavior of custom scalar types.
+"""
+directive @specifiedBy(url: String!) on SCALAR
+schema {
+	query: QueryRoot
+	mutation: MutationRoot
+}

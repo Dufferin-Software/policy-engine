@@ -1,9 +1,18 @@
+[workspace]
+members = [".", "engine/client-lib", "engine/cli", "fleet/proto", "fleet/agent", "fleet/controller", "fleet/controller-dev"]
+default-members = [".", "engine/client-lib", "engine/cli", "fleet/proto", "fleet/agent", "fleet/controller", "fleet/controller-dev"]
+
 [package]
 name = "policy_engine"
 version = "0.1.0"
 edition = "2021"
-description = "XDP/TC policy-based packet processing engine with tail call dispatcher"
-license = "MIT OR Apache-2.0"
+rust-version = "1.89"
+description = "XDP policy-based packet processing engine with tail call dispatcher"
+license = "GPL-2.0-or-later"
+
+[features]
+suricata = []
+ipfix = []
 
 [dependencies]
 libbpf-rs = "0.24"
@@ -21,15 +30,34 @@ plain = "0.2"
 ipnetwork = "0.20"
 prettytable-rs = "0.10"
 chrono = "0.4"
+chrono-tz = "0.9"
 ctrlc = "3.4"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+core_affinity = "0.8"
 
-# GraphQL server/client dependencies
+# GraphQL server dependencies
 tokio = { version = "1", features = ["full"] }
 async-graphql = { version = "7", features = ["log"] }
 async-graphql-actix-web = "7"
-actix-web = "4"
+actix-web = { version = "4", features = ["rustls-0_23"] }
+rustls = "0.23"
+rustls-pemfile = "2"
 actix-rt = "2"
-reqwest = { version = "0.11", features = ["json", "blocking"] }
+actix-cors = "0.7"
+actix-files = "0.6"
+actix-ws = "0.3"
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["time"] }
+
+# QUIC Initial decryption (Phase 3 SNI extraction)
+aes-gcm = "0.10"
+aes = "0.8"
+hkdf = "0.12"
+sha2 = "0.10"
+
+[dev-dependencies]
+mockall = "0.12"
+tokio-test = "0.4"
 
 [build-dependencies]
 libbpf-cargo = "0.24"
@@ -39,5 +67,5 @@ name = "policy-engine"
 path = "src/bin/server.rs"
 
 [[bin]]
-name = "policy-client"
-path = "src/bin/client.rs"
+name = "policy-event-reader"
+path = "src/bin/event_reader.rs"

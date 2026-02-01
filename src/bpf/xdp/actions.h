@@ -1,0 +1,134 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/* Copyright (C) 2026 Dufferin Software <support@dufferinsw.com> */
+
+#pragma once
+
+/*
+ * Process all actions for a matched rule in priority order
+ * Returns the final XDP verdict (drop or pass)
+ */
+static __always_inline __u32 process_rule_actions(
+    struct xdp_md *ctx, struct global_stats *gs, struct l4_rule *policy,
+    struct flow_key *flow_key, __u64 now_ns
+#ifdef SURICATA_IPS
+    ,
+    const struct flow_verdict_key *fv_key
+#endif
+) {
+  __u32 final_verdict = XDP_PASS;
+  __u32 should_log = 0;
+  __u8 stop_actions = 0;
+
+/* Process actions in priority order */
+#pragma unroll
+  for (__u8 i = 0; i < MAX_ACTIONS_PER_RULE; i++) {
+    if (stop_actions || i >= policy->num_actions)
+      break;
+
+    __u32 action = policy->actions[i].action;
+
+    switch (action) {
+    case ACTION_DROP:
+      final_verdict = XDP_DROP;
+      stop_actions = 1; /* DROP stops further action processing */
+      break;
+    case ACTION_LOG: {
+      __u64 param = policy->actions[i].param; /* rate-limit interval in ns */
+      if (param > 0) {
+        /* Rate limiting via rule_stats.last_log_ns (no extra map needed).
+         * update_rule_stats() is always called before process_rule_actions()
+         * so the entry exists by the time we reach here.
+         * Use the caller-provided now_ns to avoid an extra clock read.
+         * Use an atomic CAS to update last_log_ns so that concurrent CPUs
+         * processing a burst of packets only emit one event per window. */
+        struct rule_stats *rs =
+            bpf_map_lookup_elem(&rule_stats, &policy->rule_id);
+        if (rs) {
+          __u64 old_ts = rs->last_log_ns;
+          if (now_ns - old_ts < param)
+            break; /* still within rate-limit window */
+          /* Only proceed if we win the race — CAS old→now_ns */
+          if (!__sync_bool_compare_and_swap(&rs->last_log_ns, old_ts, now_ns))
+            break; /* another CPU already claimed this window */
+        }
+      }
+      should_log = 1;
+      break;
+    }
+    case ACTION_PASS:
+      /* Pass doesn't override a drop decision */
+      if (final_verdict != XDP_DROP)
+        final_verdict = XDP_PASS;
+      break;
+    case ACTION_TAIL_CALL:
+      if (policy->tail_call_idx < MAX_DISPATCHER_PROGS) {
+        if (gs)
+          gs->tail_calls++;
+
+        bpf_tail_call(ctx, &xdp_dispatcher, policy->tail_call_idx);
+      }
+      break;
+#ifdef SURICATA_IPS
+    case ACTION_INSPECT: {
+      __u32 cfg_key = 0;
+      const struct inspect_config *cfg =
+          bpf_map_lookup_elem(&inspect_config, &cfg_key);
+      if (!cfg || cfg->mode == INSPECT_MODE_DISABLED)
+        break;
+
+      if (gs)
+        gs->inspect_redirects++;
+
+      /* Mark this flow for TC ingress cloning to Suricata.
+       * fv_key is pre-built by the caller — no need to reconstruct here.
+       * TC ingress reads flows_to_inspect and calls bpf_clone_redirect to
+       * mirror each packet on this flow to pe-inspect0 while the original
+       * continues to the application.  Suricata receives the full TCP stream
+       * on pe-inspect1 (the veth peer) and fires alerts via EVE JSON.
+       * The EveConsumer writes DROP verdicts to flow_verdict_cache; the next
+       * packet on this flow is then dropped at the XDP verdict-cache check. */
+      __u64 expiry = now_ns + INSPECT_CLONE_TTL_NS;
+      bpf_map_update_elem(&flows_to_inspect, fv_key, &expiry, BPF_ANY);
+
+      /* Write a temporary PASS verdict so the EveConsumer can overwrite it
+       * with DROP when Suricata alerts.  BPF_NOEXIST prevents overwriting an
+       * existing DROP verdict if an alert arrived between packets.
+       * Uses now_ns (CLOCK_MONOTONIC) — userspace must also use
+       * CLOCK_MONOTONIC when writing or comparing expires_ns. */
+      struct flow_verdict pass_v = {};
+      pass_v.action = ACTION_PASS;
+      pass_v.expires_ns = now_ns + INSPECT_PASS_VERDICT_TTL_NS;
+      bpf_map_update_elem(&flow_verdict_cache, fv_key, &pass_v, BPF_NOEXIST);
+
+      if (final_verdict != XDP_DROP)
+        final_verdict = XDP_PASS;
+      break;
+    }
+#endif /* SURICATA_IPS */
+    }
+  }
+
+  /* Emit event if logging was requested */
+  if (should_log) {
+    /* evt->verdict is decoded as a PolicyAction enum in userspace, NOT an
+     * XDP return code.  XDP_PASS (2) numerically collides with
+     * PolicyAction::Log (2), so passing final_verdict directly would render
+     * PASSes as "LOG" in the event stream.  Translate to the action enum. */
+    __u32 final_action =
+        (final_verdict == XDP_DROP) ? ACTION_DROP : ACTION_PASS;
+    emit_event(ctx, flow_key, policy->rule_id, ACTION_LOG, final_action, NULL,
+               0, now_ns);
+  }
+
+  /* Update action stats once here — single accounting location for all matched
+   * rules.  inspect_redirects is already incremented in the INSPECT case above;
+   * only pass/drop needs to be recorded here. */
+  if (gs) {
+    if (final_verdict == XDP_DROP)
+      gs->policy_drops++;
+    else
+      gs->policy_pass++;
+  }
+
+  return final_verdict;
+}

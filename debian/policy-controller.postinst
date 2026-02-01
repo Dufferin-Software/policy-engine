@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+#DEBHELPER#
+
+# Ensure the service is restarted after upgrade so the new binary is active.
+if [ "$1" = "configure" ] && [ -n "$2" ] && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+    systemctl restart policy-controller.service || true
+fi

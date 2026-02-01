@@ -1,0 +1,930 @@
+{
+  "title": "Policy engine \u2014 data plane",
+  "uid": "duf-engine-data-plane",
+  "schemaVersion": 36,
+  "refresh": "10s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "hostname",
+        "label": "Hostname",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "pe-prometheus"
+        },
+        "query": "label_values(policy_engine_uptime_seconds, hostname)",
+        "refresh": 1,
+        "sort": 1,
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": false,
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Throughput \u2014 rx packets/sec (ingress)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_rx_packets_total{direction=\"ingress\",hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Throughput \u2014 tx packets/sec (egress)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_tx_packets_total{direction=\"egress\",hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Throughput \u2014 rx bytes/sec (ingress)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_rx_bytes_total{direction=\"ingress\",hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Throughput \u2014 tx bytes/sec (egress)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_tx_bytes_total{direction=\"egress\",hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Policy drops/sec",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_policy_drops_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "title": "Policy pass/sec",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 16,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_policy_pass_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "title": "Policy matches/sec",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 16,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_policy_matches_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 18,
+      "title": "Policy redirects/sec",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_policy_redirects_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 19,
+      "title": "Verdict \u2014 pass vs drop packets/sec",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 24,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_verdict_pass_packets_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}} pass"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_verdict_drop_packets_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}} drop"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "title": "Verdict \u2014 pass vs drop bytes/sec",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 24,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_verdict_pass_bytes_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}} pass"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_verdict_drop_bytes_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}} drop"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "title": "FIB forwarding/sec",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_fib_forwarded_packets_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}} forwarded"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_fib_fallback_packets_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}} fallback"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "title": "Packet anomalies/sec",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_parse_errors_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}} parse errors"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_bum_packets_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}} BUM"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_fragments_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}} fragments"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_non_ip_unicast_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}} non-IP unicast"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_tail_calls_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}} tail calls"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "IPS inspect redirects/sec",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_inspect_redirects_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{interface}} {{direction}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Top rules by packet rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 40,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "topk(10, rate(policy_engine_rule_packets_total{hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{instance}} rule {{rule_id}} {{direction}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "Top rules by byte rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "topk(10, rate(policy_engine_rule_bytes_total{hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{instance}} rule {{rule_id}} {{direction}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "L4 protocol breakdown \u2014 ingress pps",
+      "type": "piechart",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 48,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "sum by (protocol) (rate(policy_engine_proto_packets_total{direction=\"ingress\",hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{protocol}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "L4 protocol breakdown \u2014 egress pps",
+      "type": "piechart",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 56,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "sum by (protocol) (rate(policy_engine_proto_packets_total{direction=\"egress\",hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{protocol}}"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "title": "L3 protocol breakdown \u2014 ingress pps",
+      "type": "piechart",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 56,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "sum by (protocol) (rate(policy_engine_l3_proto_packets_total{direction=\"ingress\",hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{protocol}}"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "title": "L3 protocol breakdown \u2014 egress pps",
+      "type": "piechart",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 64,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "sum by (protocol) (rate(policy_engine_l3_proto_packets_total{direction=\"egress\",hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{protocol}}"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "title": "Ethertype breakdown \u2014 ingress pps",
+      "type": "piechart",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 64,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "sum by (ethertype_name, ethertype) (rate(policy_engine_ethertype_packets_total{direction=\"ingress\",hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{ethertype_name}} (0x{{ethertype}})"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "title": "Ethertype breakdown \u2014 egress pps",
+      "type": "piechart",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 72,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "sum by (ethertype_name, ethertype) (rate(policy_engine_ethertype_packets_total{direction=\"egress\",hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{ethertype_name}} (0x{{ethertype}})"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Drop rate % of total",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 72,
+        "w": 6,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "100 * sum(rate(policy_engine_policy_drops_total{hostname=~\"$hostname\"}[5m])) / clamp_min(sum(rate(policy_engine_rx_packets_total{hostname=~\"$hostname\"}[5m])) + sum(rate(policy_engine_tx_packets_total{hostname=~\"$hostname\"}[5m])), 1)",
+          "legendFormat": "drop %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Uptime",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 72,
+        "w": 6,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "policy_engine_uptime_seconds{hostname=~\"$hostname\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "title": "BPF packet processing time (ns)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 80,
+        "w": 18,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "policy_engine_processing_time_ns{quantile=\"0.5\",hostname=~\"$hostname\"}",
+          "legendFormat": "{{instance}} {{direction}} p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "policy_engine_processing_time_ns{quantile=\"0.9\",hostname=~\"$hostname\"}",
+          "legendFormat": "{{instance}} {{direction}} p90"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "policy_engine_processing_time_ns{quantile=\"0.99\",hostname=~\"$hostname\"}",
+          "legendFormat": "{{instance}} {{direction}} p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "id": 27,
+      "title": "BPF processing sample count",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 80,
+        "w": 6,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_processing_time_ns_count{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} {{direction}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "QUIC packets/sec (ingress)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 88,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_quic_packets_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} v{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 15,
+      "title": "QUIC bytes/sec (ingress)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 88,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "rate(policy_engine_quic_bytes_total{hostname=~\"$hostname\"}[1m])",
+          "legendFormat": "{{instance}} v{{version}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    }
+  ],
+  "tags": [
+    "dufferin",
+    "policy-engine",
+    "data-plane"
+  ]
+}

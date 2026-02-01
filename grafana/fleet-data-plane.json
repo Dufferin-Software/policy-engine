@@ -1,0 +1,885 @@
+{
+  "title": "Controller Fleet Overview",
+  "uid": "duf-fleet-data-plane",
+  "schemaVersion": 36,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "hostname",
+        "label": "Node",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "pe-prometheus"
+        },
+        "query": "label_values(fleet_node_online, hostname)",
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": false,
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Nodes Online",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "fleet_nodes_online_total",
+          "legendFormat": "online"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 2,
+      "title": "Active Nodes",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "fleet_nodes_total{status=\"active\"}",
+          "legendFormat": "active"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 3,
+      "title": "Nodes Offline",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "fleet_nodes_total{status=\"active\"} - on() fleet_nodes_online_total",
+          "legendFormat": "offline"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Pending Enrollment",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "fleet_nodes_total{status=\"pending\"}",
+          "legendFormat": "pending"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 5,
+      "title": "Node Online Status",
+      "type": "bargauge",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "fleet_node_online{hostname=~\"$hostname\"}",
+          "legendFormat": "{{hostname}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Offline"
+                },
+                "1": {
+                  "text": "Online"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "displayMode": "lcd"
+      }
+    },
+    {
+      "id": 6,
+      "title": "Rule Count per Node",
+      "type": "bargauge",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "fleet_node_rule_count{hostname=~\"$hostname\"}",
+          "legendFormat": "{{hostname}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "thresholds": {
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "displayMode": "basic"
+      }
+    },
+    {
+      "id": 7,
+      "title": "Certificate Expiry \u2014 Days Remaining",
+      "type": "bargauge",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "(fleet_node_cert_expiry_seconds{hostname=~\"$hostname\"} - time()) / 86400",
+          "legendFormat": "{{hostname}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "d",
+          "min": 0,
+          "thresholds": {
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 7
+              },
+              {
+                "color": "green",
+                "value": 30
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "displayMode": "gradient"
+      }
+    },
+    {
+      "id": 8,
+      "title": "rx packets/sec by node (ingress)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "sum by (node_id, hostname) (rate(policy_engine_rx_packets_total{direction=\"ingress\",hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{hostname}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "tx packets/sec by node (egress)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "sum by (node_id, hostname) (rate(policy_engine_tx_packets_total{direction=\"egress\",hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{hostname}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "rx bytes/sec by node (ingress)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 28,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "sum by (node_id, hostname) (rate(policy_engine_rx_bytes_total{direction=\"ingress\",hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{hostname}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "tx bytes/sec by node (egress)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 28,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "sum by (node_id, hostname) (rate(policy_engine_tx_bytes_total{direction=\"egress\",hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{hostname}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "title": "Policy drops/sec by node",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "sum by (node_id, hostname) (rate(policy_engine_policy_drops_total{hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{hostname}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "title": "Policy pass/sec by node",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 36,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "sum by (node_id, hostname) (rate(policy_engine_policy_pass_total{hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{hostname}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "Fleet drop rate %",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 36,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "100 * sum(rate(policy_engine_policy_drops_total{hostname=~\"$hostname\"}[5m])) / clamp_min(sum(rate(policy_engine_rx_packets_total{hostname=~\"$hostname\"}[5m])) + sum(rate(policy_engine_tx_packets_total{hostname=~\"$hostname\"}[5m])), 1)",
+          "legendFormat": "drop %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 15,
+      "title": "Top rules by packet rate ($hostname)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "topk(10, sum by (rule_id, node_id, hostname) (rate(policy_engine_rule_packets_total{hostname=~\"$hostname\"}[1m])))",
+          "legendFormat": "{{hostname}} rule {{rule_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "title": "Top rules by byte rate ($hostname)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 44,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "topk(10, sum by (rule_id, node_id, hostname) (rate(policy_engine_rule_bytes_total{hostname=~\"$hostname\"}[1m])))",
+          "legendFormat": "{{hostname}} rule {{rule_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "title": "BPF processing latency (ns)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 18,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "policy_engine_processing_time_ns{quantile=\"0.5\",hostname=~\"$hostname\"}",
+          "legendFormat": "{{hostname}} {{direction}} p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "policy_engine_processing_time_ns{quantile=\"0.9\",hostname=~\"$hostname\"}",
+          "legendFormat": "{{hostname}} {{direction}} p90"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "policy_engine_processing_time_ns{quantile=\"0.99\",hostname=~\"$hostname\"}",
+          "legendFormat": "{{hostname}} {{direction}} p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ns"
+        }
+      }
+    },
+    {
+      "id": 18,
+      "title": "Last Seen \u2014 seconds ago",
+      "type": "bargauge",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 52,
+        "w": 6,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "time() - fleet_node_last_seen_seconds{hostname=~\"$hostname\"}",
+          "legendFormat": "{{hostname}}",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 60
+              },
+              {
+                "color": "red",
+                "value": 300
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "displayMode": "gradient"
+      }
+    },
+    {
+      "id": 19,
+      "title": "L4 protocol breakdown \u2014 ingress ($hostname)",
+      "type": "piechart",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "sum by (hostname, protocol) (rate(policy_engine_proto_packets_total{direction=\"ingress\",hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{hostname}} {{protocol}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "title": "L4 protocol breakdown \u2014 egress ($hostname)",
+      "type": "piechart",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "pe-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "pe-prometheus"
+          },
+          "expr": "sum by (hostname, protocol) (rate(policy_engine_proto_packets_total{direction=\"egress\",hostname=~\"$hostname\"}[1m]))",
+          "legendFormat": "{{hostname}} {{protocol}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps"
+        }
+      }
+    }
+  ],
+  "tags": [
+    "dufferin",
+    "fleet",
+    "data-plane"
+  ]
+}

@@ -1,0 +1,1237 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
+
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use policy_controller_proto::controller::InterfaceReport;
+use sqlx::{sqlite::SqlitePool, Row};
+use std::path::Path;
+
+use super::{
+    rule_content_equal, AuditEntry, ControllerStore, DiffSummary, EnrollmentTokenRecord,
+    NewAuditEntry, NodeInterface, NodeRecord, NodeStatus, Rule, TokenRedeemOutcome,
+};
+
+/// Production [`ControllerStore`] backed by SQLite via `sqlx`.
+///
+/// The database schema is managed by migrations in `migrations/`.
+/// Call [`SqliteControllerStore::new`] to open (or create) the database
+/// and run all pending migrations automatically.
+pub struct SqliteControllerStore {
+    pool: SqlitePool,
+}
+
+impl SqliteControllerStore {
+    /// Open the SQLite database at `db_path` and run pending migrations.
+    /// Creates the file and its parent directory if they do not exist.
+    pub async fn new(db_path: &Path) -> Result<Self> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create DB directory: {}", parent.display()))?;
+        }
+
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let pool = SqlitePool::connect(&url)
+            .await
+            .with_context(|| format!("Failed to open SQLite DB: {}", db_path.display()))?;
+
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .context("Failed to run database migrations")?;
+
+        Ok(Self { pool })
+    }
+
+    /// Access the underlying `SqlitePool` for modules that need to attach
+    /// their own tables (currently: the event pipeline, via
+    /// [`crate::event_pipeline::TenantScope`]). All such modules must go
+    /// through `TenantScope` rather than the raw pool — see
+    /// `docs/event-pipeline.md` "Multi-tenancy".
+    pub fn pool(&self) -> sqlx::sqlite::SqlitePool {
+        self.pool.clone()
+    }
+}
+
+#[async_trait]
+impl ControllerStore for SqliteControllerStore {
+    // ── Nodes ────────────────────────────────────────────────────────────────
+
+    async fn upsert_node(&self, node: &NodeRecord) -> Result<()> {
+        let status = node.status.to_string();
+        let public_key_der = hex::encode(&node.public_key_der);
+        let cert_serial = node.cert_serial.as_deref().map(hex::encode);
+        let cert_expiry = node.cert_expiry.map(|dt| dt.timestamp());
+        let last_seen = node.last_seen.map(|dt| dt.timestamp());
+        let enrolled_at = node.enrolled_at.map(|dt| dt.timestamp());
+        let decommissioned_at = node.decommissioned_at.map(|dt| dt.timestamp());
+        let last_renewed_at = node.last_renewed_at.map(|dt| dt.timestamp());
+
+        sqlx::query(
+            r#"
+            INSERT INTO nodes
+                (id, label, public_key_der, dmi_uuid, status, cert_serial, cert_expiry,
+                 last_seen, enrolled_at, decommissioned_at, enrollment_id, tpm_backed,
+                 agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id,
+                 last_renewed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                label              = excluded.label,
+                dmi_uuid           = excluded.dmi_uuid,
+                status             = excluded.status,
+                cert_serial        = excluded.cert_serial,
+                cert_expiry        = excluded.cert_expiry,
+                last_seen          = excluded.last_seen,
+                enrolled_at        = excluded.enrolled_at,
+                decommissioned_at  = excluded.decommissioned_at,
+                enrollment_id      = excluded.enrollment_id,
+                tpm_backed         = excluded.tpm_backed,
+                agent_version      = excluded.agent_version,
+                hostname           = excluded.hostname,
+                os_pretty_name     = excluded.os_pretty_name,
+                kernel_version     = excluded.kernel_version,
+                dmi_sys_vendor     = excluded.dmi_sys_vendor,
+                dmi_product_name   = excluded.dmi_product_name,
+                last_renewed_at    = excluded.last_renewed_at
+            "#,
+        )
+        .bind(&node.id)
+        .bind(&node.label)
+        .bind(&public_key_der)
+        .bind(&node.dmi_uuid)
+        .bind(&status)
+        .bind(&cert_serial)
+        .bind(cert_expiry)
+        .bind(last_seen)
+        .bind(enrolled_at)
+        .bind(decommissioned_at)
+        .bind(&node.enrollment_id)
+        .bind(node.tpm_backed)
+        .bind(&node.agent_version)
+        .bind(&node.hostname)
+        .bind(&node.os_pretty_name)
+        .bind(&node.kernel_version)
+        .bind(&node.dmi_sys_vendor)
+        .bind(&node.dmi_product_name)
+        .bind(&node.tenant_id)
+        .bind(last_renewed_at)
+        .execute(&self.pool)
+        .await
+        .context("Failed to upsert node")?;
+
+        Ok(())
+    }
+
+    async fn get_node(&self, id: &str) -> Result<Option<NodeRecord>> {
+        let row = sqlx::query(
+            "SELECT id, label, public_key_der, dmi_uuid, status, cert_serial, cert_expiry, \
+             last_seen, enrolled_at, decommissioned_at, enrollment_id, tpm_backed, \
+             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at \
+             FROM nodes WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to query node")?;
+
+        row.map(row_to_node).transpose()
+    }
+
+    async fn get_node_by_enrollment_id(&self, enrollment_id: &str) -> Result<Option<NodeRecord>> {
+        let row = sqlx::query(
+            "SELECT id, label, public_key_der, dmi_uuid, status, cert_serial, cert_expiry, \
+             last_seen, enrolled_at, decommissioned_at, enrollment_id, tpm_backed, \
+             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at \
+             FROM nodes WHERE enrollment_id = ?",
+        )
+        .bind(enrollment_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to query node by enrollment_id")?;
+
+        row.map(row_to_node).transpose()
+    }
+
+    async fn list_nodes(
+        &self,
+        tenant_id: Option<&str>,
+        status: Option<NodeStatus>,
+    ) -> Result<Vec<NodeRecord>> {
+        const COLS: &str = "id, label, public_key_der, dmi_uuid, status, cert_serial, cert_expiry, \
+             last_seen, enrolled_at, decommissioned_at, enrollment_id, tpm_backed, \
+             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at";
+        let mut sql = format!("SELECT {COLS} FROM nodes");
+        let mut clauses: Vec<&'static str> = Vec::new();
+        if status.is_some() {
+            clauses.push("status = ?");
+        }
+        if tenant_id.is_some() {
+            clauses.push("tenant_id = ?");
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        let mut q = sqlx::query(&sql);
+        if let Some(s) = status {
+            q = q.bind(s.to_string());
+        }
+        if let Some(t) = tenant_id {
+            q = q.bind(t.to_string());
+        }
+        let rows = q
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to list nodes")?;
+        rows.into_iter().map(row_to_node).collect()
+    }
+
+    async fn update_node_status(&self, id: &str, status: NodeStatus) -> Result<()> {
+        sqlx::query("UPDATE nodes SET status = ? WHERE id = ?")
+            .bind(status.to_string())
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update node status")?;
+        Ok(())
+    }
+
+    async fn update_node_tenant(&self, id: &str, tenant_id: &str) -> Result<()> {
+        sqlx::query("UPDATE nodes SET tenant_id = ? WHERE id = ?")
+            .bind(tenant_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update node tenant")?;
+        Ok(())
+    }
+
+    async fn delete_node(&self, id: &str) -> Result<()> {
+        // Remove dependent rows first.
+        sqlx::query("DELETE FROM rules WHERE node_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to delete node rules")?;
+        sqlx::query("DELETE FROM node_interfaces WHERE node_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to delete node interfaces")?;
+        sqlx::query("DELETE FROM node_certs WHERE node_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to delete node cert")?;
+        sqlx::query("DELETE FROM nodes WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to delete node")?;
+        Ok(())
+    }
+
+    async fn update_node_last_seen(&self, id: &str, ts: DateTime<Utc>) -> Result<()> {
+        sqlx::query("UPDATE nodes SET last_seen = ? WHERE id = ?")
+            .bind(ts.timestamp())
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update node last_seen")?;
+        Ok(())
+    }
+
+    async fn update_node_stop_behavior(&self, id: &str, behavior: Option<&str>) -> Result<()> {
+        sqlx::query("UPDATE nodes SET stop_behavior = ? WHERE id = ?")
+            .bind(behavior)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update node stop_behavior")?;
+        Ok(())
+    }
+
+    async fn update_node_agent_info(
+        &self,
+        id: &str,
+        tpm_backed: bool,
+        agent_version: Option<&str>,
+        hostname: Option<&str>,
+        os_pretty_name: Option<&str>,
+        kernel_version: Option<&str>,
+        dmi_sys_vendor: Option<&str>,
+        dmi_product_name: Option<&str>,
+        dmi_uuid: Option<&str>,
+    ) -> Result<()> {
+        // COALESCE so an empty AgentHello field (None) doesn't overwrite a
+        // value that was populated at enrollment time. This matters for
+        // dmi_uuid in particular: a node enrolled before the
+        // CAP_DAC_READ_SEARCH fix shipped will have it stored, and a later
+        // reconnect from an agent that still can't read product_uuid would
+        // otherwise wipe it.
+        sqlx::query(
+            "UPDATE nodes SET tpm_backed = ?, \
+             agent_version = COALESCE(?, agent_version), \
+             hostname = COALESCE(?, hostname), \
+             os_pretty_name = COALESCE(?, os_pretty_name), \
+             kernel_version = COALESCE(?, kernel_version), \
+             dmi_sys_vendor = COALESCE(?, dmi_sys_vendor), \
+             dmi_product_name = COALESCE(?, dmi_product_name), \
+             dmi_uuid = COALESCE(?, dmi_uuid) \
+             WHERE id = ?",
+        )
+        .bind(tpm_backed)
+        .bind(agent_version)
+        .bind(hostname)
+        .bind(os_pretty_name)
+        .bind(kernel_version)
+        .bind(dmi_sys_vendor)
+        .bind(dmi_product_name)
+        .bind(dmi_uuid)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to update node agent info")?;
+        Ok(())
+    }
+
+    async fn update_node_capabilities(&self, id: &str, capabilities_json: &str) -> Result<()> {
+        sqlx::query("UPDATE nodes SET capabilities = ? WHERE id = ?")
+            .bind(capabilities_json)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update node capabilities")?;
+        Ok(())
+    }
+
+    async fn list_active_node_sources(
+        &self,
+        tenant_id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        // Pull every Active node's capabilities blob for this tenant and
+        // union the `sources` arrays in Rust — the JSON is small (one row
+        // per node, ~100 bytes) and SQLite's json1 isn't worth the deps.
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT capabilities FROM nodes WHERE tenant_id = ? AND status = 'active'",
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list node capabilities")?;
+        let mut out = std::collections::HashSet::new();
+        for (json,) in rows {
+            // A corrupt capabilities blob (truncated, hand-edited) shouldn't
+            // make rule validation fall over — skip it and keep going so the
+            // operator's mutation still proceeds against the other nodes.
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
+                continue;
+            };
+            if let Some(arr) = v.get("sources").and_then(|s| s.as_array()) {
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        out.insert(s.to_string());
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn update_node_cert(
+        &self,
+        id: &str,
+        serial: Vec<u8>,
+        expiry: DateTime<Utc>,
+        cert_pem: String,
+    ) -> Result<()> {
+        sqlx::query("UPDATE nodes SET cert_serial = ?, cert_expiry = ? WHERE id = ?")
+            .bind(hex::encode(&serial))
+            .bind(expiry.timestamp())
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update node cert")?;
+
+        self.store_node_cert_pem(id, &cert_pem).await?;
+        Ok(())
+    }
+
+    async fn update_current_cert_meta(
+        &self,
+        id: &str,
+        serial: Vec<u8>,
+        expiry: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE nodes SET cert_serial = ?, cert_expiry = ? WHERE id = ?")
+            .bind(hex::encode(&serial))
+            .bind(expiry.timestamp())
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update current cert meta")?;
+        Ok(())
+    }
+
+    // ── Cert revocation ──────────────────────────────────────────────────────
+
+    async fn revoke_cert(&self, serial: &[u8]) -> Result<()> {
+        sqlx::query("INSERT OR IGNORE INTO revoked_certs (serial, revoked_at) VALUES (?, ?)")
+            .bind(hex::encode(serial))
+            .bind(Utc::now().timestamp())
+            .execute(&self.pool)
+            .await
+            .context("Failed to revoke cert")?;
+        Ok(())
+    }
+
+    async fn is_cert_revoked(&self, serial: &[u8]) -> Result<bool> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM revoked_certs WHERE serial = ?")
+            .bind(hex::encode(serial))
+            .fetch_one(&self.pool)
+            .await
+            .context("Failed to check cert revocation")?;
+        Ok(count > 0)
+    }
+
+    async fn list_revoked_serials(&self) -> Result<Vec<Vec<u8>>> {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT serial FROM revoked_certs")
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to list revoked serials")?;
+        rows.into_iter()
+            .map(|(s,)| {
+                hex::decode(&s)
+                    .with_context(|| format!("Invalid hex serial in revoked_certs: {}", s))
+            })
+            .collect()
+    }
+
+    // ── Rules ────────────────────────────────────────────────────────────────
+
+    async fn create_rule(&self, rule: &Rule) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO rules
+                (id, tenant_id, node_id, interface_name, direction,
+                 src_cidr, dst_cidr, src_port, dst_port, protocol,
+                 sni_pattern, quic_version, src_mac, dst_mac,
+                 actions_json, created_at, created_by,
+                 expires_after_secs, schedule_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&rule.id)
+        .bind(&rule.tenant_id)
+        .bind(&rule.node_id)
+        .bind(&rule.interface_name)
+        .bind(&rule.direction)
+        .bind(&rule.src_cidr)
+        .bind(&rule.dst_cidr)
+        .bind(rule.src_port.map(|p| p as i64))
+        .bind(rule.dst_port.map(|p| p as i64))
+        .bind(&rule.protocol)
+        .bind(&rule.sni_pattern)
+        .bind(&rule.quic_version)
+        .bind(&rule.src_mac)
+        .bind(&rule.dst_mac)
+        .bind(&rule.actions_json)
+        .bind(rule.created_at.timestamp())
+        .bind(&rule.created_by)
+        .bind(rule.expires_after_secs.map(|s| s as i64))
+        .bind(&rule.schedule_json)
+        .execute(&self.pool)
+        .await
+        .context("Failed to create rule")?;
+        Ok(())
+    }
+
+    async fn delete_rule(&self, rule_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM rules WHERE id = ?")
+            .bind(rule_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to delete rule")?;
+        Ok(())
+    }
+
+    async fn get_rule(&self, rule_id: &str) -> Result<Option<Rule>> {
+        let row = sqlx::query(
+            "SELECT id, tenant_id, node_id, interface_name, direction, \
+             src_cidr, dst_cidr, src_port, dst_port, protocol, \
+             sni_pattern, quic_version, src_mac, dst_mac, \
+             actions_json, created_at, created_by, \
+             expires_after_secs, schedule_json \
+             FROM rules WHERE id = ?",
+        )
+        .bind(rule_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to query rule")?;
+
+        row.map(row_to_rule).transpose()
+    }
+
+    async fn list_rules_for_node(&self, node_id: &str) -> Result<Vec<Rule>> {
+        let rows = sqlx::query(
+            "SELECT id, tenant_id, node_id, interface_name, direction, \
+             src_cidr, dst_cidr, src_port, dst_port, protocol, \
+             sni_pattern, quic_version, src_mac, dst_mac, \
+             actions_json, created_at, created_by, \
+             expires_after_secs, schedule_json \
+             FROM rules WHERE node_id = ? ORDER BY created_at",
+        )
+        .bind(node_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list rules for node")?;
+
+        rows.into_iter().map(row_to_rule).collect()
+    }
+
+    async fn list_rules_for_interface(
+        &self,
+        node_id: &str,
+        interface_name: &str,
+        direction: &str,
+    ) -> Result<Vec<Rule>> {
+        let rows = sqlx::query(
+            "SELECT id, tenant_id, node_id, interface_name, direction, \
+             src_cidr, dst_cidr, src_port, dst_port, protocol, \
+             sni_pattern, quic_version, src_mac, dst_mac, \
+             actions_json, created_at, created_by, \
+             expires_after_secs, schedule_json \
+             FROM rules WHERE node_id = ? AND interface_name = ? AND direction = ? \
+             ORDER BY created_at",
+        )
+        .bind(node_id)
+        .bind(interface_name)
+        .bind(direction)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list rules for interface")?;
+
+        rows.into_iter().map(row_to_rule).collect()
+    }
+
+    async fn delete_rules_for_node(&self, node_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM rules WHERE node_id = ?")
+            .bind(node_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to delete rules for node")?;
+        Ok(())
+    }
+
+    async fn replace_rules_for_node(
+        &self,
+        node_id: &str,
+        new_rules: &[Rule],
+    ) -> Result<DiffSummary> {
+        for r in new_rules {
+            if r.node_id != node_id {
+                anyhow::bail!(
+                    "replace_rules_for_node: rule {} has node_id {} != {}",
+                    r.id,
+                    r.node_id,
+                    node_id
+                );
+            }
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("Failed to begin transaction")?;
+
+        let existing_rows = sqlx::query(
+            "SELECT id, tenant_id, node_id, interface_name, direction, \
+             src_cidr, dst_cidr, src_port, dst_port, protocol, \
+             sni_pattern, quic_version, src_mac, dst_mac, \
+             actions_json, created_at, created_by, \
+             expires_after_secs, schedule_json \
+             FROM rules WHERE node_id = ?",
+        )
+        .bind(node_id)
+        .fetch_all(&mut *tx)
+        .await
+        .context("Failed to load existing rules for replace")?;
+
+        let existing: std::collections::HashMap<String, Rule> = existing_rows
+            .into_iter()
+            .map(row_to_rule)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|r| (r.id.clone(), r))
+            .collect();
+
+        let new_ids: std::collections::HashSet<&str> =
+            new_rules.iter().map(|r| r.id.as_str()).collect();
+
+        let mut summary = DiffSummary::default();
+
+        for (id, _) in existing.iter() {
+            if !new_ids.contains(id.as_str()) {
+                sqlx::query("DELETE FROM rules WHERE id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .context("Failed to delete rule during replace")?;
+                summary.deleted += 1;
+            }
+        }
+
+        for rule in new_rules {
+            if let Some(prev) = existing.get(&rule.id) {
+                if rule_content_equal(prev, rule) {
+                    summary.unchanged += 1;
+                    continue;
+                }
+                summary.updated += 1;
+            } else {
+                summary.added += 1;
+            }
+            sqlx::query(
+                r#"
+                INSERT INTO rules
+                    (id, tenant_id, node_id, interface_name, direction,
+                     src_cidr, dst_cidr, src_port, dst_port, protocol,
+                     sni_pattern, quic_version, src_mac, dst_mac,
+                     actions_json, created_at, created_by,
+                     expires_after_secs, schedule_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    tenant_id = excluded.tenant_id,
+                    node_id = excluded.node_id,
+                    interface_name = excluded.interface_name,
+                    direction = excluded.direction,
+                    src_cidr = excluded.src_cidr,
+                    dst_cidr = excluded.dst_cidr,
+                    src_port = excluded.src_port,
+                    dst_port = excluded.dst_port,
+                    protocol = excluded.protocol,
+                    sni_pattern = excluded.sni_pattern,
+                    quic_version = excluded.quic_version,
+                    src_mac = excluded.src_mac,
+                    dst_mac = excluded.dst_mac,
+                    actions_json = excluded.actions_json,
+                    created_by = excluded.created_by,
+                    expires_after_secs = excluded.expires_after_secs,
+                    schedule_json = excluded.schedule_json
+                "#,
+            )
+            .bind(&rule.id)
+            .bind(&rule.tenant_id)
+            .bind(&rule.node_id)
+            .bind(&rule.interface_name)
+            .bind(&rule.direction)
+            .bind(&rule.src_cidr)
+            .bind(&rule.dst_cidr)
+            .bind(rule.src_port.map(|p| p as i64))
+            .bind(rule.dst_port.map(|p| p as i64))
+            .bind(&rule.protocol)
+            .bind(&rule.sni_pattern)
+            .bind(&rule.quic_version)
+            .bind(&rule.src_mac)
+            .bind(&rule.dst_mac)
+            .bind(&rule.actions_json)
+            .bind(rule.created_at.timestamp())
+            .bind(&rule.created_by)
+            .bind(rule.expires_after_secs.map(|s| s as i64))
+            .bind(&rule.schedule_json)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to upsert rule during replace")?;
+        }
+
+        tx.commit()
+            .await
+            .context("Failed to commit replace_rules_for_node")?;
+
+        Ok(summary)
+    }
+
+    // ── Node interfaces ──────────────────────────────────────────────────────
+
+    async fn upsert_node_interfaces(
+        &self,
+        node_id: &str,
+        interfaces: &[InterfaceReport],
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        for iface in interfaces {
+            let addresses_json = super::address_reports_to_json(&iface.addresses);
+            sqlx::query(
+                r#"
+                INSERT INTO node_interfaces
+                    (node_id, interface_name, ifindex, mac_address, link_state, addresses_json, last_reported)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(node_id, interface_name) DO UPDATE SET
+                    ifindex        = excluded.ifindex,
+                    mac_address    = excluded.mac_address,
+                    link_state     = excluded.link_state,
+                    addresses_json = excluded.addresses_json,
+                    last_reported  = excluded.last_reported
+                "#,
+            )
+            .bind(node_id)
+            .bind(&iface.name)
+            .bind(iface.ifindex as i64)
+            .bind(&iface.mac_address)
+            .bind(&iface.link_state)
+            .bind(&addresses_json)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("Failed to upsert interface {}", iface.name))?;
+        }
+        Ok(())
+    }
+
+    async fn list_all_node_interfaces(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<NodeInterface>> {
+        // node_interfaces has no tenant_id column — interfaces inherit
+        // their node's tenant. Join through `nodes` when scoping.
+        let rows = if let Some(t) = tenant_id {
+            sqlx::query(
+                "SELECT ni.node_id, ni.interface_name, ni.ifindex, ni.mac_address, ni.link_state, ni.addresses_json, \
+                 ni.tag, ni.last_reported, ni.xdp_attached, ni.tc_attached, ni.fib_forwarding, \
+                 ni.ingress_default_action, ni.egress_default_action \
+                 FROM node_interfaces ni \
+                 JOIN nodes n ON n.id = ni.node_id \
+                 WHERE n.tenant_id = ? \
+                 ORDER BY ni.node_id, ni.interface_name",
+            )
+            .bind(t.to_string())
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT node_id, interface_name, ifindex, mac_address, link_state, addresses_json, \
+                 tag, last_reported, xdp_attached, tc_attached, fib_forwarding, \
+                 ingress_default_action, egress_default_action \
+                 FROM node_interfaces ORDER BY node_id, interface_name",
+            )
+            .fetch_all(&self.pool)
+            .await
+        }
+        .context("Failed to list all node interfaces")?;
+        rows.into_iter().map(row_to_node_interface).collect()
+    }
+
+    async fn list_node_interfaces(&self, node_id: &str) -> Result<Vec<NodeInterface>> {
+        let rows = sqlx::query(
+            "SELECT node_id, interface_name, ifindex, mac_address, link_state, addresses_json, \
+             tag, last_reported, xdp_attached, tc_attached, fib_forwarding, \
+             ingress_default_action, egress_default_action \
+             FROM node_interfaces WHERE node_id = ? ORDER BY interface_name",
+        )
+        .bind(node_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list node interfaces")?;
+
+        rows.into_iter().map(row_to_node_interface).collect()
+    }
+
+    async fn update_interface_default_action(
+        &self,
+        node_id: &str,
+        interface_name: &str,
+        direction: &str,
+        action: &str,
+    ) -> Result<()> {
+        let col = match direction.to_lowercase().as_str() {
+            "ingress" => "ingress_default_action",
+            "egress" => "egress_default_action",
+            _ => anyhow::bail!("Invalid direction: {}", direction),
+        };
+        let sql = format!(
+            "UPDATE node_interfaces SET {} = ? WHERE node_id = ? AND interface_name = ?",
+            col
+        );
+        sqlx::query(&sql)
+            .bind(action)
+            .bind(node_id)
+            .bind(interface_name)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("Failed to set {} for {}/{}", col, node_id, interface_name))?;
+        Ok(())
+    }
+
+    async fn set_interface_tag(
+        &self,
+        node_id: &str,
+        interface_name: &str,
+        tag: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE node_interfaces SET tag = ? WHERE node_id = ? AND interface_name = ?")
+            .bind(tag)
+            .bind(node_id)
+            .bind(interface_name)
+            .execute(&self.pool)
+            .await
+            .context("Failed to set interface tag")?;
+        Ok(())
+    }
+
+    async fn remove_interface_tag(&self, node_id: &str, interface_name: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE node_interfaces SET tag = NULL WHERE node_id = ? AND interface_name = ?",
+        )
+        .bind(node_id)
+        .bind(interface_name)
+        .execute(&self.pool)
+        .await
+        .context("Failed to remove interface tag")?;
+        Ok(())
+    }
+
+    async fn update_interface_fib_forwarding(
+        &self,
+        node_id: &str,
+        enabled_interfaces: &[String],
+    ) -> Result<()> {
+        // Reset all interfaces for this node, then enable the listed ones.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("Failed to begin transaction")?;
+        sqlx::query("UPDATE node_interfaces SET fib_forwarding = 0 WHERE node_id = ?")
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to clear node fib_forwarding")?;
+        for iface in enabled_interfaces {
+            sqlx::query(
+                "UPDATE node_interfaces SET fib_forwarding = 1 \
+                 WHERE node_id = ? AND interface_name = ?",
+            )
+            .bind(node_id)
+            .bind(iface)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to set interface fib_forwarding")?;
+        }
+        tx.commit().await.context("Failed to commit")?;
+        Ok(())
+    }
+
+    async fn update_interface_attachments(
+        &self,
+        node_id: &str,
+        attachments: &[(String, String)],
+    ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("Failed to begin transaction")?;
+
+        // Reset all attachments for this node first.
+        sqlx::query(
+            "UPDATE node_interfaces SET xdp_attached = 0, tc_attached = 0 WHERE node_id = ?",
+        )
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to reset interface attachments")?;
+
+        // Set the ones that are actually attached.
+        for (iface, dir) in attachments {
+            let (col, val) = match dir.to_lowercase().as_str() {
+                "ingress" => ("xdp_attached", true),
+                "egress" => ("tc_attached", true),
+                _ => continue,
+            };
+            // Ensure the row exists — it may not yet if the agent attaches a
+            // program before AgentHello's upsert_node_interfaces has run.
+            sqlx::query(
+                "INSERT OR IGNORE INTO node_interfaces \
+                 (node_id, interface_name, last_reported) VALUES (?, ?, unixepoch())",
+            )
+            .bind(node_id)
+            .bind(iface)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("Failed to ensure interface row for {}/{}", node_id, iface))?;
+            let sql = format!(
+                "UPDATE node_interfaces SET {} = ? WHERE node_id = ? AND interface_name = ?",
+                col
+            );
+            sqlx::query(&sql)
+                .bind(val)
+                .bind(node_id)
+                .bind(iface)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("Failed to set {} for {} on {}", col, iface, node_id))?;
+        }
+
+        tx.commit().await.context("Failed to commit")?;
+        Ok(())
+    }
+
+    // ── Certs ────────────────────────────────────────────────────────────────
+
+    async fn store_node_cert_pem(&self, node_id: &str, cert_pem: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO node_certs (node_id, cert_pem) VALUES (?, ?) \
+             ON CONFLICT(node_id) DO UPDATE SET cert_pem = excluded.cert_pem",
+        )
+        .bind(node_id)
+        .bind(cert_pem)
+        .execute(&self.pool)
+        .await
+        .context("Failed to store node cert PEM")?;
+        Ok(())
+    }
+
+    async fn get_node_cert_pem(&self, node_id: &str) -> Result<Option<String>> {
+        sqlx::query_scalar("SELECT cert_pem FROM node_certs WHERE node_id = ?")
+            .bind(node_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("Failed to get node cert PEM")
+    }
+
+    // ── Audit log ────────────────────────────────────────────────────────────
+
+    async fn append_audit(&self, entry: NewAuditEntry) -> Result<()> {
+        // Tenant resolution mirrors `NewAuditEntry`'s docs: explicit > derived
+        // from node > 'default' fallback. The derivation runs as a subquery
+        // so the whole insert is one round trip; if `nodes.id = node_id` is
+        // missing (race with decommission, or a synthetic node id) the
+        // COALESCE picks up the literal default.
+        let explicit_tenant = entry.tenant_id.clone();
+        sqlx::query(
+            "INSERT INTO audit_log (ts, operator, action, node_id, detail, tenant_id) \
+             VALUES ( \
+                ?, ?, ?, ?, ?, \
+                COALESCE( \
+                    ?, \
+                    (SELECT tenant_id FROM nodes WHERE id = ?), \
+                    'default' \
+                ) \
+             )",
+        )
+        .bind(Utc::now().timestamp())
+        .bind(&entry.operator)
+        .bind(&entry.action)
+        .bind(&entry.node_id)
+        .bind(&entry.detail)
+        .bind(&explicit_tenant)
+        .bind(&entry.node_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to append audit entry")?;
+        Ok(())
+    }
+
+    async fn list_audit(
+        &self,
+        tenant_id: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<AuditEntry>> {
+        let rows = if let Some(t) = tenant_id {
+            sqlx::query(
+                "SELECT id, ts, operator, action, node_id, detail, tenant_id FROM audit_log \
+                 WHERE tenant_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(t.to_string())
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT id, ts, operator, action, node_id, detail, tenant_id FROM audit_log \
+                 ORDER BY id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .context("Failed to list audit log")?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(AuditEntry {
+                    id: row.get("id"),
+                    ts: DateTime::from_timestamp(row.get::<i64, _>("ts"), 0).unwrap_or_default(),
+                    operator: row.get("operator"),
+                    action: row.get("action"),
+                    node_id: row.get("node_id"),
+                    detail: row.get("detail"),
+                    tenant_id: row.get("tenant_id"),
+                })
+            })
+            .collect()
+    }
+
+    // ── Enrollment tokens ────────────────────────────────────────────────────
+
+    async fn insert_enrollment_token(&self, token: &EnrollmentTokenRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO enrollment_tokens
+                (token_id, token_hash, created_at, created_by, expires_at,
+                 uses_remaining, cidr_scope, fleet_label, revoked_at, tenant_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&token.token_id)
+        .bind(&token.token_hash)
+        .bind(token.created_at.timestamp())
+        .bind(&token.created_by)
+        .bind(token.expires_at.timestamp())
+        .bind(token.uses_remaining)
+        .bind(&token.cidr_scope)
+        .bind(&token.fleet_label)
+        .bind(token.revoked_at.map(|dt| dt.timestamp()))
+        .bind(&token.tenant_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to insert enrollment token")?;
+        Ok(())
+    }
+
+    async fn list_enrollment_tokens(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<EnrollmentTokenRecord>> {
+        let base = "SELECT token_id, token_hash, created_at, created_by, expires_at, \
+                    uses_remaining, cidr_scope, fleet_label, revoked_at, tenant_id \
+                    FROM enrollment_tokens";
+        let rows = match tenant_id {
+            Some(slug) => {
+                sqlx::query(&format!(
+                    "{base} WHERE tenant_id = ? ORDER BY created_at DESC"
+                ))
+                .bind(slug)
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(&format!("{base} ORDER BY created_at DESC"))
+                    .fetch_all(&self.pool)
+                    .await
+            }
+        }
+        .context("Failed to list enrollment tokens")?;
+
+        rows.into_iter().map(row_to_enrollment_token).collect()
+    }
+
+    async fn revoke_enrollment_token(&self, token_id: &str) -> Result<bool> {
+        let now = Utc::now().timestamp();
+        let result = sqlx::query(
+            "UPDATE enrollment_tokens SET revoked_at = ? \
+             WHERE token_id = ? AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(token_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to revoke enrollment token")?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn redeem_enrollment_token(
+        &self,
+        token_id: &str,
+        token_hash: &[u8],
+    ) -> Result<TokenRedeemOutcome> {
+        use subtle::ConstantTimeEq;
+
+        // Single-statement atomic decrement using a guarded UPDATE.
+        // We first peek at the row so we can return precise outcomes
+        // (Expired/Revoked/Exhausted/BadSecret) — then the UPDATE applies
+        // only if the row still matches all conditions.
+        let row = sqlx::query(
+            "SELECT token_hash, expires_at, uses_remaining, revoked_at, fleet_label, tenant_id \
+             FROM enrollment_tokens WHERE token_id = ?",
+        )
+        .bind(token_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to look up enrollment token")?;
+
+        let Some(row) = row else {
+            return Ok(TokenRedeemOutcome::Unknown);
+        };
+
+        let stored_hash: Vec<u8> = row.get("token_hash");
+        if stored_hash.ct_eq(token_hash).unwrap_u8() == 0 {
+            return Ok(TokenRedeemOutcome::BadSecret);
+        }
+        if row.get::<Option<i64>, _>("revoked_at").is_some() {
+            return Ok(TokenRedeemOutcome::Revoked);
+        }
+        let expires_at: i64 = row.get("expires_at");
+        if expires_at <= Utc::now().timestamp() {
+            return Ok(TokenRedeemOutcome::Expired);
+        }
+        let uses_remaining: i64 = row.get("uses_remaining");
+        if uses_remaining <= 0 {
+            return Ok(TokenRedeemOutcome::Exhausted);
+        }
+
+        // Conditional UPDATE: decrement only if the row is still valid.
+        // Two redemptions racing will both pass the SELECT above but the
+        // UPDATE's `uses_remaining > 0` guard ensures only one succeeds.
+        let now = Utc::now().timestamp();
+        let result = sqlx::query(
+            "UPDATE enrollment_tokens \
+             SET uses_remaining = uses_remaining - 1 \
+             WHERE token_id = ? \
+               AND uses_remaining > 0 \
+               AND expires_at > ? \
+               AND revoked_at IS NULL",
+        )
+        .bind(token_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("Failed to decrement enrollment token uses")?;
+
+        if result.rows_affected() == 0 {
+            // Lost a race or row changed between SELECT and UPDATE.
+            return Ok(TokenRedeemOutcome::Exhausted);
+        }
+
+        let fleet_label: Option<String> = row.get("fleet_label");
+        let tenant_id: String = row.get("tenant_id");
+        Ok(TokenRedeemOutcome::Redeemed {
+            fleet_label,
+            tenant_id,
+        })
+    }
+}
+
+// ── Row helpers ───────────────────────────────────────────────────────────────
+
+fn row_to_node(row: sqlx::sqlite::SqliteRow) -> Result<NodeRecord> {
+    let status_str: String = row.get("status");
+    let status = match status_str.as_str() {
+        "pending" => NodeStatus::Pending,
+        "active" => NodeStatus::Active,
+        "decommissioned" => NodeStatus::Decommissioned,
+        other => anyhow::bail!("Unknown node status: {}", other),
+    };
+
+    let pub_key_hex: String = row.get("public_key_der");
+    let public_key_der = hex::decode(&pub_key_hex).context("Failed to decode public_key_der")?;
+
+    let cert_serial: Option<String> = row.get("cert_serial");
+    let cert_serial = cert_serial
+        .map(|s| hex::decode(s).context("Failed to decode cert_serial"))
+        .transpose()?;
+
+    let cert_expiry: Option<i64> = row.get("cert_expiry");
+    let last_seen: Option<i64> = row.get("last_seen");
+    let enrolled_at: Option<i64> = row.get("enrolled_at");
+    let decommissioned_at: Option<i64> = row.get("decommissioned_at");
+    let last_renewed_at: Option<i64> = row.get("last_renewed_at");
+
+    Ok(NodeRecord {
+        id: row.get("id"),
+        label: row.get("label"),
+        public_key_der,
+        dmi_uuid: row.get("dmi_uuid"),
+        status,
+        cert_serial,
+        cert_expiry: cert_expiry.and_then(|t| DateTime::from_timestamp(t, 0)),
+        last_seen: last_seen.and_then(|t| DateTime::from_timestamp(t, 0)),
+        enrolled_at: enrolled_at.and_then(|t| DateTime::from_timestamp(t, 0)),
+        decommissioned_at: decommissioned_at.and_then(|t| DateTime::from_timestamp(t, 0)),
+        last_renewed_at: last_renewed_at.and_then(|t| DateTime::from_timestamp(t, 0)),
+        enrollment_id: row.get("enrollment_id"),
+        tpm_backed: row.get("tpm_backed"),
+        agent_version: row.get("agent_version"),
+        hostname: row.try_get("hostname").unwrap_or(None),
+        os_pretty_name: row.try_get("os_pretty_name").unwrap_or(None),
+        kernel_version: row.try_get("kernel_version").unwrap_or(None),
+        dmi_sys_vendor: row.try_get("dmi_sys_vendor").unwrap_or(None),
+        dmi_product_name: row.try_get("dmi_product_name").unwrap_or(None),
+        tenant_id: row
+            .try_get("tenant_id")
+            .unwrap_or_else(|_| "default".to_string()),
+        stop_behavior: row.try_get("stop_behavior").unwrap_or(None),
+        capabilities: row
+            .try_get("capabilities")
+            .unwrap_or_else(|_| "{}".to_string()),
+    })
+}
+
+fn row_to_rule(row: sqlx::sqlite::SqliteRow) -> Result<Rule> {
+    let created_at: i64 = row.get("created_at");
+    Ok(Rule {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        node_id: row.get("node_id"),
+        interface_name: row.get("interface_name"),
+        direction: row.get("direction"),
+        src_cidr: row.get("src_cidr"),
+        dst_cidr: row.get("dst_cidr"),
+        src_port: row.get::<Option<i64>, _>("src_port").map(|p| p as u32),
+        dst_port: row.get::<Option<i64>, _>("dst_port").map(|p| p as u32),
+        protocol: row.get("protocol"),
+        sni_pattern: row.get("sni_pattern"),
+        quic_version: row.get("quic_version"),
+        src_mac: row.get("src_mac"),
+        dst_mac: row.get("dst_mac"),
+        actions_json: row.get("actions_json"),
+        created_at: DateTime::from_timestamp(created_at, 0).unwrap_or_default(),
+        created_by: row.get("created_by"),
+        expires_after_secs: row
+            .get::<Option<i64>, _>("expires_after_secs")
+            .map(|s| s as u32),
+        schedule_json: row.get("schedule_json"),
+    })
+}
+
+fn row_to_enrollment_token(row: sqlx::sqlite::SqliteRow) -> Result<EnrollmentTokenRecord> {
+    let created_at: i64 = row.get("created_at");
+    let expires_at: i64 = row.get("expires_at");
+    let revoked_at: Option<i64> = row.get("revoked_at");
+    Ok(EnrollmentTokenRecord {
+        token_id: row.get("token_id"),
+        token_hash: row.get("token_hash"),
+        created_at: DateTime::from_timestamp(created_at, 0).unwrap_or_default(),
+        created_by: row.get("created_by"),
+        expires_at: DateTime::from_timestamp(expires_at, 0).unwrap_or_default(),
+        uses_remaining: row.get("uses_remaining"),
+        cidr_scope: row.get("cidr_scope"),
+        fleet_label: row.get("fleet_label"),
+        revoked_at: revoked_at.and_then(|t| DateTime::from_timestamp(t, 0)),
+        tenant_id: row.get("tenant_id"),
+    })
+}
+
+fn row_to_node_interface(row: sqlx::sqlite::SqliteRow) -> Result<NodeInterface> {
+    let last_reported: i64 = row.get("last_reported");
+    Ok(NodeInterface {
+        node_id: row.get("node_id"),
+        name: row.get("interface_name"),
+        ifindex: row.try_get::<i64, _>("ifindex").unwrap_or(0) as u32,
+        mac_address: row.get("mac_address"),
+        link_state: row.get("link_state"),
+        addresses_json: row.get("addresses_json"),
+        tag: row.get("tag"),
+        last_reported: DateTime::from_timestamp(last_reported, 0).unwrap_or_default(),
+        xdp_attached: row.try_get::<bool, _>("xdp_attached").unwrap_or(false),
+        tc_attached: row.try_get::<bool, _>("tc_attached").unwrap_or(false),
+        fib_forwarding: row.try_get::<bool, _>("fib_forwarding").unwrap_or(false),
+        ingress_default_action: row.try_get("ingress_default_action").unwrap_or(None),
+        egress_default_action: row.try_get("egress_default_action").unwrap_or(None),
+    })
+}

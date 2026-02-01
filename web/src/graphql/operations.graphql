@@ -1,0 +1,240 @@
+# Policy Engine GraphQL Operations
+
+# Queries
+
+query GetStatus {
+  status {
+    running
+    version
+    uptimeSecs
+    programAttached
+    inspectMode
+    suricataRunning
+  }
+}
+
+query GetInterfaces {
+  interfaces {
+    interface
+    ifindex
+    mode
+    direction
+  }
+}
+
+query GetAvailableInterfaces {
+  availableInterfaces
+}
+
+query GetStats($interface: String!, $direction: GqlDirection!) {
+  stats(interface: $interface, direction: $direction) {
+    rxPackets
+    rxBytes
+    txPackets
+    txBytes
+    policyMatches
+    policyDrops
+    policyPass
+    policyRedirects
+    parseErrors
+    tailCalls
+    bumPackets
+    nonIpUnicast
+    inspectRedirects
+  }
+}
+
+query GetEthertypeStats($interface: String!, $direction: GqlDirection!) {
+  ethertypeStats(interface: $interface, direction: $direction) {
+    ethertype
+    name
+    packets
+  }
+}
+
+query GetRuleStats($ruleId: String!, $direction: GqlDirection!) {
+  ruleStats(ruleId: $ruleId, direction: $direction) {
+    packets
+    bytes
+    lastSeenNs
+  }
+}
+
+query GetRules($direction: GqlDirection!) {
+  rules(direction: $direction) {
+    ruleId
+    interface
+    srcPrefix
+    dstPrefix
+    sport
+    dport
+    protocol
+    priority
+    actions {
+      action
+      priority
+    }
+    sni
+    quicVersion
+    srcMac
+    dstMac
+  }
+}
+
+query GetInspectStatus {
+  inspectStatus {
+    mode
+    suricataRunning
+    mirrorInterface
+    mirrorIfindex
+    flowVerdictCount
+  }
+}
+
+query GetFlowVerdicts($direction: GqlDirection!) {
+  flowVerdicts(direction: $direction) {
+    activeVerdicts
+  }
+}
+
+query GetSuricataStatus {
+  suricataStatus {
+    success
+    message
+  }
+}
+
+# Mutations
+
+mutation AttachIngress($input: AttachIngressInput!) {
+  attachIngress(input: $input) {
+    success
+    message
+  }
+}
+
+mutation DetachIngress($input: DetachIngressInput!) {
+  detachIngress(input: $input) {
+    success
+    message
+  }
+}
+
+mutation AttachEgress($input: AttachTcInput!) {
+  attachTc(input: $input) {
+    success
+    message
+  }
+}
+
+mutation DetachEgress($input: DetachTcInput!) {
+  detachTc(input: $input) {
+    success
+    message
+  }
+}
+
+mutation DetachAll {
+  detachAll {
+    success
+    message
+  }
+}
+
+mutation AddRule($input: AddRuleInput!) {
+  addRule(input: $input) {
+    success
+    message
+  }
+}
+
+mutation DeleteRule($input: DeleteRuleInput!) {
+  deleteRule(input: $input) {
+    success
+    message
+  }
+}
+
+mutation FlushRules($interface: String!, $direction: GqlDirection!) {
+  flushRules(interface: $interface, direction: $direction) {
+    success
+    message
+  }
+}
+
+mutation SetDefaultAction($input: DefaultActionInput!) {
+  setDefaultAction(input: $input) {
+    success
+    message
+  }
+}
+
+mutation ClearGlobalStats($interface: String!, $direction: GqlDirection!) {
+  clearGlobalStats(interface: $interface, direction: $direction) {
+    success
+    message
+  }
+}
+
+mutation ClearRuleStats($ruleId: String!, $direction: GqlDirection!) {
+  clearRuleStats(ruleId: $ruleId, direction: $direction) {
+    success
+    message
+  }
+}
+
+mutation ClearAllRuleStats($direction: GqlDirection!) {
+  clearAllRuleStats(direction: $direction) {
+    success
+    message
+  }
+}
+
+mutation ClearEthertypeStats($interface: String!, $direction: GqlDirection!) {
+  clearEthertypeStats(interface: $interface, direction: $direction) {
+    success
+    message
+  }
+}
+
+mutation ClearInterfaceStats($interface: String!, $direction: GqlDirection!) {
+  clearInterfaceStats(interface: $interface, direction: $direction) {
+    success
+    message
+  }
+}
+
+mutation ConfigureInspect($mode: GqlInspectMode!) {
+  configureInspect(input: { mode: $mode }) {
+    success
+    message
+  }
+}
+
+mutation DisableInspect {
+  disableInspect {
+    success
+    message
+  }
+}
+
+mutation DeploySuricataRules($rules: String!, $filename: String!) {
+  deploySuricataRules(input: { rules: $rules, filename: $filename }) {
+    success
+    message
+  }
+}
+
+mutation ReloadSuricataRules {
+  reloadSuricataRules {
+    success
+    message
+  }
+}
+
+mutation ClearFlowVerdicts($direction: GqlDirection!) {
+  clearFlowVerdicts(direction: $direction) {
+    success
+    message
+  }
+}

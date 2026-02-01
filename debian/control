@@ -1,0 +1,190 @@
+Source: policy-engine
+Section: net
+Priority: optional
+Maintainer: Peter Morrow <pdmorrow@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc,
+               llvm-19 | llvm,
+               clang-19 | clang,
+               libbpf-dev,
+               linux-headers-generic | linux-headers-amd64,
+               nodejs,
+               npm,
+               protobuf-compiler,
+               libtss2-dev,
+Standards-Version: 4.6.2
+Homepage: https://github.com/dufferinsw/policy_engine
+Rules-Requires-Root: no
+
+Package: policy-engine
+Build-Profiles: <!pkg.policy-engine.suricata !pkg.policy-engine.ipfix>
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libbpf1
+Suggests: grafana, prometheus, policy-engine-web
+Description: XDP policy-based packet processing engine
+ A high-performance XDP policy-based packet processing engine built with
+ libbpf-rs. Provides ingress policy enforcement using eBPF/XDP for Linux.
+ .
+ Features:
+  - XDP Support for high-performance ingress policy enforcement
+  - 5-tuple matching (source/destination IP, ports, protocol)
+  - IPv4 and IPv6 dual-stack support
+  - Wildcard matching in any tuple field
+  - Per-rule and global statistics
+  - Server/Client architecture with GraphQL API
+ .
+ This package contains the policy-engine server daemon and event reader.
+
+Package: policy-engine-ips
+Build-Profiles: <pkg.policy-engine.suricata !pkg.policy-engine.ipfix>
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libbpf1, suricata
+Provides: policy-engine
+Conflicts: policy-engine, policy-engine-ipfix, policy-engine-ips-ipfix
+Suggests: grafana, prometheus, policy-engine-web
+Description: XDP policy-based packet processing engine with Suricata IPS/IDS
+ A high-performance XDP policy-based packet processing engine built with
+ libbpf-rs. Provides ingress policy enforcement using eBPF/XDP for Linux,
+ with optional Suricata-based deep packet inspection (IPS/IDS mode).
+ .
+ Features:
+  - XDP Support for high-performance ingress policy enforcement
+  - 5-tuple matching (source/destination IP, ports, protocol)
+  - IPv4 and IPv6 dual-stack support
+  - Wildcard matching in any tuple field
+  - Per-rule and global statistics
+  - Server/Client architecture with GraphQL API
+  - Suricata IPS/IDS integration via TC clone-redirect
+  - Flow verdict cache for line-rate enforcement
+ .
+ This package contains the policy-engine server daemon and event reader.
+
+Package: policy-engine-ipfix
+Build-Profiles: <!pkg.policy-engine.suricata pkg.policy-engine.ipfix>
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libbpf1
+Provides: policy-engine
+Conflicts: policy-engine, policy-engine-ips, policy-engine-ips-ipfix
+Suggests: grafana, prometheus, policy-engine-web
+Description: XDP policy-based packet processing engine with IPFIX flow export
+ A high-performance XDP policy-based packet processing engine built with
+ libbpf-rs. Provides ingress policy enforcement using eBPF/XDP for Linux,
+ with RFC 7011 IPFIX flow export for per-flow traffic visibility.
+ .
+ Features:
+  - XDP Support for high-performance ingress policy enforcement
+  - 5-tuple matching (source/destination IP, ports, protocol)
+  - IPv4 and IPv6 dual-stack support
+  - Wildcard matching in any tuple field
+  - Per-rule and global statistics
+  - Server/Client architecture with GraphQL API
+  - IPFIX flow export to any RFC 7011-compliant collector
+  - Configurable idle and active flow timeouts
+ .
+ This package contains the policy-engine server daemon and event reader.
+
+Package: policy-engine-ips-ipfix
+Build-Profiles: <pkg.policy-engine.suricata pkg.policy-engine.ipfix>
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libbpf1, suricata
+Provides: policy-engine, policy-engine-ips, policy-engine-ipfix
+Conflicts: policy-engine, policy-engine-ips, policy-engine-ipfix
+Suggests: grafana, prometheus, policy-engine-web
+Description: XDP policy-based packet processing engine with Suricata IPS/IDS and IPFIX
+ A high-performance XDP policy-based packet processing engine built with
+ libbpf-rs. Provides ingress policy enforcement using eBPF/XDP for Linux,
+ with Suricata-based deep packet inspection and RFC 7011 IPFIX flow export.
+ .
+ Features:
+  - XDP Support for high-performance ingress policy enforcement
+  - 5-tuple matching (source/destination IP, ports, protocol)
+  - IPv4 and IPv6 dual-stack support
+  - Wildcard matching in any tuple field
+  - Per-rule and global statistics
+  - Server/Client architecture with GraphQL API
+  - Suricata IPS/IDS integration via TC clone-redirect
+  - Flow verdict cache for line-rate enforcement
+  - IPFIX flow export to any RFC 7011-compliant collector
+  - Configurable idle and active flow timeouts
+ .
+ This package contains the policy-engine server daemon and event reader.
+
+Package: policy-engine-client
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: CLI client for the policy engine
+ A command-line tool for managing a policy-engine deployment.
+ Supports rule management, interface attachment, statistics inspection,
+ and event stream consumption via the GraphQL API.
+
+Package: policy-engine-web
+Architecture: all
+Depends: ${misc:Depends}
+Description: Web UI for the policy engine
+ React-based dashboard for managing the policy engine server.
+ Served automatically by the policy-engine daemon when installed at
+ /usr/share/policy-engine-web.
+
+Package: policy-engine-client-dev
+Architecture: all
+Depends: cargo, rustc
+Description: Rust client library for the policy engine (development files)
+ A standalone Rust library for communicating with the policy engine server
+ via its GraphQL API. Use this library to build custom clients that
+ integrate with threat intelligence feeds or automate rule management.
+ .
+ The library source is installed under /usr/share/policy-engine-client/
+ and can be referenced as a path dependency in your Cargo.toml:
+  policy-engine-client = { path = "/usr/share/policy-engine-client" }
+
+Package: policy-controller-client
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: CLI client for the policy controller operator API
+ A command-line tool for managing a policy-controller deployment.
+ Supports node enrollment approval, ruleset creation and assignment,
+ config push, decommissioning, and audit log inspection.
+
+Package: policy-controller
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Suggests: policy-controller-web
+Description: Central controller daemon for a fleet of policy-engine nodes
+ Manages a fleet of policy-engine nodes: distributes rulesets, aggregates
+ visibility, and provides a zero-touch provisioning (ZTP) enrollment
+ workflow secured with mutual TLS.
+ .
+ Features:
+  - Automatic CA generation (ECDSA P-384) and node certificate issuance
+  - Zero-touch enrollment with operator approval workflow
+  - Desired-state ruleset distribution to all managed nodes
+  - Aggregated Prometheus metrics and WebSocket event stream
+  - GraphQL operator API with audit logging
+  - SQLite-backed state store
+
+Package: policy-controller-web
+Architecture: all
+Depends: ${misc:Depends}, policy-controller
+Description: Web UI for the policy controller
+ React-based fleet dashboard for managing a policy-controller deployment.
+ Shows node health, enrollment queue, ruleset editor, and audit log.
+ Served automatically by the policy-controller daemon when installed at
+ /usr/share/policy-controller/web.
+
+Package: policy-node-agent
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: policy-engine, tpm2-tools
+Description: Node agent that bridges policy-engine with a central controller
+ Connects a local policy-engine instance to a policy-controller daemon.
+ Handles enrollment, certificate management, config distribution, and
+ forwards BPF events and Prometheus metrics to the controller.
+ .
+ Features:
+  - Zero-touch enrollment with automatic cert renewal (30d before expiry)
+  - mTLS bidirectional gRPC stream to the controller
+  - Applies ruleset pushes from the controller to the local policy-engine
+  - Forwards BPF events from the local WebSocket event stream
+  - Scrapes and forwards local Prometheus metrics every 30s
+  - Runtime TPM detection with automatic fallback to file-based identity

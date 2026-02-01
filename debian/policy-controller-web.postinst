@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+#DEBHELPER#
+
+# Restart the controller so it picks up the newly installed web UI files.
+if [ "$1" = "configure" ] && [ -d /run/systemd/system ]; then
+    if systemctl is-active --quiet policy-controller.service; then
+        systemctl restart policy-controller.service || true
+    fi
+fi

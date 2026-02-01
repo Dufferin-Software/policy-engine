@@ -1,0 +1,20 @@
+services:
+  policy-controller:
+    image: policy-controller:0.1.0
+    build:
+      context: ../..
+      dockerfile: policy-engine/docker/policy-controller/Dockerfile
+      args:
+        DEB: policy-controller_0.1.0_amd64.deb
+    ports:
+      - "8443:8443"   # Operator API (HTTP/GraphQL + web UI)
+      - "7776:7776"   # Enrollment gRPC (TLS)
+      - "7777:7777"   # Node Management gRPC (mTLS)
+    volumes:
+      # Config and CA key are host-provided; never baked into the image
+      - /etc/policy-controller:/etc/policy-controller:ro
+      # SQLite database persists across container restarts
+      - /var/lib/policy-controller:/var/lib/policy-controller
+    environment:
+      RUST_LOG: "info"
+    restart: unless-stopped

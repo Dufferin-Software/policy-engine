@@ -1,0 +1,34 @@
+[Unit]
+Description=Policy Controller Daemon
+Documentation=https://github.com/dufferinsw/policy_engine
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/policy-controller --config /etc/policy-controller/config.toml
+Restart=on-failure
+RestartSec=5
+DynamicUser=yes
+PrivateUsers=yes
+Environment=RUST_LOG=info
+RuntimeDirectory=policy-controller
+StateDirectory=policy-controller
+ConfigurationDirectory=policy-controller
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+policy-engine (0.1.0) unstable; urgency=medium
+
+  * Initial release.
+  * XDP policy-based packet processing engine
+  * Server/client architecture with GraphQL API
+  * 5-tuple matching with LPM trie for CIDR prefixes
+  * IPv4 and IPv6 support
+  * Per-rule and global statistics
+
+ -- Dufferin Software <support@dufferinsw.com>  Fri, 31 Jan 2026 12:00:00 +0000

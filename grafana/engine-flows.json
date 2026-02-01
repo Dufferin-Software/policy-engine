@@ -1,0 +1,807 @@
+{
+  "title": "Policy engine \u2014 IPFIX flows",
+  "uid": "duf-engine-flows",
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "tags": [
+    "dufferin",
+    "policy-engine",
+    "ipfix",
+    "flows"
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Total flows",
+      "type": "stat",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "elasticsearch"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "elasticsearch"
+          },
+          "query": "",
+          "timeField": "@timestamp",
+          "metrics": [
+            {
+              "type": "count",
+              "id": "1"
+            }
+          ],
+          "bucketAggs": []
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "sum"
+          ]
+        },
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 2,
+      "title": "Total bytes",
+      "type": "stat",
+      "gridPos": {
+        "x": 4,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "elasticsearch"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "elasticsearch"
+          },
+          "query": "",
+          "timeField": "@timestamp",
+          "metrics": [
+            {
+              "type": "sum",
+              "field": "netflow.in_bytes",
+              "id": "1"
+            }
+          ],
+          "bucketAggs": []
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {
+            "mode": "thresholds"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "sum"
+          ]
+        },
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 3,
+      "title": "Total packets",
+      "type": "stat",
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "datasource": {
+        "type": "elasticsearch"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "elasticsearch"
+          },
+          "query": "",
+          "timeField": "@timestamp",
+          "metrics": [
+            {
+              "type": "sum",
+              "field": "netflow.in_pkts",
+              "id": "1"
+            }
+          ],
+          "bucketAggs": []
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "sum"
+          ]
+        },
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Protocol breakdown",
+      "type": "piechart",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "type": "elasticsearch"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "elasticsearch"
+          },
+          "query": "",
+          "timeField": "@timestamp",
+          "metrics": [
+            {
+              "type": "count",
+              "id": "1"
+            }
+          ],
+          "bucketAggs": [
+            {
+              "type": "terms",
+              "field": "netflow.protocol",
+              "id": "2",
+              "settings": {
+                "size": "10",
+                "order": "desc",
+                "orderBy": "1",
+                "missing": "0",
+                "min_doc_count": "1"
+              }
+            }
+          ]
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "valueLabels": "name"
+      },
+      "fieldConfig": {
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "6"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "TCP"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "17"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "UDP"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "1"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "ICMP"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "58"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "ICMPv6"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 5,
+      "title": "Ingress vs egress (bytes)",
+      "type": "piechart",
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 8
+      },
+      "datasource": {
+        "type": "elasticsearch"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "elasticsearch"
+          },
+          "query": "",
+          "timeField": "@timestamp",
+          "metrics": [
+            {
+              "type": "sum",
+              "field": "netflow.in_bytes",
+              "id": "1"
+            }
+          ],
+          "bucketAggs": [
+            {
+              "type": "terms",
+              "field": "direction.keyword",
+              "id": "2",
+              "settings": {
+                "size": "5",
+                "order": "desc",
+                "orderBy": "1"
+              }
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Flows per minute",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "elasticsearch"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "elasticsearch"
+          },
+          "query": "",
+          "timeField": "@timestamp",
+          "metrics": [
+            {
+              "type": "count",
+              "id": "1"
+            }
+          ],
+          "bucketAggs": [
+            {
+              "type": "date_histogram",
+              "field": "@timestamp",
+              "id": "2",
+              "settings": {
+                "interval": "1m",
+                "min_doc_count": "0",
+                "trimEdges": "0"
+              }
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Bytes per minute by direction",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "elasticsearch"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "elasticsearch"
+          },
+          "query": "direction:ingress",
+          "timeField": "@timestamp",
+          "alias": "ingress",
+          "metrics": [
+            {
+              "type": "sum",
+              "field": "netflow.in_bytes",
+              "id": "1"
+            }
+          ],
+          "bucketAggs": [
+            {
+              "type": "date_histogram",
+              "field": "@timestamp",
+              "id": "2",
+              "settings": {
+                "interval": "1m",
+                "min_doc_count": "0"
+              }
+            }
+          ]
+        },
+        {
+          "datasource": {
+            "type": "elasticsearch"
+          },
+          "query": "direction:egress",
+          "timeField": "@timestamp",
+          "alias": "egress",
+          "metrics": [
+            {
+              "type": "sum",
+              "field": "netflow.in_bytes",
+              "id": "1"
+            }
+          ],
+          "bucketAggs": [
+            {
+              "type": "date_histogram",
+              "field": "@timestamp",
+              "id": "2",
+              "settings": {
+                "interval": "1m",
+                "min_doc_count": "0"
+              }
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10
+          }
+        }
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Top source IPs by bytes",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 12,
+        "h": 10
+      },
+      "datasource": {
+        "type": "elasticsearch"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "elasticsearch"
+          },
+          "query": "",
+          "timeField": "@timestamp",
+          "metrics": [
+            {
+              "type": "sum",
+              "field": "netflow.in_bytes",
+              "id": "1"
+            },
+            {
+              "type": "sum",
+              "field": "netflow.in_pkts",
+              "id": "2"
+            },
+            {
+              "type": "count",
+              "id": "3"
+            }
+          ],
+          "bucketAggs": [
+            {
+              "type": "terms",
+              "field": "netflow.ipv4_src_addr",
+              "id": "4",
+              "settings": {
+                "size": "20",
+                "order": "desc",
+                "orderBy": "1"
+              }
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Sum in_bytes"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              },
+              {
+                "id": "displayName",
+                "value": "Bytes"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Sum in_pkts"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Packets"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Count"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Flows"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "netflow.ipv4_src_addr"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Source IP"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "sortBy": [
+          {
+            "displayName": "Bytes",
+            "desc": true
+          }
+        ]
+      }
+    },
+    {
+      "id": 9,
+      "title": "Top destination IPs by bytes",
+      "type": "table",
+      "gridPos": {
+        "x": 12,
+        "y": 20,
+        "w": 12,
+        "h": 10
+      },
+      "datasource": {
+        "type": "elasticsearch"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "elasticsearch"
+          },
+          "query": "",
+          "timeField": "@timestamp",
+          "metrics": [
+            {
+              "type": "sum",
+              "field": "netflow.in_bytes",
+              "id": "1"
+            },
+            {
+              "type": "sum",
+              "field": "netflow.in_pkts",
+              "id": "2"
+            },
+            {
+              "type": "count",
+              "id": "3"
+            }
+          ],
+          "bucketAggs": [
+            {
+              "type": "terms",
+              "field": "netflow.ipv4_dst_addr",
+              "id": "4",
+              "settings": {
+                "size": "20",
+                "order": "desc",
+                "orderBy": "1"
+              }
+            }
+          ]
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Sum in_bytes"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              },
+              {
+                "id": "displayName",
+                "value": "Bytes"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Sum in_pkts"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Packets"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Count"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Flows"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "netflow.ipv4_dst_addr"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Destination IP"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "sortBy": [
+          {
+            "displayName": "Bytes",
+            "desc": true
+          }
+        ]
+      }
+    },
+    {
+      "id": 10,
+      "title": "Recent flows",
+      "type": "table",
+      "gridPos": {
+        "x": 0,
+        "y": 30,
+        "w": 24,
+        "h": 12
+      },
+      "datasource": {
+        "type": "elasticsearch"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "elasticsearch"
+          },
+          "query": "",
+          "timeField": "@timestamp",
+          "metrics": [
+            {
+              "type": "raw_document",
+              "id": "1",
+              "settings": {
+                "size": "100"
+              }
+            }
+          ],
+          "bucketAggs": []
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "_id": true,
+              "_index": true,
+              "_type": true,
+              "_score": true,
+              "sort": true,
+              "netflow.version": true,
+              "netflow.flow_seq_num": true,
+              "netflow.sampling_algorithm": true,
+              "netflow.sampling_interval": true,
+              "netflow.output_snmp": true,
+              "netflow.input_snmp": true,
+              "netflow.ipv4_next_hop": true,
+              "netflow.src_as": true,
+              "netflow.dst_as": true,
+              "netflow.src_mask": true,
+              "netflow.dst_mask": true,
+              "tags": true,
+              "type": true,
+              "host": true,
+              "@version": true
+            },
+            "indexByName": {
+              "@timestamp": 0,
+              "netflow.ipv4_src_addr": 1,
+              "netflow.l4_src_port": 2,
+              "netflow.ipv4_dst_addr": 3,
+              "netflow.l4_dst_port": 4,
+              "netflow.protocol": 5,
+              "direction": 6,
+              "netflow.in_bytes": 7,
+              "netflow.in_pkts": 8
+            },
+            "renameByName": {
+              "@timestamp": "Time",
+              "netflow.ipv4_src_addr": "Src IP",
+              "netflow.l4_src_port": "Src Port",
+              "netflow.ipv4_dst_addr": "Dst IP",
+              "netflow.l4_dst_port": "Dst Port",
+              "netflow.protocol": "Protocol",
+              "direction": "Direction",
+              "netflow.in_bytes": "Bytes",
+              "netflow.in_pkts": "Packets"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bytes"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "sortBy": [
+          {
+            "displayName": "Time",
+            "desc": true
+          }
+        ]
+      }
+    }
+  ]
+}

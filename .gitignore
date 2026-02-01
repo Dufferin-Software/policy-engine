@@ -1,0 +1,10 @@
+/target
+/src/bpf/.output
+*.o
+*.ll
+*.buildinfo
+*.deb
+*.changes
+*.profraw
+/coverage
+node_modules

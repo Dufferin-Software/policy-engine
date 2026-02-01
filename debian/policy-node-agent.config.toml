@@ -1,0 +1,62 @@
+# Policy Node Agent Configuration
+#
+# This file configures the policy-node-agent daemon, which connects to a
+# policy-controller for centralized fleet management.
+#
+# Uncomment and set the required fields to enable the agent.
+# At minimum, controller_url must be set.
+
+# ── Controller connection ────────────────────────────────────────────────────
+
+# URL of the policy-controller management gRPC endpoint (mTLS, port 7777 by default).
+# Used for the ongoing bidirectional management stream after enrollment.
+# REQUIRED — the agent will not start without this.
+#
+# controller_url = "https://controller.example.com:7777"
+
+# URL of the policy-controller enrollment gRPC endpoint (TLS only, port 7776 by default).
+# Used to obtain the initial mTLS client certificate before joining the management stream.
+# If omitted, controller_url is used (only correct when both services share the same port).
+#
+# enrollment_url = "https://controller.example.com:7776"
+
+# ── TLS certificates ────────────────────────────────────────────────────────
+
+# Path to the controller CA certificate (PEM).
+# Used to verify the controller's TLS server certificate.
+# Default: /etc/policy-node-agent/controller-ca.crt
+#
+# ca_cert_path = "/etc/policy-node-agent/controller-ca.crt"
+
+# ── Node identity ────────────────────────────────────────────────────────────
+
+# Path to the node identity key (PKCS#8 PEM, mode 0600).
+# Generated automatically on first run if absent.
+# Default: /var/lib/policy-node-agent/identity.key
+#
+# identity_key_path = "/var/lib/policy-node-agent/identity.key"
+
+# Path where the issued mTLS client certificate is stored after enrollment.
+# Default: /var/lib/policy-node-agent/controller-client.crt
+#
+# client_cert_path = "/var/lib/policy-node-agent/controller-client.crt"
+
+# Path where the issued mTLS client private key is stored after enrollment.
+# Default: /var/lib/policy-node-agent/controller-client.key
+#
+# client_key_path = "/var/lib/policy-node-agent/controller-client.key"
+
+# ── Local policy-engine ─────────────────────────────────────────────────────
+
+# URL of the local policy-engine GraphQL server.
+# The agent applies configuration received from the controller by calling
+# this endpoint on the local machine.
+# Default: http://127.0.0.1:8080/graphql
+#
+# local_server_url = "http://127.0.0.1:8080/graphql"
+
+# ── Interface discovery ─────────────────────────────────────────────────────
+
+# Interface names to exclude from discovery reports sent to the controller.
+# These interfaces will not appear in the controller UI.
+interface_blocklist = ["lo"]

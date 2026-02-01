@@ -1,0 +1,4 @@
+etc/suricata/rules
+etc/systemd/system/suricata.service.d
+usr/share/policy-engine/grafana
+etc/grafana/provisioning/dashboards

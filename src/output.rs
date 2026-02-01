@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
+
 //! Output formatting utilities
 
 use crate::types::*;
@@ -97,8 +100,12 @@ pub fn print_stats(ifname: &str, stats: &GlobalStats) {
     policy_table.add_row(row!["Policy Matches", format_packets(stats.policy_matches)]);
     policy_table.add_row(row!["Policy Pass", format_packets(stats.policy_pass)]);
     policy_table.add_row(row!["Policy Drops", format_packets(stats.policy_drops)]);
-    policy_table.add_row(row!["Policy Redirects", format_packets(stats.policy_redirects)]);
+    policy_table.add_row(row![
+        "Policy Redirects",
+        format_packets(stats.policy_redirects)
+    ]);
     policy_table.add_row(row!["Parse Errors", format_packets(stats.parse_errors)]);
+    policy_table.add_row(row!["Fragments", format_packets(stats.fragments)]);
     policy_table.add_row(row!["Tail Calls", format_packets(stats.tail_calls)]);
 
     policy_table.printstd();
@@ -120,400 +127,139 @@ pub fn print_rule_stats(rule_id: u64, stats: &RuleStats) {
     table.printstd();
 }
 
-/// Print policy rules as a table
-pub fn print_rules_table(rules: &[(FlowKey, PolicyValue)]) {
-    if rules.is_empty() {
-        println!("No policy rules configured.");
-        return;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── format_bytes ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn format_bytes_zero() {
+        assert_eq!(format_bytes(0), "0 B");
     }
 
-    let mut table = Table::new();
-    table.set_format(*format::consts::FORMAT_BOX_CHARS);
-
-    table.add_row(row![
-        "ID",
-        "Priority",
-        "Source",
-        "Destination",
-        "Proto",
-        "Action",
-        "Flags"
-    ]);
-
-    for (key, value) in rules {
-        let src = format_flow_addr(key, true);
-        let dst = format_flow_addr(key, false);
-        let proto = format_protocol(key.protocol);
-        // Get the first action from the embedded actions list
-        let action = if value.num_actions > 0 {
-            PolicyAction::from(value.actions[0].action)
-        } else {
-            PolicyAction::Pass
-        };
-        let flags = format_flags(value.flags);
-        // Copy values from packed struct to avoid unaligned references
-        let rule_id = value.rule_id;
-        let priority = value.priority;
-
-        table.add_row(row![
-            rule_id,
-            priority,
-            src,
-            dst,
-            proto,
-            action,
-            flags
-        ]);
+    #[test]
+    fn format_bytes_below_kb() {
+        assert_eq!(format_bytes(1), "1 B");
+        assert_eq!(format_bytes(1023), "1023 B");
     }
 
-    table.printstd();
-    println!("\nTotal rules: {}", rules.len());
-}
-
-/// Print policy rules as JSON
-pub fn print_rules_json(rules: &[(FlowKey, PolicyValue)]) {
-    #[derive(serde::Serialize)]
-    struct RuleJson {
-        rule_id: u64,
-        priority: u32,
-        src_addr: String,
-        dst_addr: String,
-        src_port: u16,
-        dst_port: u16,
-        protocol: String,
-        action: String,
-        flags: Vec<String>,
+    #[test]
+    fn format_bytes_kb() {
+        assert_eq!(format_bytes(1024), "1.00 KB");
+        assert_eq!(format_bytes(2048), "2.00 KB");
+        assert_eq!(format_bytes(1536), "1.50 KB");
+        // 512 KB
+        assert_eq!(format_bytes(512 * 1024), "512.00 KB");
     }
 
-    let json_rules: Vec<RuleJson> = rules
-        .iter()
-        .map(|(key, value)| {
-            let action = if value.num_actions > 0 {
-                PolicyAction::from(value.actions[0].action).to_string()
-            } else {
-                PolicyAction::Pass.to_string()
-            };
-            RuleJson {
-                rule_id: value.rule_id,
-                priority: value.priority,
-                src_addr: format_flow_addr(key, true),
-                dst_addr: format_flow_addr(key, false),
-                src_port: key.sport,
-                dst_port: key.dport,
-                protocol: format_protocol(key.protocol),
-                action,
-                flags: format_flags_vec(value.flags),
-            }
-        })
-        .collect();
-
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json_rules).unwrap_or_else(|_| "[]".to_string())
-    );
-}
-
-/// Format flow address
-fn format_flow_addr(key: &FlowKey, is_src: bool) -> String {
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
-    let (addr, port) = if is_src {
-        (&key.saddr, key.sport)
-    } else {
-        (&key.daddr, key.dport)
-    };
-
-    let ip_str = if key.af == AF_INET {
-        let octets: [u8; 4] = addr[..4].try_into().unwrap();
-        let ip = Ipv4Addr::from(octets);
-        if ip.is_unspecified() {
-            "*".to_string()
-        } else {
-            ip.to_string()
-        }
-    } else {
-        let octets: [u8; 16] = *addr;
-        let ip = Ipv6Addr::from(octets);
-        if ip.is_unspecified() {
-            "*".to_string()
-        } else {
-            ip.to_string()
-        }
-    };
-
-    if port == 0 {
-        format!("{}:*", ip_str)
-    } else {
-        format!("{}:{}", ip_str, port)
-    }
-}
-
-/// Format protocol number
-fn format_protocol(proto: u8) -> String {
-    match proto {
-        0 => "any".to_string(),
-        1 => "icmp".to_string(),
-        6 => "tcp".to_string(),
-        17 => "udp".to_string(),
-        _ => format!("{}", proto),
-    }
-}
-
-/// Format flags as string
-fn format_flags(flags: u32) -> String {
-    let mut parts = Vec::new();
-
-    if flags & flags::POLICY_FLAG_ENABLED != 0 {
-        parts.push("E");
-    }
-    if flags & flags::POLICY_FLAG_LOG != 0 {
-        parts.push("L");
-    }
-    if flags & flags::POLICY_FLAG_BIDIRECTIONAL != 0 {
-        parts.push("B");
-    }
-    if flags & flags::POLICY_FLAG_CONNTRACK != 0 {
-        parts.push("C");
+    #[test]
+    fn format_bytes_mb() {
+        assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 10), "10.00 MB");
     }
 
-    if parts.is_empty() {
-        "-".to_string()
-    } else {
-        parts.join("")
-    }
-}
-
-/// Format flags as vector of strings
-fn format_flags_vec(flags: u32) -> Vec<String> {
-    let mut parts = Vec::new();
-
-    if flags & flags::POLICY_FLAG_ENABLED != 0 {
-        parts.push("enabled".to_string());
-    }
-    if flags & flags::POLICY_FLAG_LOG != 0 {
-        parts.push("log".to_string());
-    }
-    if flags & flags::POLICY_FLAG_BIDIRECTIONAL != 0 {
-        parts.push("bidirectional".to_string());
-    }
-    if flags & flags::POLICY_FLAG_CONNTRACK != 0 {
-        parts.push("conntrack".to_string());
+    #[test]
+    fn format_bytes_gb() {
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024 * 2), "2.00 GB");
     }
 
-    parts
-}
-
-/// Print LPM policy rules as a table
-pub fn print_lpm_rules_table(
-    v4_rules: &[(LpmKeyV4, LpmPolicyEntry)],
-    v6_rules: &[(LpmKeyV6, LpmPolicyEntry)],
-) {
-    let total = v4_rules.len() + v6_rules.len();
-    if total == 0 {
-        println!("No LPM policy rules configured.");
-        return;
+    #[test]
+    fn format_bytes_tb() {
+        assert_eq!(format_bytes(1024u64 * 1024 * 1024 * 1024), "1.00 TB");
+        assert_eq!(format_bytes(1024u64 * 1024 * 1024 * 1024 * 5), "5.00 TB");
     }
 
-    let mut table = Table::new();
-    table.set_format(*format::consts::FORMAT_BOX_CHARS);
+    // ── format_packets ───────────────────────────────────────────────────────
 
-    table.add_row(row![
-        "ID",
-        "Priority",
-        "Source CIDR",
-        "Dest CIDR",
-        "Ports",
-        "Proto",
-        "Action",
-        "Flags"
-    ]);
-
-    // IPv4 rules
-    for (key, entry) in v4_rules {
-        let src_cidr = format_lpm_key_v4(key);
-        let dst_cidr = format_lpm_entry_dst_v4(entry);
-        let ports = format_ports(entry.sport, entry.dport);
-        let proto = format_protocol(entry.protocol);
-        let action = if entry.num_actions > 0 {
-            PolicyAction::from(entry.actions[0].action)
-        } else {
-            PolicyAction::Pass
-        };
-        let flags = format_flags(entry.flags);
-        // Copy values from packed struct to avoid unaligned references
-        let rule_id = entry.rule_id;
-        let priority = entry.priority;
-
-        table.add_row(row![
-            rule_id,
-            priority,
-            src_cidr,
-            dst_cidr,
-            ports,
-            proto,
-            action,
-            flags
-        ]);
+    #[test]
+    fn format_packets_zero() {
+        assert_eq!(format_packets(0), "0");
     }
 
-    // IPv6 rules
-    for (key, entry) in v6_rules {
-        let src_cidr = format_lpm_key_v6(key);
-        let dst_cidr = format_lpm_entry_dst_v6(entry);
-        let ports = format_ports(entry.sport, entry.dport);
-        let proto = format_protocol(entry.protocol);
-        let action = if entry.num_actions > 0 {
-            PolicyAction::from(entry.actions[0].action)
-        } else {
-            PolicyAction::Pass
-        };
-        let flags = format_flags(entry.flags);
-        // Copy values from packed struct to avoid unaligned references
-        let rule_id = entry.rule_id;
-        let priority = entry.priority;
-
-        table.add_row(row![
-            rule_id,
-            priority,
-            src_cidr,
-            dst_cidr,
-            ports,
-            proto,
-            action,
-            flags
-        ]);
+    #[test]
+    fn format_packets_below_k() {
+        assert_eq!(format_packets(1), "1");
+        assert_eq!(format_packets(999), "999");
     }
 
-    table.printstd();
-    println!("\nTotal LPM rules: {} (IPv4: {}, IPv6: {})", total, v4_rules.len(), v6_rules.len());
-}
-
-/// Print LPM policy rules as JSON
-pub fn print_lpm_rules_json(
-    v4_rules: &[(LpmKeyV4, LpmPolicyEntry)],
-    v6_rules: &[(LpmKeyV6, LpmPolicyEntry)],
-) {
-    #[derive(serde::Serialize)]
-    struct LpmRuleJson {
-        rule_id: u64,
-        priority: u32,
-        src_cidr: String,
-        dst_cidr: String,
-        src_port: u16,
-        dst_port: u16,
-        protocol: String,
-        action: String,
-        flags: Vec<String>,
-        address_family: String,
+    #[test]
+    fn format_packets_k() {
+        assert_eq!(format_packets(1_000), "1.00K");
+        assert_eq!(format_packets(5_500), "5.50K");
     }
 
-    let mut json_rules: Vec<LpmRuleJson> = Vec::new();
-
-    // IPv4 rules
-    for (key, entry) in v4_rules {
-        let action = if entry.num_actions > 0 {
-            PolicyAction::from(entry.actions[0].action).to_string()
-        } else {
-            PolicyAction::Pass.to_string()
-        };
-        json_rules.push(LpmRuleJson {
-            rule_id: entry.rule_id,
-            priority: entry.priority,
-            src_cidr: format_lpm_key_v4(key),
-            dst_cidr: format_lpm_entry_dst_v4(entry),
-            src_port: entry.sport,
-            dst_port: entry.dport,
-            protocol: format_protocol(entry.protocol),
-            action,
-            flags: format_flags_vec(entry.flags),
-            address_family: "ipv4".to_string(),
-        });
+    #[test]
+    fn format_packets_m() {
+        assert_eq!(format_packets(1_000_000), "1.00M");
+        assert_eq!(format_packets(2_500_000), "2.50M");
     }
 
-    // IPv6 rules
-    for (key, entry) in v6_rules {
-        let action = if entry.num_actions > 0 {
-            PolicyAction::from(entry.actions[0].action).to_string()
-        } else {
-            PolicyAction::Pass.to_string()
-        };
-        json_rules.push(LpmRuleJson {
-            rule_id: entry.rule_id,
-            priority: entry.priority,
-            src_cidr: format_lpm_key_v6(key),
-            dst_cidr: format_lpm_entry_dst_v6(entry),
-            src_port: entry.sport,
-            dst_port: entry.dport,
-            protocol: format_protocol(entry.protocol),
-            action,
-            flags: format_flags_vec(entry.flags),
-            address_family: "ipv6".to_string(),
-        });
+    #[test]
+    fn format_packets_g() {
+        assert_eq!(format_packets(1_000_000_000), "1.00G");
+        assert_eq!(format_packets(3_000_000_000), "3.00G");
     }
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json_rules).unwrap_or_else(|_| "[]".to_string())
-    );
-}
+    // ── format_timestamp_ns ──────────────────────────────────────────────────
 
-/// Format LPM key (IPv4)
-fn format_lpm_key_v4(key: &LpmKeyV4) -> String {
-    use std::net::Ipv4Addr;
-    let prefixlen = key.prefixlen;
-    let addr = Ipv4Addr::from(u32::from_be(key.addr));
-    if prefixlen == 0 && addr.is_unspecified() {
-        "any".to_string()
-    } else {
-        format!("{}/{}", addr, prefixlen)
+    #[test]
+    fn format_timestamp_ns_zero_is_never() {
+        assert_eq!(format_timestamp_ns(0), "never");
     }
-}
 
-/// Format LPM key (IPv6)
-fn format_lpm_key_v6(key: &LpmKeyV6) -> String {
-    use std::net::Ipv6Addr;
-    let prefixlen = key.prefixlen;
-    let mut octets = [0u8; 16];
-    for i in 0..4 {
-        let bytes = u32::to_be_bytes(key.addr[i]);
-        octets[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
+    #[test]
+    fn format_timestamp_ns_future() {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let ts = now_ns + 10_000_000_000_000; // well in the future
+        assert_eq!(format_timestamp_ns(ts), "future?");
     }
-    let addr = Ipv6Addr::from(octets);
-    if prefixlen == 0 && addr.is_unspecified() {
-        "any".to_string()
-    } else {
-        format!("{}/{}", addr, prefixlen)
-    }
-}
 
-/// Format LPM entry destination (IPv4)
-fn format_lpm_entry_dst_v4(entry: &LpmPolicyEntry) -> String {
-    use std::net::Ipv4Addr;
-    let octets: [u8; 4] = entry.daddr[..4].try_into().unwrap_or([0; 4]);
-    let addr = Ipv4Addr::from(octets);
-    let prefixlen = entry.dst_prefixlen;
-    if prefixlen == 0 && addr.is_unspecified() {
-        "any".to_string()
-    } else {
-        format!("{}/{}", addr, prefixlen)
+    #[test]
+    fn format_timestamp_ns_seconds_ago() {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let ts = now_ns.saturating_sub(10 * 1_000_000_000); // 10s ago
+        let result = format_timestamp_ns(ts);
+        assert!(result.ends_with("s ago"), "got: {}", result);
     }
-}
 
-/// Format LPM entry destination (IPv6)
-fn format_lpm_entry_dst_v6(entry: &LpmPolicyEntry) -> String {
-    use std::net::Ipv6Addr;
-    let addr = Ipv6Addr::from(entry.daddr);
-    let prefixlen = entry.dst_prefixlen;
-    if prefixlen == 0 && addr.is_unspecified() {
-        "any".to_string()
-    } else {
-        format!("{}/{}", addr, prefixlen)
+    #[test]
+    fn format_timestamp_ns_minutes_ago() {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let ts = now_ns.saturating_sub(5 * 60 * 1_000_000_000); // 5 min ago
+        let result = format_timestamp_ns(ts);
+        assert!(result.ends_with("m ago"), "got: {}", result);
     }
-}
 
-/// Format ports for display
-fn format_ports(sport: u16, dport: u16) -> String {
-    let s = if sport == 0 { "*".to_string() } else { sport.to_string() };
-    let d = if dport == 0 { "*".to_string() } else { dport.to_string() };
-    format!("{}:{}", s, d)
+    #[test]
+    fn format_timestamp_ns_hours_ago() {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let ts = now_ns.saturating_sub(2 * 3600 * 1_000_000_000); // 2h ago
+        let result = format_timestamp_ns(ts);
+        assert!(result.ends_with("h ago"), "got: {}", result);
+    }
+
+    #[test]
+    fn format_timestamp_ns_days_ago() {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let ts = now_ns.saturating_sub(2 * 86400 * 1_000_000_000); // 2d ago
+        let result = format_timestamp_ns(ts);
+        assert!(result.ends_with("d ago"), "got: {}", result);
+    }
 }

@@ -1,0 +1,1065 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * TC Policy Engine - Egress TC program with LPM-based policy matching
+ *
+ * Mirrors xdp_policy.bpf.c for egress traffic using TC (Traffic Control).
+ * Uses separate maps prefixed with tc_ to allow independent ingress/egress
+ * rules.
+ */
+
+#include "../include/bpf_helpers.h"
+#include "../include/policy_common.h"
+#include "../include/vmlinux_subset.h"
+
+char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+/*
+ * Per-rule statistics map (egress)
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, MAX_POLICY_RULES);
+  __type(key, __u64); /* rule_id */
+  __type(value, struct rule_stats);
+} tc_rule_stats SEC(".maps");
+
+/*
+ * Global per-CPU statistics (egress)
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, MAX_INTERFACES);
+  __type(key, __u32);
+  __type(value, struct global_stats);
+} tc_global_stats SEC(".maps");
+
+/*
+ * Tail call program array for dispatcher (egress)
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+  __uint(max_entries, MAX_DISPATCHER_PROGS);
+  __type(key, __u32);
+  __type(value, __u32);
+} tc_dispatcher SEC(".maps");
+
+/*
+ * Ring buffer for events (egress)
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 256 * 1024); /* 256 KB */
+} tc_events SEC(".maps");
+
+/*
+ * Ring buffer for QUIC Initial inspection events (TC egress).
+ * Mirrors quic_inspect_events in xdp_policy.bpf.c.  Separate map so the
+ * egress side has its own producer/consumer pair.
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 1024 * 1024); /* 1 MB */
+} tc_quic_inspect_events SEC(".maps");
+
+/*
+ * Flow verdict cache for egress.  Generic primitive shared by the Suricata
+ * IPS path, the QUIC SNI inspector (userspace), and the in-kernel TCP SNI
+ * inspector tc_sni_inspect (PASS/DROP after walking matched rule actions).
+ * Always compiled in.
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, MAX_FLOW_VERDICTS);
+  __type(key, struct flow_verdict_key);
+  __type(value, struct flow_verdict);
+} tc_flow_verdict_cache SEC(".maps");
+
+#ifdef SURICATA_IPS
+/*
+ * Inspect configuration (used by both TC egress and TC ingress)
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct inspect_config);
+} tc_inspect_config SEC(".maps");
+
+/*
+ * Flows to inspect: shared with XDP skeleton via BPF filesystem pinning.
+ * XDP writes an entry on each INSPECT rule match; TC ingress reads it to
+ * decide which flows to clone to pe-inspect0 for Suricata inspection.
+ * Value is the expiry timestamp in nanoseconds.
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, MAX_FLOWS_TO_INSPECT);
+  __type(key, struct flow_verdict_key);
+  __type(value, __u64); /* expiry timestamp in ns */
+} flows_to_inspect SEC(".maps");
+#endif /* SURICATA_IPS */
+
+/*
+ * Scratch space for per-packet metadata (used by tail call chain).
+ * Mirrors struct pkt_meta in xdp_policy.bpf.c; kept separate because TC and
+ * XDP use independent PERCPU_ARRAY maps.
+ */
+struct tc_pkt_meta {
+  struct flow_key flow; /* 40 bytes */
+  __u32 pkt_len;        /* 4  bytes */
+  __u16 l4_off;         /* 2  bytes */
+  __u8 sni_count;       /* 1  byte  — number of valid entries in sni_pending */
+  __u8 sni_idx;         /* 1  byte  — next entry for tc_sni_inspect to check */
+  __u8 sni_seen;        /* 1  byte  — non-zero once match_sni_in_packet parsed a
+                                       ClientHello (sni_result != 0).  Gates the
+                                       no-match PASS verdict write so TCP SYNs
+                                       and other non-TLS segments don't poison
+                                       the cache before the real CH arrives. */
+  __u8 _sni_pad[5];     /* explicit padding so the layout is obvious — t0 below
+                           is 8-byte aligned regardless of compiler choice */
+  __u64
+      t0;                                             /* 8  bytes — packet start timestamp for processing-time histogram */
+  struct sni_pending_entry sni_pending[MAX_L4_RULES]; /* 8 × 80 = 640 bytes */
+  /* Flow cache tail call fields — written by TC_FLOW_CACHE_TAIL_CALL, read by tc_flow_cache_update */
+  __u32 fc_verdict; /* TC return code to pass through */
+  __u32 fc_action;  /* ACTION_PASS / ACTION_DROP / etc. */
+  __u64 fc_rule_id; /* matched rule id (or 0) */
+}; /* 200 bytes total */
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct tc_pkt_meta);
+} tc_pkt_scratch SEC(".maps");
+
+/*
+ * SNI rules map (egress): keyed by rule_id, contains the TLS SNI pattern.
+ * Written by userspace when a TC egress rule with SNI criteria is installed.
+ * Read exclusively by tc_sni_inspect (tail call slot 0).
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, MAX_POLICY_RULES);
+  __type(key, __u64); /* rule_id */
+  __type(value, struct sni_rule_entry);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+} tc_sni_rules SEC(".maps");
+
+/*
+ * MAC rule sidecar map (TC egress mirror of XDP mac_rules).
+ * Keyed by rule_id (u64); value is struct mac_rule_entry.
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, MAX_POLICY_RULES);
+  __type(key, __u64); /* rule_id */
+  __type(value, struct mac_rule_entry);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+} tc_mac_rules SEC(".maps");
+
+/*
+ * MAC sidecar check helper for TC egress — mirrors check_mac_rule_xdp.
+ * Marked __noinline to keep the rule-scan loop in tc_policy_egress within the
+ * ±32767 instruction branch-range limit.
+ * pkt_src/pkt_dst must be PTR_TO_STACK (local arrays, not raw packet pointers).
+ */
+static __noinline __u8 check_mac_rule_tc(const __u8 *pkt_src,
+                                         const __u8 *pkt_dst,
+                                         __u8 mac_match_flags,
+                                         __u64 rule_id) {
+  if (!mac_match_flags)
+    return 1;
+  struct mac_rule_entry *me = bpf_map_lookup_elem(&tc_mac_rules, &rule_id);
+  if (!me)
+    return 0;
+  return match_mac(pkt_src, pkt_dst, mac_match_flags, me);
+}
+
+/*
+ * Default action when no rule matches (configurable from userspace)
+ */
+/*
+ * Per-interface default action when no rule matches (configurable from userspace).
+ * Keyed by egress ifindex → u32 action (ACTION_PASS / ACTION_DROP).
+ * Absent entry → ACTION_PASS.
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, MAX_INTERFACES);
+  __type(key, __u32);
+  __type(value, __u32);
+} tc_default_action SEC(".maps");
+
+/*
+ * Two-level LPM: source prefix tries (egress, IPv4 and IPv6).
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __uint(max_entries, MAX_SRC_GROUPS);
+  __type(key, struct src_lpm_key_v4);
+  __type(value, struct src_lpm_value);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+} tc_src_lpm_v4 SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __uint(max_entries, MAX_SRC_GROUPS);
+  __type(key, struct src_lpm_key_v6);
+  __type(value, struct src_lpm_value);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+} tc_src_lpm_v6 SEC(".maps");
+
+/*
+ * Inner dst LPM trie prototypes (egress, IPv4 and IPv6).
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __uint(max_entries, MAX_DST_ENTRIES_PER_GROUP);
+  __type(key, struct lpm_key_v4);
+  __type(value, struct dst_lpm_value);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+} tc_dst_lpm_v4_inner SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+  __uint(max_entries, MAX_DST_ENTRIES_PER_GROUP);
+  __type(key, struct lpm_key_v6);
+  __type(value, struct dst_lpm_value);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+} tc_dst_lpm_v6_inner SEC(".maps");
+
+/*
+ * HASH_OF_MAPS: src_group_id → inner dst LPM trie (egress, IPv4 and IPv6).
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+  __uint(max_entries, MAX_SRC_GROUPS);
+  __type(key, __u32);
+  __array(values, tc_dst_lpm_v4_inner);
+} tc_src_groups_v4 SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH_OF_MAPS);
+  __uint(max_entries, MAX_SRC_GROUPS);
+  __type(key, __u32);
+  __array(values, tc_dst_lpm_v6_inner);
+} tc_src_groups_v6 SEC(".maps");
+
+/*
+ * Processing-time histogram (log2 ns buckets 0-63, egress)
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 64);
+  __type(key, __u32);
+  __type(value, __u64);
+} tc_processing_time_hist SEC(".maps");
+
+/*
+ * Per-IP-protocol packet/byte counters (egress, indexed by protocol 0-255)
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 256);
+  __type(key, __u32);
+  __type(value, struct proto_stats);
+} tc_per_proto_stats SEC(".maps");
+
+/*
+ * Per-L3-protocol packet/byte counters (egress).
+ * Buckets: 0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 5);
+  __type(key, __u32);
+  __type(value, struct proto_stats);
+} tc_per_l3_stats SEC(".maps");
+
+/*
+ * Flow cache configuration — enables/disables per-flow accounting for IPFIX
+ * (egress direction). Written by userspace; read on every processed packet.
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct flow_cache_config);
+} tc_flow_cache_config_map SEC(".maps");
+
+/*
+ * Per-flow accounting cache for IPFIX export (egress direction).
+ * LRU_HASH auto-evicts the least-recently-used entry when full.
+ * Key: struct flow_key (5-tuple). Value: struct flow_cache_entry.
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 65536);
+  __type(key, struct flow_key);
+  __type(value, struct flow_cache_entry);
+} tc_flow_cache SEC(".maps");
+
+/* Record elapsed ns into the egress log2 histogram (reads clock internally) */
+#define TC_RECORD_TIMING(t0)                                             \
+  do {                                                                   \
+    __u64 __delta = bpf_ktime_get_ns() - (t0);                           \
+    __u32 __slot = log2_u64(__delta);                                    \
+    if (__slot > 63)                                                     \
+      __slot = 63;                                                       \
+    __u64 *__h = bpf_map_lookup_elem(&tc_processing_time_hist, &__slot); \
+    if (__h)                                                             \
+      (*__h)++;                                                          \
+  } while (0)
+
+/* Record elapsed ns using a pre-fetched 'now' — avoids an extra
+ * bpf_ktime_get_ns() call on paths that already read the clock. */
+#define TC_RECORD_TIMING_AT(t0, now)                                     \
+  do {                                                                   \
+    __u64 __delta = (now) - (t0);                                        \
+    __u32 __slot = log2_u64(__delta);                                    \
+    if (__slot > 63)                                                     \
+      __slot = 63;                                                       \
+    __u64 *__h = bpf_map_lookup_elem(&tc_processing_time_hist, &__slot); \
+    if (__h)                                                             \
+      (*__h)++;                                                          \
+  } while (0)
+
+/*
+ * TC_FLOW_CACHE_TAIL_CALL — tail-call tc_flow_cache_update with flow metadata.
+ *
+ * Mirrors FLOW_CACHE_TAIL_CALL in xdp_policy.bpf.c; uses tc_pkt_scratch and
+ * tc_dispatcher. TC does not chain to FIB forwarding (TC-only program).
+ *
+ * Fail-open: if the tail call slot is not loaded the bpf_tail_call is a no-op
+ * and execution continues with the plain `return (_verdict)` below.
+ */
+#define TC_FLOW_CACHE_TAIL_CALL(_ctx, _fk, _len, _rid, _act, _verdict)      \
+  do {                                                                      \
+    __u32 _fc_key = 0;                                                      \
+    struct tc_pkt_meta *_fcm =                                              \
+        bpf_map_lookup_elem(&tc_pkt_scratch, &_fc_key);                     \
+    if (_fcm) {                                                             \
+      __builtin_memcpy(&_fcm->flow, (_fk), sizeof(struct flow_key));        \
+      _fcm->pkt_len = (_len);                                               \
+      _fcm->fc_rule_id = (_rid);                                            \
+      _fcm->fc_action = (_act);                                             \
+      _fcm->fc_verdict = (_verdict);                                        \
+      bpf_tail_call((_ctx), &tc_dispatcher, TC_DISPATCHER_FLOW_CACHE_SLOT); \
+    }                                                                       \
+    return (_verdict);                                                      \
+  } while (0)
+
+// clang-format off
+#include "parse.h"
+#include "stats.h"
+#include "events.h"
+#include "actions.h"
+#include "lookup.h"
+// clang-format on
+
+SEC("tc")
+int tc_policy_egress(struct __sk_buff *ctx) {
+  struct flow_key flow_key;
+  struct dst_lpm_value *policy;
+  __u32 pkt_len = ctx->len;
+  __u32 zero = 0;
+  __u64 t0 = bpf_ktime_get_ns();
+  __u64 tc_fc_rule_id = 0; /* rule_id for flow cache: first matching rule */
+
+  /* Hoist both hot pointers — one lookup each for the whole path */
+  __u32 gs_key = ctx->ifindex % MAX_INTERFACES;
+  struct global_stats *gs = bpf_map_lookup_elem(&tc_global_stats, &gs_key);
+#ifdef SURICATA_IPS
+  struct inspect_config *icfg = bpf_map_lookup_elem(&tc_inspect_config, &zero);
+#endif
+
+  /* Count ALL egress packets (including non-IP) */
+  if (gs) {
+    gs->tx_packets++;
+    gs->tx_bytes += pkt_len;
+  }
+
+  /* Extract source/destination MAC for per-rule L2 matching */
+  __u8 pkt_src_mac[6] = {};
+  __u8 pkt_dst_mac[6] = {};
+  {
+    void *_mac_data = (void *)(long)ctx->data;
+    const void *_mac_data_end = (void *)(long)ctx->data_end;
+    struct ethhdr *_eth = _mac_data;
+    if ((void *)(_eth + 1) <= _mac_data_end) {
+      __builtin_memcpy(pkt_src_mac, _eth->h_source, 6);
+      __builtin_memcpy(pkt_dst_mac, _eth->h_dest, 6);
+    }
+  }
+
+  /* Classify L3 protocol (buckets: 0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other) */
+  {
+    void *data = (void *)(long)ctx->data;
+    const void *data_end = (void *)(long)ctx->data_end;
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) <= data_end) {
+      __u16 eth_proto = bpf_ntohs(eth->h_proto);
+      /* Look through one level of VLAN tag */
+      if (eth_proto == ETH_P_8021Q) {
+        struct {
+          __be16 tci;
+          __be16 inner;
+        } *vlan = (void *)(eth + 1);
+        if ((void *)(vlan + 1) <= data_end)
+          eth_proto = bpf_ntohs(vlan->inner);
+      }
+      __u32 l3_key = 4;
+      if (eth_proto == ETH_P_IP)
+        l3_key = 0;
+      else if (eth_proto == ETH_P_IPV6)
+        l3_key = 1;
+      else if (eth_proto == ETH_P_ARP)
+        l3_key = 2;
+      else if (eth_proto == ETHERTYPE_MPLS || eth_proto == ETHERTYPE_MPLS_MC)
+        l3_key = 3;
+      struct proto_stats *l3ps = bpf_map_lookup_elem(&tc_per_l3_stats, &l3_key);
+      if (l3ps) {
+        l3ps->packets++;
+        l3ps->bytes += pkt_len;
+      }
+    }
+  }
+
+  /* Parse packet to extract flow key.
+   * Returns >= 0 (L4 offset) on success, PARSE_NONFIRST_FRAG (-2) for a
+   * non-first IP fragment, or -1 on a genuine parse error / non-IP traffic. */
+  int l4_off = tc_parse_packet(ctx, &flow_key);
+
+  if (l4_off == PARSE_NONFIRST_FRAG) {
+    /* Non-first IP fragment: src/dst IP and protocol are valid, no L4 header.
+     * Count it and let the policy lookup proceed with IP/protocol-only
+     * matching. */
+    if (gs)
+      gs->fragments++;
+    l4_off = 0;
+  } else if (l4_off < 0) {
+    /* Non-IP traffic or malformed packet on egress — pass through */
+    TC_RECORD_TIMING(t0);
+    return TC_ACT_OK;
+  }
+
+  /* Update per-IP-protocol stats (flow_key.protocol valid from here) */
+  {
+    __u32 proto_key = flow_key.protocol;
+    struct proto_stats *ps =
+        bpf_map_lookup_elem(&tc_per_proto_stats, &proto_key);
+    if (ps) {
+      ps->packets++;
+      ps->bytes += pkt_len;
+    }
+  }
+
+  /* Check flow verdict cache.  Writers are the Suricata EVE consumer and the
+   * QUIC SNI inspector; a hit short-circuits the policy lookup. */
+  {
+    struct flow_verdict_key fv_key = {};
+    if (flow_key.af == AF_INET) {
+      fv_key.saddr4 = flow_key.saddr4;
+      fv_key.daddr4 = flow_key.daddr4;
+    } else {
+      __builtin_memcpy(fv_key.saddr6, flow_key.saddr6, 16);
+      __builtin_memcpy(fv_key.daddr6, flow_key.daddr6, 16);
+    }
+    fv_key.sport = flow_key.sport;
+    fv_key.dport = flow_key.dport;
+    fv_key.protocol = flow_key.protocol;
+    fv_key.af = flow_key.af;
+
+    struct flow_verdict *fv =
+        bpf_map_lookup_elem(&tc_flow_verdict_cache, &fv_key);
+    if (fv) {
+      __u64 now = bpf_ktime_get_ns();
+      if (fv->expires_ns == 0 || now < fv->expires_ns) {
+        if (fv->action == ACTION_DROP) {
+          __sync_fetch_and_add(&fv->packets, 1);
+          __sync_fetch_and_add(&fv->bytes, pkt_len);
+          update_action_stats(gs, ACTION_DROP);
+          if (gs) {
+            gs->verdict_drop_packets++;
+            gs->verdict_drop_bytes += pkt_len;
+          }
+          /* Reuse 'now' already read above — avoids an extra clock call */
+          TC_RECORD_TIMING_AT(t0, now);
+          return TC_ACT_SHOT;
+        } else if (fv->action == ACTION_PASS) {
+          /* Cached PASS verdict: flow previously inspected, pass through. */
+          __sync_fetch_and_add(&fv->packets, 1);
+          __sync_fetch_and_add(&fv->bytes, pkt_len);
+          update_action_stats(gs, ACTION_PASS);
+          if (gs) {
+            gs->verdict_pass_packets++;
+            gs->verdict_pass_bytes += pkt_len;
+          }
+          TC_RECORD_TIMING_AT(t0, now);
+          return TC_ACT_OK;
+        }
+      }
+    }
+  }
+
+#ifdef SURICATA_IPS
+  /* Clone egress packets belonging to flows being inspected on ingress.
+   * flows_to_inspect is keyed by the ingress direction (src=server,
+   * dst=client). Reverse the 5-tuple so that outgoing client→server packets are
+   * also sent to Suricata, giving it the full bidirectional stream and allowing
+   * request-based rules (e.g. http.host) to fire before the server responds. */
+  {
+    if (icfg && icfg->mode != INSPECT_MODE_DISABLED &&
+        icfg->mirror_ifindex != 0) {
+      struct flow_verdict_key fv_key = {};
+      /* Swap src/dst: egress is client→server, map keys are server→client */
+      if (flow_key.af == AF_INET) {
+        fv_key.saddr4 = flow_key.daddr4;
+        fv_key.daddr4 = flow_key.saddr4;
+      } else {
+        __builtin_memcpy(fv_key.saddr6, flow_key.daddr6, 16);
+        __builtin_memcpy(fv_key.daddr6, flow_key.saddr6, 16);
+      }
+      fv_key.sport = flow_key.dport;
+      fv_key.dport = flow_key.sport;
+      fv_key.protocol = flow_key.protocol;
+      fv_key.af = flow_key.af;
+
+      const __u64 *expiry = bpf_map_lookup_elem(&flows_to_inspect, &fv_key);
+      if (expiry) {
+        __u64 now = bpf_ktime_get_ns();
+        if (*expiry == 0 || now < *expiry)
+          bpf_clone_redirect(ctx, icfg->mirror_ifindex, 0);
+      }
+    }
+  }
+#endif /* SURICATA_IPS */
+
+  /* Lookup policy (two-level LPM: src prefix → dst prefix → L4 rules).
+   * Scoped per-interface by skb->ifindex (TC egress interface). */
+  policy = tc_lookup_policy_v2(&flow_key, ctx->ifindex);
+
+  if (policy) {
+    /* Update rule match counter */
+    if (gs)
+      gs->policy_matches++;
+
+    /* Pre-populate tc_pkt_scratch for the SNI tail-call chain */
+    struct tc_pkt_meta *meta = bpf_map_lookup_elem(&tc_pkt_scratch, &zero);
+    if (meta) {
+      __builtin_memcpy(&meta->flow, &flow_key, sizeof(flow_key));
+      meta->pkt_len = pkt_len;
+      meta->l4_off = (__u16)l4_off;
+      meta->sni_count = 0;
+      meta->sni_idx = 0;
+      meta->sni_seen = 0;
+      meta->t0 = t0;
+    }
+
+    __u8 cnt = policy->count;
+    if (cnt > MAX_L4_RULES)
+      cnt = MAX_L4_RULES;
+
+    int final_verdict = TC_ACT_OK;
+    __u8 dropped = 0;
+
+    /* Scan all L4 rules in this dst entry.
+     * Non-SNI rules are applied immediately; SNI rules queued for tail call. */
+    for (int r = 0; r < MAX_L4_RULES; r++) {
+      if (!dropped && (__u8)r < cnt) {
+        struct l4_rule *rule = &policy->rules[r];
+        if (match_l4(&flow_key, rule) &&
+            match_quic_version(flow_key.flags, rule->quic_version) &&
+            check_mac_rule_tc(pkt_src_mac, pkt_dst_mac,
+                              rule->mac_match_flags, rule->rule_id)) {
+          if (rule->sni_match_type == SNI_MATCH_NONE) {
+            tc_update_rule_stats(rule->rule_id, pkt_len, t0);
+            if (tc_fc_rule_id == 0)
+              tc_fc_rule_id = rule->rule_id;
+            int v = tc_process_rule_actions(ctx, gs, rule, &flow_key, t0
+#ifdef SURICATA_IPS
+                                            ,
+                                            icfg
+#endif
+            );
+            if (v == TC_ACT_SHOT) {
+              tc_fc_rule_id = rule->rule_id; /* override with DROP rule */
+              dropped = 1;
+              final_verdict = TC_ACT_SHOT;
+            }
+          } else {
+            if (meta && meta->sni_count < MAX_L4_RULES) {
+              __u8 si = meta->sni_count;
+              __asm__ volatile("" : "+r"(si));
+              si &= (MAX_L4_RULES - 1);
+              meta->sni_pending[si].rule_id = rule->rule_id;
+              meta->sni_pending[si].num_actions = rule->num_actions;
+#pragma unroll
+              for (__u8 ai = 0; ai < MAX_ACTIONS_PER_RULE; ai++)
+                meta->sni_pending[si].actions[ai] = rule->actions[ai];
+              meta->sni_count++;
+            }
+          }
+        }
+      }
+    }
+
+    if (!dropped && meta && meta->sni_count > 0) {
+      if (gs)
+        gs->tail_calls++;
+      /* Branch by L4 protocol so the same `sni` rule field triggers TLS-
+       * ClientHello matching on TCP and QUIC-Initial detection on UDP.
+       * Timing is recorded by the inspection tail-call program. */
+      if (flow_key.protocol == PROTO_UDP)
+        bpf_tail_call(ctx, &tc_dispatcher, TC_DISPATCHER_QUIC_SLOT);
+      else
+        bpf_tail_call(ctx, &tc_dispatcher, TC_DISPATCHER_SNI_SLOT);
+      /* Tail call slot not loaded — fail open */
+      TC_RECORD_TIMING(t0);
+      update_action_stats(gs, ACTION_PASS);
+      TC_FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, tc_fc_rule_id, ACTION_PASS, TC_ACT_OK);
+    }
+
+    TC_RECORD_TIMING(t0);
+    TC_FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, tc_fc_rule_id,
+                            final_verdict == TC_ACT_SHOT ? ACTION_DROP : ACTION_PASS,
+                            final_verdict);
+
+  } else {
+    /* No matching rule - use per-interface default action */
+    __u32 ifidx = ctx->ifindex;
+    __u32 *def_action = bpf_map_lookup_elem(&tc_default_action, &ifidx);
+    __u32 action = def_action ? *def_action : ACTION_PASS;
+    update_action_stats(gs, action);
+
+    TC_RECORD_TIMING(t0);
+    switch (action) {
+    case ACTION_DROP:
+      TC_FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, 0, ACTION_DROP, TC_ACT_SHOT);
+    case ACTION_PASS:
+    case ACTION_LOG:
+    default:
+      TC_FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, 0, ACTION_PASS, TC_ACT_OK);
+    }
+  }
+}
+
+/*
+ * Seed tc_flow_verdict_cache with the action selected by tc_sni_inspect after
+ * walking a matched rule's actions[] (or PASS on the no-match-after-all-rules-
+ * exhausted path).  TC egress uses the canonical egress 5-tuple (client→server)
+ * as the key, mirroring the read path in tc_policy_egress's verdict-cache
+ * check.  Subsequent packets short-circuit there without re-running the SNI
+ * tail call.
+ */
+static __always_inline void
+tc_sni_write_verdict(const struct flow_key *flow, __u32 action, __u64 now_ns) {
+  struct flow_verdict_key fv_key = {};
+  if (flow->af == AF_INET) {
+    fv_key.saddr4 = flow->saddr4;
+    fv_key.daddr4 = flow->daddr4;
+  } else {
+    __builtin_memcpy(fv_key.saddr6, flow->saddr6, 16);
+    __builtin_memcpy(fv_key.daddr6, flow->daddr6, 16);
+  }
+  fv_key.sport = flow->sport;
+  fv_key.dport = flow->dport;
+  fv_key.protocol = flow->protocol;
+  fv_key.af = flow->af;
+
+  struct flow_verdict v = {};
+  v.action = action;
+  v.expires_ns = now_ns + SNI_VERDICT_TTL_NS;
+  bpf_map_update_elem(&tc_flow_verdict_cache, &fv_key, &v, BPF_ANY);
+}
+
+/*
+ * tc_sni_inspect — tail call program registered in tc_dispatcher[0].
+ *
+ * Mirrors xdp_sni_inspect for egress traffic.  Processes sni_pending[sni_idx]
+ * from tc_pkt_scratch; on SNI mismatch increments sni_idx and tail-calls itself
+ * to check the next pending rule (chained, up to MAX_L4_RULES=8 invocations).
+ */
+SEC("tc")
+int tc_sni_inspect(struct __sk_buff *ctx) {
+  __u32 zero = 0;
+  struct tc_pkt_meta *meta = bpf_map_lookup_elem(&tc_pkt_scratch, &zero);
+  if (!meta)
+    return TC_ACT_OK;
+  if (meta->sni_idx >= meta->sni_count) {
+    /* All SNI rules exhausted without a match — pass through.  Seed the
+     * verdict cache so subsequent packets on this flow fast-path at L4 entry,
+     * but ONLY if at least one rule's parser observed a real ClientHello on
+     * this packet (sni_seen).  Otherwise this is a pre-handshake segment
+     * (TCP SYN, ACK, etc.) and caching PASS here would poison the cache
+     * before the real CH arrives. */
+    __u64 sni_now = bpf_ktime_get_ns();
+    if (meta->sni_seen)
+      tc_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now);
+    TC_RECORD_TIMING_AT(meta->t0, sni_now);
+    TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, TC_ACT_OK);
+  }
+
+  __u8 idx = meta->sni_idx;
+  idx &= (MAX_L4_RULES - 1);
+
+  __u64 rule_id = meta->sni_pending[idx].rule_id;
+
+  struct sni_rule_entry *sni = bpf_map_lookup_elem(&tc_sni_rules, &rule_id);
+
+  /* TSO/GSO super-skbs (common on egress for large TLS ClientHellos —
+   * Brave + post-quantum key share + ECH pushes the CH to ~2 KB) keep most
+   * payload bytes in paged fragments; ctx->data..data_end only spans the
+   * linear header region.  match_sni_in_packet() uses direct packet access
+   * and will bail at the first read past the linear region, leaving SNI
+   * undetected for any segment whose CH spills past the headers.  Pull
+   * enough data into the linear region to cover a realistic ClientHello
+   * before reading ctx->data.  Cap at SNI_PULL_MAX so the verifier sees a
+   * bounded scalar; the parser itself enforces 0x3000 anyway. */
+  __u32 want = ctx->len;
+  if (want > SNI_PULL_MAX)
+    want = SNI_PULL_MAX;
+  if (want > 0)
+    (void)bpf_skb_pull_data(ctx, want);
+
+  void *data = (void *)(long)ctx->data;
+  const void *data_end = (void *)(long)ctx->data_end;
+
+  __u32 gs_key = ctx->ifindex % MAX_INTERFACES;
+  struct global_stats *gs = bpf_map_lookup_elem(&tc_global_stats, &gs_key);
+
+  if (!sni || sni->sni_match_type == SNI_MATCH_NONE)
+    goto next_rule;
+
+  {
+    int sni_result = match_sni_in_packet(data, data_end, meta->l4_off, sni);
+    if (sni_result != 0)
+      meta->sni_seen = 1; /* parser walked a real ClientHello on this packet */
+    if (sni_result != 1)
+      goto next_rule; /* no SNI / different SNI — try next pending rule */
+
+    /* SNI matched: iterate all actions in priority order, mirroring
+     * tc_process_rule_actions() for non-SNI rules. */
+    __u64 sni_now = bpf_ktime_get_ns();
+    tc_update_rule_stats(rule_id, meta->pkt_len, sni_now);
+
+    __u32 final_verdict = TC_ACT_OK;
+    __u32 final_action = ACTION_PASS;
+    __u8 should_log = 0;
+    __u8 stop_actions = 0;
+    __u8 num_actions = meta->sni_pending[idx].num_actions;
+    if (num_actions > MAX_ACTIONS_PER_RULE)
+      num_actions = MAX_ACTIONS_PER_RULE;
+
+#pragma unroll
+    for (__u8 ai = 0; ai < MAX_ACTIONS_PER_RULE; ai++) {
+      if (stop_actions || ai >= num_actions)
+        break;
+      __u32 a = meta->sni_pending[idx].actions[ai].action;
+      switch (a) {
+      case ACTION_DROP:
+        final_verdict = TC_ACT_SHOT;
+        final_action = ACTION_DROP;
+        stop_actions = 1;
+        break;
+      case ACTION_LOG: {
+        __u64 param = meta->sni_pending[idx].actions[ai].param;
+        if (param > 0) {
+          struct rule_stats *rs =
+              bpf_map_lookup_elem(&tc_rule_stats, &rule_id);
+          if (rs) {
+            __u64 old_ts = rs->last_log_ns;
+            if (sni_now - old_ts < param)
+              break;
+            if (!__sync_bool_compare_and_swap(&rs->last_log_ns, old_ts, sni_now))
+              break;
+          }
+        }
+        should_log = 1;
+        break;
+      }
+      case ACTION_PASS:
+      default:
+        break;
+#ifdef SURICATA_IPS
+      case ACTION_INSPECT: {
+        __u32 icfg_key = 0;
+        struct inspect_config *icfg =
+            bpf_map_lookup_elem(&tc_inspect_config, &icfg_key);
+        if (!icfg || icfg->mode == INSPECT_MODE_DISABLED)
+          break;
+        struct flow_verdict_key fv_key = {};
+        if (meta->flow.af == AF_INET) {
+          fv_key.saddr4 = meta->flow.daddr4;
+          fv_key.daddr4 = meta->flow.saddr4;
+        } else {
+          __builtin_memcpy(fv_key.saddr6, meta->flow.daddr6, 16);
+          __builtin_memcpy(fv_key.daddr6, meta->flow.saddr6, 16);
+        }
+        fv_key.sport = meta->flow.dport;
+        fv_key.dport = meta->flow.sport;
+        fv_key.protocol = meta->flow.protocol;
+        fv_key.af = meta->flow.af;
+        __u64 expiry = sni_now + INSPECT_CLONE_TTL_NS;
+        bpf_map_update_elem(&flows_to_inspect, &fv_key, &expiry, BPF_ANY);
+        if (icfg->mirror_ifindex != 0)
+          bpf_clone_redirect(ctx, icfg->mirror_ifindex, 0);
+        break;
+      }
+#endif /* SURICATA_IPS */
+      }
+    }
+
+    if (should_log) {
+      struct policy_event *evt =
+          bpf_ringbuf_reserve(&tc_events, sizeof(*evt), 0);
+      if (evt) {
+        evt->timestamp_ns = sni_now;
+        evt->rule_id = rule_id;
+        evt->action = ACTION_LOG;
+        evt->ifindex = ctx->ifindex;
+        __builtin_memcpy(&evt->flow, &meta->flow, sizeof(meta->flow));
+        evt->pkt_len = meta->pkt_len;
+        /* PolicyAction enum, not TC return code — see tc/actions.h */
+        evt->verdict = final_action;
+        evt->sni_len = sni->sni_len;
+        if (sni->sni_len > 0 && sni->sni_len <= MAX_SNI_LEN) {
+#pragma clang loop unroll(disable)
+          for (__u8 i = 0; i < MAX_SNI_LEN; i++)
+            evt->sni[i] = (i < sni->sni_len) ? sni->sni_pattern[i] : 0;
+        }
+        bpf_ringbuf_submit(evt, 0);
+      }
+    }
+
+    update_action_stats(gs, final_action);
+
+    if (final_verdict == TC_ACT_SHOT) {
+      tc_sni_write_verdict(&meta->flow, ACTION_DROP, sni_now);
+      TC_RECORD_TIMING_AT(meta->t0, sni_now);
+      TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, rule_id, ACTION_DROP, TC_ACT_SHOT);
+    }
+    goto next_rule;
+  }
+
+next_rule:
+  meta->sni_idx++;
+  if (meta->sni_idx < meta->sni_count)
+    bpf_tail_call(ctx, &tc_dispatcher, TC_DISPATCHER_SNI_SLOT);
+  /* Either all rules exhausted or tail call slot not loaded — pass through.
+   * Seed the verdict cache only if at least one rule's parser proved this
+   * packet carries a real ClientHello (see comment at the top of the function
+   * for why pre-CH segments must not poison the cache). */
+  {
+    __u64 sni_now = bpf_ktime_get_ns();
+    if (meta->sni_seen)
+      tc_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now);
+    TC_RECORD_TIMING_AT(meta->t0, sni_now);
+  }
+  TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, TC_ACT_OK);
+}
+
+/*
+ * tc_quic_initial_inspect — tail call program registered in
+ * tc_dispatcher[TC_DISPATCHER_QUIC_SLOT].
+ *
+ * Egress mirror of xdp_quic_initial_inspect.  See that program's comment for
+ * the design rationale; the only differences are (a) ringbuf is
+ * tc_quic_inspect_events, (b) packet copy uses bpf_skb_load_bytes, and (c)
+ * verdict-cache seeding flips src/dst to match the canonical ingress
+ * orientation used by all other writers (the policy engine stores verdicts
+ * by ingress 5-tuple regardless of which path observed the flow).
+ */
+SEC("tc")
+int tc_quic_initial_inspect(struct __sk_buff *ctx) {
+  __u32 zero = 0;
+  struct tc_pkt_meta *meta = bpf_map_lookup_elem(&tc_pkt_scratch, &zero);
+  if (!meta)
+    return TC_ACT_OK;
+
+  void *data = (void *)(long)ctx->data;
+  const void *data_end = (void *)(long)ctx->data_end;
+
+  __u16 l4_off = meta->l4_off;
+  if (l4_off > 512)
+    goto pass_through;
+
+  __u32 q_off = (__u32)l4_off + 8;
+
+  if ((void *)((__u8 *)data + q_off + 7) > data_end)
+    goto pass_through;
+
+  __u8 *q = (__u8 *)data + q_off;
+  __u8 first = q[0];
+
+  if ((first & 0xC0) != 0xC0)
+    goto pass_through;
+
+  __u32 version = ((__u32)q[1] << 24) | ((__u32)q[2] << 16) |
+                  ((__u32)q[3] << 8) | q[4];
+
+  __u8 long_type = (first >> 4) & 0x03;
+  if (version == QUIC_VERSION_V1) {
+    if (long_type != 0x00)
+      goto pass_through;
+  } else if (version == QUIC_VERSION_V2) {
+    if (long_type != 0x01)
+      goto pass_through;
+  } else {
+    goto pass_through;
+  }
+
+  __u8 dcid_len = q[5];
+  if (dcid_len == 0 || dcid_len > QUIC_INSPECT_MAX_DCID_LEN)
+    goto pass_through;
+
+  if ((void *)(q + 6 + dcid_len) > data_end)
+    goto pass_through;
+
+  struct quic_inspect_event *evt =
+      bpf_ringbuf_reserve(&tc_quic_inspect_events, sizeof(*evt), 0);
+  if (evt) {
+    evt->timestamp_ns = bpf_ktime_get_ns();
+    evt->ifindex = ctx->ifindex;
+    evt->version = version;
+    __builtin_memcpy(&evt->flow, &meta->flow, sizeof(meta->flow));
+    evt->pkt_len = meta->pkt_len;
+    evt->payload_off = (__u16)q_off;
+    evt->dcid_len = dcid_len;
+
+    /* DCID lives at payload[6..6+dcid_len] in the captured payload below;
+     * userspace extracts it from there.  See xdp_quic_initial_inspect. */
+    __builtin_memset(evt->dcid, 0, sizeof(evt->dcid));
+
+    __u32 avail = (meta->pkt_len > q_off) ? (meta->pkt_len - q_off) : 0;
+    __u32 copy_len = avail;
+    if (copy_len > QUIC_INSPECT_PAYLOAD_MAX)
+      copy_len = QUIC_INSPECT_PAYLOAD_MAX;
+    evt->payload_len = (__u16)copy_len;
+
+    /* See xdp_quic_initial_inspect: volatile round-trip plus two separate
+     * bounds compares are required so the verifier sees umin >= 1. */
+    volatile __u32 cl_slot = copy_len;
+    __u32 cl = cl_slot;
+    if (cl == 0)
+      goto skip_payload_load;
+    if (cl > QUIC_INSPECT_PAYLOAD_MAX)
+      goto skip_payload_load;
+    bpf_skb_load_bytes(ctx, q_off, evt->payload, cl);
+  skip_payload_load:;
+
+    bpf_ringbuf_submit(evt, 0);
+  }
+
+  /* See xdp_quic_initial_inspect: no flow_verdict_cache seed here, because
+   * a deliberately-fragmented ClientHello needs every Initial in the burst
+   * to reach userspace for reassembly.  Userspace writes the verdict once
+   * inspection completes. */
+
+pass_through:
+  TC_RECORD_TIMING(meta->t0);
+  TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, TC_ACT_OK);
+}
+
+/*
+ * tc_flow_cache_update — flow cache accounting program (egress).
+ *
+ * Registered in tc_dispatcher[TC_DISPATCHER_FLOW_CACHE_SLOT].
+ * Tail-called by tc_policy_egress and tc_sni_inspect (via TC_FLOW_CACHE_TAIL_CALL)
+ * with the final verdict and flow metadata stored in tc_pkt_scratch.
+ *
+ * Updates tc_flow_cache if enabled, then returns the stored verdict.
+ * TC does not chain to FIB forwarding (ingress-only feature).
+ */
+SEC("tc")
+int tc_flow_cache_update(struct __sk_buff *ctx) {
+  __u32 zero = 0;
+  struct tc_pkt_meta *meta = bpf_map_lookup_elem(&tc_pkt_scratch, &zero);
+  if (!meta)
+    return TC_ACT_OK;
+
+  __u32 verdict = meta->fc_verdict;
+
+  struct flow_cache_config *cfg =
+      bpf_map_lookup_elem(&tc_flow_cache_config_map, &zero);
+  if (cfg && cfg->enabled == FLOW_CACHE_ENABLED) {
+    struct flow_cache_entry *fe = bpf_map_lookup_elem(&tc_flow_cache, &meta->flow);
+    if (fe) {
+      __sync_fetch_and_add(&fe->packets, 1);
+      __sync_fetch_and_add(&fe->bytes, meta->pkt_len);
+      fe->last_seen_ns = bpf_ktime_get_ns();
+      fe->action = meta->fc_action;
+    } else {
+      struct flow_cache_entry new_fe = {};
+      __u64 now = bpf_ktime_get_ns();
+      new_fe.first_seen_ns = now;
+      new_fe.last_seen_ns = now;
+      new_fe.packets = 1;
+      new_fe.bytes = meta->pkt_len;
+      new_fe.rule_id = meta->fc_rule_id;
+      new_fe.action = meta->fc_action;
+      bpf_map_update_elem(&tc_flow_cache, &meta->flow, &new_fe, BPF_ANY);
+    }
+  }
+
+  return verdict;
+}
+
+/*
+ * TC ingress program: clones INSPECT-marked flows to Suricata.
+ *
+ * Only compiled when SURICATA_IPS is defined.  Without Suricata support the
+ * ingress clone path is not needed.
+ */
+#ifdef SURICATA_IPS
+SEC("tc")
+int tc_policy_ingress(struct __sk_buff *ctx) {
+  __u32 cfg_key = 0;
+  struct inspect_config *cfg =
+      bpf_map_lookup_elem(&tc_inspect_config, &cfg_key);
+  if (!cfg || cfg->mode == INSPECT_MODE_DISABLED || cfg->mirror_ifindex == 0)
+    return TC_ACT_OK;
+
+  struct flow_key flow_key;
+  int l4_off = tc_parse_packet(ctx, &flow_key);
+  /* Non-IP traffic or genuine parse error — pass through unmodified */
+  if (l4_off < 0 && l4_off != PARSE_NONFIRST_FRAG)
+    return TC_ACT_OK;
+
+  /* Build the flow verdict key for the flows_to_inspect lookup */
+  struct flow_verdict_key fv_key = {};
+  if (flow_key.af == AF_INET) {
+    fv_key.saddr4 = flow_key.saddr4;
+    fv_key.daddr4 = flow_key.daddr4;
+  } else {
+    __builtin_memcpy(fv_key.saddr6, flow_key.saddr6, 16);
+    __builtin_memcpy(fv_key.daddr6, flow_key.daddr6, 16);
+  }
+  fv_key.sport = flow_key.sport;
+  fv_key.dport = flow_key.dport;
+  fv_key.protocol = flow_key.protocol;
+  fv_key.af = flow_key.af;
+
+  /* Check if this flow should be cloned to Suricata */
+  const __u64 *expiry = bpf_map_lookup_elem(&flows_to_inspect, &fv_key);
+  if (!expiry)
+    return TC_ACT_OK;
+
+  /* Remove expired entries to keep the map tidy */
+  __u64 now = bpf_ktime_get_ns();
+  if (*expiry != 0 && now >= *expiry) {
+    bpf_map_delete_elem(&flows_to_inspect, &fv_key);
+    return TC_ACT_OK;
+  }
+
+  /* Clone the packet to pe-inspect0 (Suricata receives it on pe-inspect1).
+   * BPF_F_INGRESS=0: the clone is sent as an egress packet out pe-inspect0;
+   * the veth driver delivers it as ingress on the peer (pe-inspect1) where
+   * Suricata's AF-packet socket is bound.
+   * The original sk_buff is unmodified and continues to the application. */
+  bpf_clone_redirect(ctx, cfg->mirror_ifindex, 0);
+
+  return TC_ACT_OK;
+}
+#endif /* SURICATA_IPS */

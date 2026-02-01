@@ -1,0 +1,194 @@
+name: Rust CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  rust:
+    name: Rust CI (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:trixie
+      options: --privileged
+
+    strategy:
+      matrix:
+        include:
+          - name: default
+            profiles: ""
+          - name: suricata
+            profiles: "pkg.policy-engine.suricata"
+          - name: ipfix
+            profiles: "pkg.policy-engine.ipfix"
+          - name: suricata+ipfix
+            profiles: "pkg.policy-engine.suricata pkg.policy-engine.ipfix"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          echo "deb http://deb.debian.org/debian trixie-backports main" >> /etc/apt/sources.list
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            build-essential git sudo ca-certificates \
+            rustc/trixie-backports cargo/trixie-backports \
+            rustfmt/trixie-backports rust-clippy/trixie-backports \
+            clang-19 llvm-19 libbpf-dev \
+            linux-headers-amd64 \
+            clang-format-19 \
+            bpftool \
+            debhelper \
+            pkg-config libelf-dev zlib1g-dev libtss2-dev \
+            libcurl4-openssl-dev/trixie-backports \
+            libnghttp3-dev/trixie-backports \
+            libngtcp2-dev/trixie-backports \
+            nodejs npm \
+            protobuf-compiler
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build and test Debian package
+        env:
+          DEB_BUILD_PROFILES: ${{ matrix.profiles }}
+          CLANG: clang-19
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Check formatting
+        if: matrix.name == 'default'
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all features)
+        if: matrix.name == 'default'
+        env:
+          CLANG: clang-19
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Lint BPF C sources
+        run: make lint-bpf CLANG_FORMAT=clang-format-19
+
+      - name: Mount BPF filesystem
+        run: mount -t bpf bpf /sys/fs/bpf
+
+      - name: Verify BPF programs (kernel verifier)
+        run: make verify-bpf CLANG=clang-19
+
+      - name: Collect Debian packages
+        run: |
+          mkdir -p dist
+          mv ../*.deb dist/
+
+      - name: Upload Debian packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ matrix.name }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  containers:
+    name: Build container images
+    runs-on: ubuntu-24.04
+    needs: rust
+    container:
+      image: debian:trixie
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Docker CLI
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends ca-certificates curl gnupg
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/debian/gpg \
+            | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] \
+            https://download.docker.com/linux/debian trixie stable" \
+            > /etc/apt/sources.list.d/docker.list
+          apt-get update -qq
+          apt-get install -y --no-install-recommends docker-ce-cli
+
+      - name: Download default packages
+        uses: actions/download-artifact@v4
+        with:
+          name: debs-default
+          path: dist/
+
+      - name: Download suricata packages
+        uses: actions/download-artifact@v4
+        with:
+          name: debs-suricata
+          path: dist/
+
+      - name: Download ipfix packages
+        uses: actions/download-artifact@v4
+        with:
+          name: debs-ipfix
+          path: dist/
+
+      - name: Build policy-engine image
+        run: |
+          DEB=$(ls dist/policy-engine_*_amd64.deb | xargs basename)
+          VERSION=$(echo "$DEB" | cut -d_ -f2)
+          docker build --build-arg DEB="$DEB" -f docker/policy-engine/Dockerfile -t "policy-engine:$VERSION" dist/
+
+      - name: Build policy-engine suricata image
+        run: |
+          DEB=$(ls dist/policy-engine-ips_*_amd64.deb | xargs basename)
+          VERSION=$(echo "$DEB" | cut -d_ -f2)
+          docker build --build-arg DEB="$DEB" -f docker/policy-engine/Dockerfile -t "policy-engine:$VERSION-ips" dist/
+
+      - name: Build policy-engine ipfix image
+        run: |
+          DEB=$(ls dist/policy-engine-ipfix_*_amd64.deb | xargs basename)
+          VERSION=$(echo "$DEB" | cut -d_ -f2)
+          docker build --build-arg DEB="$DEB" -f docker/policy-engine/Dockerfile -t "policy-engine:$VERSION-ipfix" dist/
+
+      - name: Build policy-node-agent image
+        run: |
+          DEB=$(ls dist/policy-node-agent_*_amd64.deb | xargs basename)
+          VERSION=$(echo "$DEB" | cut -d_ -f2)
+          docker build --build-arg DEB="$DEB" -f docker/policy-node-agent/Dockerfile -t "policy-node-agent:$VERSION" dist/
+
+      - name: Build policy-controller image
+        run: |
+          DEB=$(ls dist/policy-controller_*_amd64.deb | xargs basename)
+          VERSION=$(echo "$DEB" | cut -d_ -f2)
+          docker build --build-arg DEB="$DEB" -f docker/policy-controller/Dockerfile -t "policy-controller:$VERSION" dist/
+
+  web:
+    name: Web UI lint and build
+    runs-on: ubuntu-24.04
+
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build

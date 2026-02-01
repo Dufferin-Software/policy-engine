@@ -1,0 +1,354 @@
+syntax = "proto3";
+package controller.v1;
+
+// ── Services ────────────────────────────────────────────────────────────────
+
+// Enrollment service — served with server-TLS only (no client cert required).
+// Agents call this before they have been issued a client certificate.
+service EnrollmentService {
+    // Submit an enrollment request. Returns immediately with a pending enrollment_id.
+    rpc RequestEnrollment(EnrollmentRequest) returns (EnrollmentResponse);
+
+    // Poll for enrollment approval. Returns current status and, when approved,
+    // the signed client certificate.
+    rpc CheckEnrollmentStatus(EnrollmentStatusRequest) returns (EnrollmentStatusResponse);
+}
+
+// Management service — served with mutual TLS (mTLS, client cert required).
+// Agents connect once and maintain this stream for the lifetime of the session.
+service NodeManagementService {
+    // Bidirectional stream. Agent dials out and sends the first message (AgentHello
+    // wrapped in AgentMessage). Controller responds with config and queries.
+    rpc AgentStream(stream AgentMessage) returns (stream ControllerMessage);
+
+    // Renew this node's mTLS client certificate. The agent submits a CSR
+    // signed by either the existing client key (cert-only renewal) or a fresh
+    // key (key rotation; see mtls_key_rotation_renewals in the agent config).
+    // The controller validates that the CSR's subject CN matches the node_id
+    // pulled from the *peer cert* — the renewal cannot be steered to a
+    // different node. On success the previous serial is revoked, so the old
+    // cert cannot be used in parallel after handoff.
+    rpc RenewClientCert(RenewClientCertRequest) returns (RenewClientCertResponse);
+}
+
+// ── Agent → Controller messages ─────────────────────────────────────────────
+
+message AgentMessage {
+    oneof payload {
+        AgentHello              hello                  = 1;
+        Heartbeat               heartbeat              = 2;
+        StateSnapshot           state                  = 3;
+        MetricsUpdate           metrics                = 4;
+        EventBatch              events                 = 5;
+        ConfigApplyResult       config_result          = 6;
+        InterfaceUpdate         interface_update       = 7;
+        LocalChangeReport       local_change           = 8;
+        StateRestoreRequest     restore_request        = 9;
+        ConfigConfirm           config_confirm         = 10;
+        RuleLifecycleBatch      rule_lifecycle_events  = 11;
+    }
+}
+
+// First message sent by agent on connect. Controller rejects mismatched protocol versions.
+message AgentHello {
+    string node_id          = 1;  // hex(SHA-256(SubjectPublicKeyInfo DER))
+    uint32 protocol_version = 2;  // Must equal PROTOCOL_VERSION (currently 1)
+    string agent_version    = 3;  // Semver, e.g. "0.1.0"
+    string dmi_uuid         = 4;  // May be empty if not readable
+    bool   tpm_backed       = 5;  // True if private key is stored in TPM
+    repeated InterfaceReport interfaces = 6;  // All network interfaces on this node
+    string hostname         = 7;  // OS hostname, for display only
+    string os_pretty_name  = 8;  // e.g. "Debian GNU/Linux 13 (trixie)"
+    string kernel_version  = 9;  // e.g. "6.12.74+deb13+1-amd64"
+    string dmi_sys_vendor  = 10; // /sys/class/dmi/id/sys_vendor, e.g. "Dell Inc."
+    string dmi_product_name = 11; // /sys/class/dmi/id/product_name, e.g. "PowerEdge R340"
+    Capabilities capabilities = 12; // What this agent build can do (features + event sources)
+}
+
+// Advertised by each agent so the controller can refuse alert rules that
+// reference sources no node in the fleet can produce. Immutable per agent
+// process; refreshed on reconnect.
+message Capabilities {
+    // Optional cargo features compiled in (e.g. "tpm", "xdp_fib_forwarding").
+    // Empty today — placeholder for future feature gating.
+    repeated string features = 1;
+    // Engine library version this agent is linked against.
+    string engine_version = 2;
+    // Event streams this agent can forward. The controller validates alert
+    // rules against the union of sources advertised across the fleet — a
+    // rule referencing a source that no node advertises is rejected at
+    // write time so it can't sit silently in the DB never matching.
+    repeated string sources = 3;
+}
+
+// Periodic liveness signal sent every 30 seconds.
+message Heartbeat {
+    uint64 timestamp_ns = 1;  // UNIX epoch in nanoseconds (CLOCK_REALTIME)
+}
+
+// Full snapshot of the current policy-engine state on this node.
+// Sent immediately after AgentHello and on StateQuery.
+message StateSnapshot {
+    repeated PersistedRule       rules           = 1;
+    repeated PersistedAttachment attachments     = 2;
+    map<string, string>          default_actions = 3;  // deprecated; use per_interface_default_actions
+    repeated string              fib_forwarding_interfaces = 4;  // Interfaces with XDP FIB forwarding enabled (ingress only)
+    // Per-interface default actions. Key = "interface:direction" (e.g. "eth0:ingress"), value = "pass"/"drop".
+    map<string, string>          per_interface_default_actions = 5;
+    // Current stop behavior: "clear-state" or "preserve-state". Empty means not yet reported.
+    string stop_behavior = 6;
+}
+
+message PersistedRule {
+    uint64 id          = 1;
+    bytes  params_json = 2;  // JSON-serialized AddRuleParams (policy-engine internal type)
+}
+
+message PersistedAttachment {
+    string interface_name = 1;
+    BPFDirection direction = 2;
+    BPFMode xdp_mode      = 3;  // unused for TC egress
+}
+
+// Raw Prometheus exposition text scraped from the local policy-engine /metrics endpoint.
+message MetricsUpdate {
+    uint64 timestamp_ns    = 1;
+    bytes  prometheus_text = 2;
+}
+
+// BPF events forwarded from the local policy-engine WebSocket event stream.
+message EventBatch {
+    uint64         timestamp_ns = 1;
+    string         node_id      = 2;  // Annotated by agent for aggregation on controller
+    repeated bytes events_json  = 3;  // One JSON-encoded BPF event per entry
+}
+
+// Rule lifecycle events forwarded from the local policy-engine /ws/rule-events stream.
+message RuleLifecycleBatch {
+    string         node_id      = 1;  // Annotated by agent for aggregation on controller
+    repeated bytes events_json  = 2;  // One JSON-encoded RuleLifecycleEvent per entry
+}
+
+// Result of applying a ConfigPush.
+message ConfigApplyResult {
+    bool   success         = 1;
+    string error_message   = 2;  // Non-empty on failure
+    string ruleset_id      = 3;
+    uint64 ruleset_version = 4;
+}
+
+// Agent → controller confirmation of a config push, keyed by generation_id.
+// Sent after the engine has either (a) accepted the change, (b) rejected it
+// outright, or (c) applied and then reverted it via the local watchdog.
+message ConfigConfirm {
+    string  generation_id = 1;
+    enum Outcome {
+        OUTCOME_UNSPECIFIED = 0;
+        OUTCOME_APPLIED     = 1;  // Engine accepted; awaiting controller commit
+        OUTCOME_REJECTED    = 2;  // Engine refused (validation/BPF error) — never applied
+        OUTCOME_REVERTED    = 3;  // Applied then rolled back (watchdog fired or ack denied)
+    }
+    Outcome outcome       = 2;
+    string  error_message = 3;
+}
+
+// Network interface discovered on a node.
+message InterfaceReport {
+    string name                      = 1;
+    repeated AddressReport addresses = 2;
+    string mac_address               = 3;  // "aa:bb:cc:dd:ee:ff" or empty
+    string link_state                = 4;  // "up", "down", "unknown"
+    uint32 ifindex                   = 5;  // Linux interface index (matches events)
+}
+
+message AddressReport {
+    string address    = 1;  // e.g. "192.168.1.1" or "fe80::1"
+    uint32 prefix_len = 2;  // CIDR prefix length
+    string family     = 3;  // "ipv4" or "ipv6"
+}
+
+// Periodic interface update (sent when interfaces change).
+message InterfaceUpdate {
+    repeated InterfaceReport interfaces = 1;
+}
+
+// Agent reports that config was changed locally (e.g. via policy-client CLI).
+message LocalChangeReport {
+    StateSnapshot current_state = 1;
+    string source               = 2;  // "detected", "cli", "api"
+}
+
+// Agent requests a full config restore from the controller (empty state detected).
+message StateRestoreRequest {
+    string reason = 1;  // "empty_state", "corrupt_state"
+}
+
+// ── Controller → Agent messages ─────────────────────────────────────────────
+
+message ControllerMessage {
+    oneof payload {
+        DeltaConfigPush    config         = 1;
+        StateQuery         state_query    = 2;
+        Disconnect         disconnect     = 3;
+        AttachProgram      attach         = 4;
+        DetachProgram      detach         = 5;
+        SetFibForwarding   set_fib        = 6;
+        ConfigCommitAck    commit_ack     = 7;
+        MetricsQuery       metrics_query  = 8;
+    }
+}
+
+// Controller requesting an immediate metrics push from the agent.
+message MetricsQuery {}
+
+// Controller → agent acknowledgement of a ConfigConfirm{APPLIED}.
+// When committed == true the controller has durably recorded the change; the
+// agent can clear its local inverse-delta. When committed == false the agent
+// must revert the change (e.g. controller chose to roll back after its own
+// deadline). Keyed by generation_id.
+message ConfigCommitAck {
+    string generation_id = 1;
+    bool   committed     = 2;
+    string reason        = 3;  // Optional; populated when committed == false
+}
+
+// Enable or disable XDP FIB forwarding on a single ingress interface.
+// The interface must already have XDP attached (ingress); otherwise the agent
+// returns an error. Forwarded transit traffic bypasses the kernel stack, which
+// also means any TC egress filtering on the outbound interface is NOT applied.
+message SetFibForwarding {
+    string interface_name      = 1;
+    bool   enabled             = 2;
+    string generation_id       = 10;  // ULID; empty means legacy push with no gating
+    uint32 confirm_deadline_ms = 11;  // Agent must confirm within this window
+}
+
+// Delta-based config push. Contains only the changes to apply.
+// When is_full_restore is true, the agent should flush all existing rules
+// before applying rules_to_add.
+message DeltaConfigPush {
+    repeated RuleAdd rules_to_add      = 1;
+    repeated string  rule_ids_to_delete = 2;
+    bool             is_full_restore    = 3;
+    // Per-interface default actions. Key = "interface:direction" (e.g. "eth0:ingress"), value = "pass"/"drop".
+    // Empty value for a key means "unchanged". Only keys present in this map are updated.
+    map<string, string> per_interface_default_actions = 4;
+    string           generation_id       = 5;  // ULID; empty means legacy push with no gating
+    uint32           confirm_deadline_ms = 6;  // Agent must confirm within this window
+    // Desired stop behavior: "clear-state" or "preserve-state". Empty means unchanged.
+    string stop_behavior = 7;
+}
+
+message RuleAdd {
+    string rule_id        = 1;  // Controller-assigned rule UUID
+    string interface_name = 2;
+    string direction      = 3;  // "INGRESS" or "EGRESS"
+    bytes  params_json    = 4;  // JSON-serialized AddRuleInput
+}
+
+// Controller requesting a fresh StateSnapshot from the agent.
+message StateQuery {}
+
+// Graceful shutdown signal from controller.
+message Disconnect {
+    string reason = 1;
+}
+
+// Attach a BPF program to an interface.
+message AttachProgram {
+    string interface_name      = 1;
+    BPFDirection direction     = 2;
+    BPFMode mode               = 3;  // for XDP: AUTO, NATIVE, GENERIC, OFFLOAD
+    string generation_id       = 10;
+    uint32 confirm_deadline_ms = 11;
+}
+
+// Detach a BPF program from an interface.
+message DetachProgram {
+    string interface_name      = 1;
+    BPFDirection direction     = 2;
+    string generation_id       = 10;
+    uint32 confirm_deadline_ms = 11;
+}
+
+// ── Enrollment messages ──────────────────────────────────────────────────────
+
+message EnrollmentRequest {
+    // DER-encoded SubjectPublicKeyInfo (ECDSA P-256) for the node's identity key.
+    bytes  public_key_der = 1;
+    string dmi_uuid       = 2;  // May be empty
+    // PEM-encoded PKCS#10 certificate signing request.
+    bytes  csr_pem        = 3;
+    // ECDSA-SHA256 signature over SHA-256(csr_pem), proving key possession.
+    bytes  signature      = 4;
+    string agent_version  = 5;
+    string hostname       = 6;  // OS hostname, for display only
+    bool   tpm_backed     = 7;  // True if private key is stored in TPM
+    // ZTP bootstrap token. When present and valid, the controller auto-approves
+    // the enrollment and returns the issued client cert in the same response
+    // (no operator approval, no polling required). Absent for legacy manual flow.
+    BootstrapToken bootstrap_token = 8;
+}
+
+// Token carried in the bootstrap bundle. The controller looks up `token_id` in
+// the enrollment_tokens table and compares SHA-256(token) to the stored hash.
+message BootstrapToken {
+    string token_id = 1;  // UUID identifying this token in the controller DB
+    bytes  token    = 2;  // 32-byte random secret
+}
+
+message EnrollmentResponse {
+    string           enrollment_id   = 1;  // UUID to use for status polling
+    EnrollmentStatus status          = 2;
+    bytes            ca_cert_pem     = 3;  // Controller CA cert, always returned
+    bytes            client_cert_pem = 4;  // Set only when status == APPROVED
+}
+
+message EnrollmentStatusRequest {
+    string enrollment_id = 1;
+    string node_id       = 2;  // hex(SHA-256(public_key_der))
+}
+
+message EnrollmentStatusResponse {
+    EnrollmentStatus status          = 1;
+    bytes            client_cert_pem = 2;  // Set when status == APPROVED
+    string           reject_reason   = 3;  // Set when status == REJECTED
+}
+
+// ── Renewal messages ────────────────────────────────────────────────────────
+
+message RenewClientCertRequest {
+    // PEM-encoded PKCS#10 certificate signing request. Subject CN must equal
+    // the node_id pulled from the peer cert; the controller rejects otherwise.
+    bytes csr_pem = 1;
+}
+
+message RenewClientCertResponse {
+    bytes  cert_pem       = 1;  // PEM-encoded signed cert (no private key —
+                                // the agent already holds it).
+    bytes  cert_serial    = 2;  // Big-endian DER serial; agent persists for
+                                // its own bookkeeping and metrics.
+    int64  not_after_unix = 3;  // UNIX seconds; agent uses this to schedule
+                                // the next renewal without re-parsing the PEM.
+}
+
+enum EnrollmentStatus {
+    ENROLLMENT_STATUS_UNSPECIFIED = 0;
+    ENROLLMENT_STATUS_PENDING     = 1;
+    ENROLLMENT_STATUS_APPROVED    = 2;
+    ENROLLMENT_STATUS_REJECTED    = 3;
+}
+
+enum BPFDirection {
+    BPF_DIRECTION_UNSPECIFIED = 0;
+    BPF_DIRECTION_INGRESS     = 1;
+    BPF_DIRECTION_EGRESS      = 2;
+}
+
+enum BPFMode {
+    BPF_MODE_UNSPECIFIED = 0;
+    BPF_MODE_AUTO        = 1;
+    BPF_MODE_NATIVE      = 2;
+    BPF_MODE_GENERIC     = 3;
+    BPF_MODE_OFFLOAD     = 4;
+}

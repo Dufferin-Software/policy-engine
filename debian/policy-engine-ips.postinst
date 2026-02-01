@@ -1,0 +1,21 @@
+#!/bin/bash
+set -e
+
+#DEBHELPER#
+
+# Ensure directories that policy-engine.service lists in ReadWritePaths exist
+# before systemd tries to set up the mount namespace.  The suricata drop-in
+# directory is only created by suricata's own postinst, so it may be absent on
+# a fresh install.
+mkdir -p /etc/systemd/system/suricata.service.d
+
+# Suricata is a runtime dependency but must NOT run until the operator
+# explicitly enables IPS/IDS via the configureInspect GraphQL mutation.
+# Its own postinst starts it automatically; undo that here so it cannot
+# crash-loop and consume resources on systems that do not use IPS/IDS.
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop suricata 2>/dev/null || true
+    systemctl disable suricata 2>/dev/null || true
+    systemctl stop policy-engine-suricata-update.timer 2>/dev/null || true
+    systemctl disable policy-engine-suricata-update.timer 2>/dev/null || true
+fi

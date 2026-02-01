@@ -1,0 +1,13 @@
+[package]
+name = "policy-engine-dev"
+version = "0.1.0"
+edition = "2021"
+description = "GraphQL client library for the policy engine"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+reqwest = { version = "0.11", features = ["json", "blocking", "rustls-tls"], default-features = false }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+libc = "0.2"

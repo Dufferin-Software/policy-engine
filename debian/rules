@@ -1,0 +1,89 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+export CLANG ?= clang-19
+
+%:
+	dh $@
+
+# Determine which Cargo features and which binary package name to use based on
+# the active DEB_BUILD_PROFILES.  The two independent feature profiles are:
+#   pkg.policy-engine.suricata  — Suricata IPS/IDS integration
+#   pkg.policy-engine.ipfix     — IPFIX flow export
+# They may be combined freely.
+CARGO_FEATURES =
+INSTALL_PKG = policy-engine
+
+ifneq (,$(filter pkg.policy-engine.suricata,$(DEB_BUILD_PROFILES)))
+CARGO_FEATURES += --features suricata
+INSTALL_PKG = policy-engine-ips
+endif
+
+ifneq (,$(filter pkg.policy-engine.ipfix,$(DEB_BUILD_PROFILES)))
+CARGO_FEATURES += --features ipfix
+ifeq (policy-engine-ips,$(INSTALL_PKG))
+INSTALL_PKG = policy-engine-ips-ipfix
+else
+INSTALL_PKG = policy-engine-ipfix
+endif
+endif
+
+override_dh_auto_build:
+	cargo build --release --workspace $(CARGO_FEATURES)
+	cd web && npm ci && npm run build
+	cd fleet/controller/web && npm ci && npm run build
+
+override_dh_auto_install:
+	# Server binary + event reader + systemd units → $(INSTALL_PKG) package
+	install -D -m 755 target/release/policy-engine $(CURDIR)/debian/$(INSTALL_PKG)/usr/bin/policy-engine
+	install -D -m 755 target/release/policy-event-reader $(CURDIR)/debian/$(INSTALL_PKG)/usr/bin/policy-event-reader
+	install -D -m 644 debian/policy-engine.service $(CURDIR)/debian/$(INSTALL_PKG)/usr/lib/systemd/system/policy-engine.service
+ifneq (,$(filter pkg.policy-engine.suricata,$(DEB_BUILD_PROFILES)))
+	install -D -m 644 debian/policy-engine-suricata-update.service $(CURDIR)/debian/$(INSTALL_PKG)/usr/lib/systemd/system/policy-engine-suricata-update.service
+	install -D -m 644 debian/policy-engine-suricata-update.timer $(CURDIR)/debian/$(INSTALL_PKG)/usr/lib/systemd/system/policy-engine-suricata-update.timer
+endif
+	# Grafana dashboard + provisioning config → $(INSTALL_PKG) package
+	install -D -m 644 grafana/engine-data-plane.json $(CURDIR)/debian/$(INSTALL_PKG)/usr/share/policy-engine/grafana/policy-engine.json
+	install -D -m 644 debian/policy-engine-grafana.yaml $(CURDIR)/debian/$(INSTALL_PKG)/etc/grafana/provisioning/dashboards/policy-engine.yaml
+	# sysusers.d + tmpfiles.d: user/group creation and bpffs pin directory setup
+	install -D -m 644 debian/policy-engine.sysusers $(CURDIR)/debian/$(INSTALL_PKG)/usr/lib/sysusers.d/policy-engine.conf
+	install -D -m 644 debian/policy-engine.tmpfiles $(CURDIR)/debian/$(INSTALL_PKG)/usr/lib/tmpfiles.d/policy-engine.conf
+	# CLI binary → standalone policy-engine-client package
+	install -D -m 755 target/release/policy-client $(CURDIR)/debian/policy-engine-client/usr/bin/policy-client
+	# Web UI static assets → policy-engine-web package
+	install -d $(CURDIR)/debian/policy-engine-web/usr/share/policy-engine-web
+	cp -r web/dist/* $(CURDIR)/debian/policy-engine-web/usr/share/policy-engine-web/
+	# Library source → policy-engine-client-dev package
+	install -d $(CURDIR)/debian/policy-engine-client-dev/usr/share/policy-engine-client/src
+	cp -r engine/client-lib/src/* $(CURDIR)/debian/policy-engine-client-dev/usr/share/policy-engine-client/src/
+	install -m 644 engine/client-lib/Cargo.toml $(CURDIR)/debian/policy-engine-client-dev/usr/share/policy-engine-client/
+	# Controller CLI client → policy-controller-client package
+	install -D -m 755 target/release/policy-controller-client $(CURDIR)/debian/policy-controller-client/usr/bin/policy-controller-client
+	# Controller daemon + systemd unit → policy-controller package
+	install -D -m 755 target/release/policy-controller $(CURDIR)/debian/policy-controller/usr/bin/policy-controller
+	install -D -m 755 target/release/policy-controller-mint-token $(CURDIR)/debian/policy-controller/usr/bin/policy-controller-mint-token
+	install -D -m 755 target/release/policy-controller-add-operator $(CURDIR)/debian/policy-controller/usr/bin/policy-controller-add-operator
+	install -D -m 755 target/release/policy-controller-bootstrap-tenant $(CURDIR)/debian/policy-controller/usr/bin/policy-controller-bootstrap-tenant
+	install -D -m 644 debian/policy-controller.service $(CURDIR)/debian/policy-controller/usr/lib/systemd/system/policy-controller.service
+	install -d $(CURDIR)/debian/policy-controller/etc/policy-controller
+	install -d $(CURDIR)/debian/policy-controller/var/lib/policy-controller
+	# Controller web UI → policy-controller-web package
+	install -d $(CURDIR)/debian/policy-controller-web/usr/share/policy-controller/web
+	cp -r fleet/controller/web/dist/* $(CURDIR)/debian/policy-controller-web/usr/share/policy-controller/web/
+	# Node agent binary + systemd unit → policy-node-agent package
+	install -D -m 755 target/release/policy-node-agent $(CURDIR)/debian/policy-node-agent/usr/bin/policy-node-agent
+	install -D -m 644 debian/policy-node-agent.service $(CURDIR)/debian/policy-node-agent/usr/lib/systemd/system/policy-node-agent.service
+	install -d $(CURDIR)/debian/policy-node-agent/etc/policy-node-agent
+	install -D -m 644 debian/policy-node-agent.config.toml $(CURDIR)/debian/policy-node-agent/etc/policy-node-agent/config.toml
+	install -d $(CURDIR)/debian/policy-node-agent/var/lib/policy-node-agent
+
+override_dh_auto_clean:
+	cargo clean || true
+	rm -rf $(CARGO_HOME)
+	rm -rf web/dist web/node_modules
+	rm -rf fleet/controller/web/dist fleet/controller/web/node_modules
+
+override_dh_auto_test:
+	# Run unit tests (these use mocks and don't require root/BPF privileges)
+	cargo test --release --workspace $(CARGO_FEATURES)
