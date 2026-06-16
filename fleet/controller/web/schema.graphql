@@ -457,6 +457,23 @@ type MutationRoot {
 	Clear interface statistics for every attached interface on a node.
 	"""
 	clearAllInterfaceStats(nodeId: ID!): OperationResult!
+	"""
+	Clear statistics for a single policy rule on a node.
+	
+	`ruleId` is the controller-assigned rule ID (which the engine also uses
+	as its per-rule stats key). `direction` is "ingress"/"egress"; pass null
+	to clear both. Fire-and-forget, same as the interface clears.
+	"""
+	clearRuleStats(nodeId: ID!, ruleId: ID!, direction: String): OperationResult!
+	"""
+	Clear statistics for every policy rule on a node (both directions).
+	"""
+	clearAllPolicyStats(nodeId: ID!): OperationResult!
+	"""
+	Clear ALL statistics on a node — every interface counter and every rule
+	counter, in one shot.
+	"""
+	clearAllStats(nodeId: ID!): OperationResult!
 	createAlertRule(input: CreateAlertRuleInput!): AlertRuleOutput!
 	updateAlertRule(id: ID!, input: CreateAlertRuleInput!): AlertRuleOutput!
 	deleteAlertRule(id: ID!): Boolean!

@@ -951,7 +951,37 @@ fn apply_clear_stats(
             }
             Ok(format!("cleared interface stats for {cleared} attachment(s)"))
         }
-        other => bail!("unsupported ClearStats scope: {other:?}"),
+        Scope::Rule => {
+            let id: u64 = req
+                .rule_id
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid rule_id '{}'", req.rule_id))?;
+            for dir in &dirs {
+                let op = client.clear_rule_stats(id, *dir)?;
+                if !op.success {
+                    bail!(op.message);
+                }
+            }
+            Ok(format!("cleared rule stats for {}", req.rule_id))
+        }
+        Scope::AllRules => {
+            // Rule stats are per-direction; clear both regardless of the request.
+            for dir in [GqlDirection::Ingress, GqlDirection::Egress] {
+                let op = client.clear_all_rule_stats(dir)?;
+                if !op.success {
+                    bail!(op.message);
+                }
+            }
+            Ok("cleared all rule stats".to_string())
+        }
+        Scope::All => {
+            let op = client.clear_all_stats()?;
+            if !op.success {
+                bail!(op.message);
+            }
+            Ok("cleared all stats".to_string())
+        }
+        Scope::Unspecified => bail!("ClearStats scope unspecified"),
     }
 }
 
@@ -1229,6 +1259,24 @@ mod tests {
         };
         let err = apply_clear_stats(&client, Scope::Interface, &req).unwrap_err();
         assert!(err.to_string().contains("interface_name"), "{err}");
+    }
+
+    #[test]
+    fn apply_clear_stats_rule_requires_numeric_id() {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        use policy_engine_dev::{ClientConfig, PolicyClient};
+        let client = PolicyClient::with_config(ClientConfig {
+            server_url: "http://127.0.0.1:0".to_string(),
+            ..Default::default()
+        });
+        let req = ClearStats {
+            scope: Scope::Rule as i32,
+            interface_name: String::new(),
+            rule_id: "not-a-number".to_string(),
+            direction: "ingress".to_string(),
+        };
+        let err = apply_clear_stats(&client, Scope::Rule, &req).unwrap_err();
+        assert!(err.to_string().contains("invalid rule_id"), "{err}");
     }
 
     /// In-memory stream handle driven by pre-loaded messages from the controller.

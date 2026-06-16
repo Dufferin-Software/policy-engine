@@ -1675,6 +1675,84 @@ impl MutationRoot {
         .await
     }
 
+    /// Clear statistics for a single policy rule on a node.
+    ///
+    /// `ruleId` is the controller-assigned rule ID (which the engine also uses
+    /// as its per-rule stats key). `direction` is "ingress"/"egress"; pass null
+    /// to clear both. Fire-and-forget, same as the interface clears.
+    #[graphql(guard = "Require::new(\"rule:write\")")]
+    async fn clear_rule_stats(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+        rule_id: ID,
+        direction: Option<String>,
+    ) -> Result<OperationResult> {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        push_clear_stats(
+            sessions,
+            &node_id.0,
+            ClearStats {
+                scope: Scope::Rule as i32,
+                interface_name: String::new(),
+                rule_id: rule_id.0,
+                direction: direction.unwrap_or_default(),
+            },
+        )
+        .await
+    }
+
+    /// Clear statistics for every policy rule on a node (both directions).
+    #[graphql(guard = "Require::new(\"rule:write\")")]
+    async fn clear_all_policy_stats(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+    ) -> Result<OperationResult> {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        push_clear_stats(
+            sessions,
+            &node_id.0,
+            ClearStats {
+                scope: Scope::AllRules as i32,
+                interface_name: String::new(),
+                rule_id: String::new(),
+                direction: String::new(),
+            },
+        )
+        .await
+    }
+
+    /// Clear ALL statistics on a node — every interface counter and every rule
+    /// counter, in one shot.
+    #[graphql(guard = "Require::new(\"node:write\")")]
+    async fn clear_all_stats(&self, ctx: &Context<'_>, node_id: ID) -> Result<OperationResult> {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        push_clear_stats(
+            sessions,
+            &node_id.0,
+            ClearStats {
+                scope: Scope::All as i32,
+                interface_name: String::new(),
+                rule_id: String::new(),
+                direction: String::new(),
+            },
+        )
+        .await
+    }
+
     // ── Alert pipeline (step 4) ──────────────────────────────────────────
 
     #[graphql(guard = "Require::new(\"alert:write\")")]
@@ -2336,6 +2414,61 @@ mod tests {
         let msg = rx.recv().await.expect("a message").expect("ok message");
         match msg.payload {
             Some(P::ClearStats(c)) => assert_eq!(c.scope, Scope::AllInterfaces as i32),
+            other => panic!("expected ClearStats, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clear_rule_stats_pushes_rule_scope() {
+        use policy_controller_proto::controller::{
+            clear_stats::Scope, controller_message::Payload as P,
+        };
+        use tokio::sync::mpsc;
+
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let (tx, mut rx) = mpsc::channel(4);
+        h.sessions
+            .register("n1".to_string(), "default".to_string(), tx);
+
+        let res = h
+            .schema
+            .execute(r#"mutation { clearRuleStats(nodeId: "n1", ruleId: "42") { success } }"#)
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+
+        let msg = rx.recv().await.expect("a message").expect("ok message");
+        match msg.payload {
+            Some(P::ClearStats(c)) => {
+                assert_eq!(c.scope, Scope::Rule as i32);
+                assert_eq!(c.rule_id, "42");
+            }
+            other => panic!("expected ClearStats, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clear_all_stats_pushes_all_scope() {
+        use policy_controller_proto::controller::{
+            clear_stats::Scope, controller_message::Payload as P,
+        };
+        use tokio::sync::mpsc;
+
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let (tx, mut rx) = mpsc::channel(4);
+        h.sessions
+            .register("n1".to_string(), "default".to_string(), tx);
+
+        let res = h
+            .schema
+            .execute(r#"mutation { clearAllStats(nodeId: "n1") { success } }"#)
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+
+        let msg = rx.recv().await.expect("a message").expect("ok message");
+        match msg.payload {
+            Some(P::ClearStats(c)) => assert_eq!(c.scope, Scope::All as i32),
             other => panic!("expected ClearStats, got {other:?}"),
         }
     }

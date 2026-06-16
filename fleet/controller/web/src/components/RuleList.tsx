@@ -27,6 +27,14 @@ const GET_RULE_STATS = gql`
   }
 `
 
+const CLEAR_RULE_STATS = gql`
+  mutation ClearRuleStats($nodeId: ID!, $ruleId: ID!, $direction: String!) {
+    clearRuleStats(nodeId: $nodeId, ruleId: $ruleId, direction: $direction) {
+      success message
+    }
+  }
+`
+
 interface Props {
   rules: RuleOutput[]
   direction: string
@@ -125,6 +133,7 @@ function formatActions(actionsJson: string): string {
 export default function RuleList({ rules, direction, nodeId, interfaceName, onRefetch, onFlash, onPendingChange, isPending }: Props) {
   const [deleteRule] = useMutation(DELETE_RULE)
   const [flushRules] = useMutation(FLUSH_RULES)
+  const [clearRuleStats] = useMutation(CLEAR_RULE_STATS, { refetchQueries: ['NodeRuleStats'] })
 
   const filtered = rules.filter(
     (r) => r.direction.toLowerCase() === direction.toLowerCase(),
@@ -144,6 +153,17 @@ export default function RuleList({ rules, direction, nodeId, interfaceName, onRe
       }
     } finally {
       onPendingChange?.(false)
+    }
+  }
+
+  async function handleClearStats(ruleId: string, ruleDirection: string) {
+    if (!nodeId) return
+    try {
+      const result = await clearRuleStats({ variables: { nodeId, ruleId, direction: ruleDirection } })
+      const cr = (result.data as any)?.clearRuleStats
+      onFlash?.(cr?.success ? 'Rule stats cleared — updating on next refresh' : `Clear failed: ${cr?.message ?? 'unknown error'}`)
+    } catch (e) {
+      onFlash?.(String(e).replace(/^ApolloError:\s*/, ''))
     }
   }
 
@@ -220,7 +240,17 @@ export default function RuleList({ rules, direction, nodeId, interfaceName, onRe
               <td className="px-2 py-1 text-gray-600">
                 {new Date(r.createdAt).toLocaleDateString()}
               </td>
-              <td className="px-2 py-1">
+              <td className="px-2 py-1 whitespace-nowrap">
+                {nodeId && (
+                  <button
+                    onClick={() => handleClearStats(r.id, r.direction)}
+                    disabled={isPending}
+                    className="text-gray-500 hover:text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed mr-2"
+                    title="Clear this rule's stats"
+                  >
+                    Clear stats
+                  </button>
+                )}
                 <button
                   onClick={() => handleDelete(r.id)}
                   disabled={isPending}

@@ -64,6 +64,18 @@ const SET_STOP_BEHAVIOR = gql`
   }
 `
 
+const CLEAR_ALL_POLICY_STATS = gql`
+  mutation ClearAllPolicyStats($nodeId: ID!) {
+    clearAllPolicyStats(nodeId: $nodeId) { success message }
+  }
+`
+
+const CLEAR_ALL_STATS = gql`
+  mutation ClearAllStats($nodeId: ID!) {
+    clearAllStats(nodeId: $nodeId) { success message }
+  }
+`
+
 const ATTACH_PROGRAM = gql`
   mutation AttachProgramPolicy($nodeId: ID!, $interfaceName: String!, $direction: String!, $mode: String) {
     attachProgram(nodeId: $nodeId, interfaceName: $interfaceName, direction: $direction, mode: $mode) { success message }
@@ -157,6 +169,32 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
   const [logAuditEntry] = useMutation(LOG_AUDIT_ENTRY)
   const [setNodeStopBehavior] = useMutation(SET_STOP_BEHAVIOR)
   const [stopBehaviorPending, setStopBehaviorPending] = useState(false)
+  const [clearAllPolicyStats] = useMutation(CLEAR_ALL_POLICY_STATS)
+  const [clearAllStats] = useMutation(CLEAR_ALL_STATS)
+
+  // Stats live in the node's engine and are scraped periodically, so cleared
+  // counters surface on the next metrics refresh rather than instantly.
+  async function handleClearAllPolicyStats() {
+    if (!confirm('Clear statistics for every policy rule on this node?')) return
+    try {
+      const res = await clearAllPolicyStats({ variables: { nodeId } })
+      const r = res.data?.clearAllPolicyStats
+      flash(r?.success ? 'Policy stats cleared — updating on next refresh' : (r?.message ?? 'Failed to clear policy stats'))
+    } catch (e) {
+      flash(String(e).replace(/^ApolloError:\s*/, ''))
+    }
+  }
+
+  async function handleClearAllStats() {
+    if (!confirm('Clear ALL statistics on this node — every interface and every rule counter?')) return
+    try {
+      const res = await clearAllStats({ variables: { nodeId } })
+      const r = res.data?.clearAllStats
+      flash(r?.success ? 'All stats cleared — updating on next refresh' : (r?.message ?? 'Failed to clear stats'))
+    } catch (e) {
+      flash(String(e).replace(/^ApolloError:\s*/, ''))
+    }
+  }
 
   const node = data?.node
   const interfaces = data?.nodeInterfaces ?? []
@@ -465,6 +503,22 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
         {/* ── Policy tab ──────────────────────────────────────────────── */}
         {tab === 'policy' && (
           <>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={handleClearAllPolicyStats}
+                className="text-xs px-2 py-1 rounded bg-gray-800 border border-gray-700 text-gray-300 hover:bg-red-700 hover:text-white"
+                title="Clear statistics for every policy rule on this node (both directions)"
+              >
+                Clear all policy stats
+              </button>
+              <button
+                onClick={handleClearAllStats}
+                className="text-xs px-2 py-1 rounded bg-gray-800 border border-gray-700 text-gray-300 hover:bg-red-800 hover:text-white"
+                title="Clear ALL statistics on this node — every interface and rule counter"
+              >
+                Clear ALL stats
+              </button>
+            </div>
             {interfaceNames.map((ifaceName) => {
               const iface = interfaces.find((i) => i.name === ifaceName)
               const ifaceRules = rules.filter((r) => r.interfaceName === ifaceName)
