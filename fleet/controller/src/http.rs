@@ -119,10 +119,24 @@ async fn ws_events_handler(
 
     let node_filter = q.node;
     let mut rx = event_bus.subscribe();
+    let mut shutdown = event_bus.subscribe_shutdown();
 
     actix_web::rt::spawn(async move {
         loop {
-            match rx.recv().await {
+            let recv = tokio::select! {
+                _ = shutdown.changed() => {
+                    // Send a Close frame so clients see an orderly shutdown
+                    // rather than a TCP RST.
+                    let _ = session.close(Some(actix_ws::CloseReason {
+                        code: actix_ws::CloseCode::Away,
+                        description: Some("server shutting down".into()),
+                    }))
+                    .await;
+                    return;
+                }
+                recv = rx.recv() => recv,
+            };
+            match recv {
                 Ok(batch) => {
                     // Apply node filter if set.
                     if let Some(ref nid) = node_filter {
@@ -177,6 +191,7 @@ async fn ws_rule_events_handler(
     req: HttpRequest,
     body: web::Payload,
     rule_lifecycle_bus: Data<Arc<RuleLifecycleBus>>,
+    event_bus: Data<Arc<EventBus>>,
     bearer_auth: Data<BearerAuthState>,
     query: Query<EventsQuery>,
 ) -> actix_web::Result<HttpResponse> {
@@ -188,10 +203,24 @@ async fn ws_rule_events_handler(
 
     let node_filter = q.node;
     let mut rx = rule_lifecycle_bus.subscribe();
+    let mut shutdown = event_bus.subscribe_shutdown();
 
     actix_web::rt::spawn(async move {
         loop {
-            match rx.recv().await {
+            let recv = tokio::select! {
+                _ = shutdown.changed() => {
+                    // Send a Close frame so clients see an orderly shutdown
+                    // rather than a TCP RST.
+                    let _ = session.close(Some(actix_ws::CloseReason {
+                        code: actix_ws::CloseCode::Away,
+                        description: Some("server shutting down".into()),
+                    }))
+                    .await;
+                    return;
+                }
+                recv = rx.recv() => recv,
+            };
+            match recv {
                 Ok(event) => {
                     if let Some(ref nid) = node_filter {
                         if &event.node_id != nid {
@@ -1390,6 +1419,12 @@ pub fn start_http_server(
 
         app
     })
+    // Cap the graceful drain. Normal HTTP requests finish in well under a
+    // second; the only long-lived connections are the /ws/* streams, which
+    // close themselves via the EventBus shutdown signal. This is the backstop
+    // if a connection doesn't close in time — without it actix defaults to
+    // 30s, which is the entire shutdown delay we used to observe.
+    .shutdown_timeout(5)
     .bind(bind)?
     .run();
 

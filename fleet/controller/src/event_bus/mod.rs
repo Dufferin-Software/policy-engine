@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 /// Capacity of the broadcast channel. Old events are dropped if subscribers
 /// fall too far behind (lag), which is acceptable for a live event stream.
@@ -24,12 +24,18 @@ pub struct TaggedEventBatch {
 #[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<TaggedEventBatch>,
+    /// Set to `true` on server shutdown so long-lived subscribers (the
+    /// `/ws/events` and `/ws/rule-events` WebSocket tasks) can close their
+    /// sessions promptly instead of holding connections open until the HTTP
+    /// server's `shutdown_timeout` elapses.
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl Default for EventBus {
     fn default() -> Self {
         let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
-        Self { tx }
+        let (shutdown_tx, _) = watch::channel(false);
+        Self { tx, shutdown_tx }
     }
 }
 
@@ -52,6 +58,21 @@ impl EventBus {
     /// responsibility).
     pub fn subscribe(&self) -> broadcast::Receiver<TaggedEventBatch> {
         self.tx.subscribe()
+    }
+
+    /// Subscribe to the shutdown signal.
+    ///
+    /// `changed()` on the returned receiver resolves (and the value becomes
+    /// `true`) when [`EventBus::shutdown`] is called. WebSocket handlers
+    /// select on this so they can close their session the moment shutdown
+    /// begins, rather than blocking the server's graceful drain.
+    pub fn subscribe_shutdown(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+
+    /// Signal all subscribers that the server is shutting down.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
     }
 }
 
@@ -102,6 +123,19 @@ mod tests {
 
         assert_eq!(rx1.recv().await.unwrap().node_id, "n1");
         assert_eq!(rx2.recv().await.unwrap().node_id, "n1");
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_signal_notifies_subscriber() {
+        let bus = EventBus::new();
+        let mut shutdown = bus.subscribe_shutdown();
+        assert!(!*shutdown.borrow());
+
+        bus.shutdown();
+
+        // changed() resolves and the value flips to true.
+        shutdown.changed().await.unwrap();
+        assert!(*shutdown.borrow());
     }
 
     #[tokio::test]

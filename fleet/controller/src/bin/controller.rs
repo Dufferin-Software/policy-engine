@@ -405,6 +405,31 @@ async fn main() -> Result<()> {
             .expect("gRPC management server failed");
     });
 
+    // Fire the EventBus shutdown signal the moment a termination signal
+    // arrives, in parallel with actix's own graceful drain. This lets the
+    // long-lived /ws/events and /ws/rule-events tasks close their sessions
+    // immediately instead of holding worker connections open until the HTTP
+    // server's shutdown_timeout elapses.
+    {
+        let event_bus = Arc::clone(&event_bus);
+        tokio::spawn(async move {
+            let mut sigterm =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("Failed to install SIGTERM handler for WS shutdown: {e}");
+                        return;
+                    }
+                };
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+            log::info!("Termination signal received; closing WebSocket streams");
+            event_bus.shutdown();
+        });
+    }
+
     log::info!("Policy controller started");
 
     tokio::select! {
