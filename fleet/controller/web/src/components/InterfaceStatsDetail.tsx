@@ -102,11 +102,11 @@ function DirectionPanel({
   const isIngress = direction === 'ingress'
   const { data: statsData, loading: statsLoading } = useQuery<{ nodeInterfaceStats: FullStats | null }>(
     GET_INTERFACE_STATS,
-    { variables: { nodeId, interfaceName, direction }, pollInterval: 30_000 },
+    { variables: { nodeId, interfaceName, direction }, pollInterval: 5_000 },
   )
   const { data: etData } = useQuery<{ nodeEthertypeStats: EthertypeStat[] }>(
     GET_ETHERTYPE_STATS,
-    { variables: { nodeId, interfaceName, direction }, pollInterval: 30_000 },
+    { variables: { nodeId, interfaceName, direction }, pollInterval: 5_000 },
   )
 
   const s = statsData?.nodeInterfaceStats
@@ -118,7 +118,7 @@ function DirectionPanel({
     <div className="bg-gray-800 rounded-lg border border-gray-700 p-3">
       <div className={`text-xs font-semibold uppercase mb-3 ${dirColor}`}>
         {isIngress ? 'Ingress' : 'Egress'}
-        <span className="ml-2 text-gray-600 font-normal normal-case">30s refresh</span>
+        <span className="ml-2 text-gray-600 font-normal normal-case">5s refresh</span>
       </div>
 
       {statsLoading && !s ? (
@@ -228,7 +228,8 @@ export default function InterfaceStatsDetail({ nodeId, interfaceName, onClose }:
     try {
       const res = await clearInterfaceStats({ variables: { nodeId, interfaceName } })
       const r = res.data?.clearInterfaceStats
-      setFeedback(r?.success ? 'Cleared — updating on next refresh' : (r?.message ?? 'Failed to clear stats'))
+      // Success is assumed silently; only surface failures.
+      setFeedback(r?.success ? null : (r?.message ?? 'Failed to clear stats'))
     } catch (e) {
       setFeedback(e instanceof Error ? e.message : 'Failed to clear stats')
     }

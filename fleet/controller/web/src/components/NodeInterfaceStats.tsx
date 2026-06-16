@@ -41,7 +41,7 @@ function StatRow({
 }) {
   const { data, loading } = useQuery<{ nodeInterfaceStats: StatsResult | null }>(
     GET_INTERFACE_STATS,
-    { variables: { nodeId, interfaceName, direction }, pollInterval: 30_000 },
+    { variables: { nodeId, interfaceName, direction }, pollInterval: 5_000 },
   )
   const s = data?.nodeInterfaceStats
 
@@ -96,7 +96,8 @@ export default function NodeInterfaceStats({ nodeId, interfaces, onShowStats }: 
     try {
       const res = await clearAllInterfaceStats({ variables: { nodeId } })
       const r = res.data?.clearAllInterfaceStats
-      setFeedback(r?.success ? 'Cleared — updating on next refresh' : (r?.message ?? 'Failed to clear stats'))
+      // Success is assumed silently; only surface failures.
+      setFeedback(r?.success ? null : (r?.message ?? 'Failed to clear stats'))
     } catch (e) {
       setFeedback(e instanceof Error ? e.message : 'Failed to clear stats')
     }
@@ -122,7 +123,7 @@ export default function NodeInterfaceStats({ nodeId, interfaces, onShowStats }: 
             <h3 className={`text-sm font-semibold ${dir === 'ingress' ? 'text-cyan-400' : 'text-orange-400'}`}>
               {dir === 'ingress' ? 'Ingress Traffic' : 'Egress Traffic'}
             </h3>
-            <span className="text-xs text-gray-600">30s refresh</span>
+            <span className="text-xs text-gray-600">5s refresh</span>
           </div>
           <table className="w-full">
             <thead className="text-gray-500 uppercase bg-gray-900/50">

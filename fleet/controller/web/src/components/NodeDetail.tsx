@@ -179,7 +179,8 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
     try {
       const res = await clearAllPolicyStats({ variables: { nodeId } })
       const r = res.data?.clearAllPolicyStats
-      flash(r?.success ? 'Policy stats cleared — updating on next refresh' : (r?.message ?? 'Failed to clear policy stats'))
+      // Success is assumed silently; only surface failures.
+      if (!r?.success) flash(r?.message ?? 'Failed to clear policy stats')
     } catch (e) {
       flash(String(e).replace(/^ApolloError:\s*/, ''))
     }
@@ -190,7 +191,8 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
     try {
       const res = await clearAllStats({ variables: { nodeId } })
       const r = res.data?.clearAllStats
-      flash(r?.success ? 'All stats cleared — updating on next refresh' : (r?.message ?? 'Failed to clear stats'))
+      // Success is assumed silently; only surface failures.
+      if (!r?.success) flash(r?.message ?? 'Failed to clear stats')
     } catch (e) {
       flash(String(e).replace(/^ApolloError:\s*/, ''))
     }

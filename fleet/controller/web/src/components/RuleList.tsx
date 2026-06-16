@@ -49,7 +49,7 @@ interface Props {
 function RuleStatCell({ nodeId, ruleId, direction }: { nodeId: string; ruleId: string; direction: string }) {
   const { data, loading } = useQuery<{ nodeRuleStats: { packets: number; bytes: number } | null }>(
     GET_RULE_STATS,
-    { variables: { nodeId, ruleId, direction }, pollInterval: 30_000 },
+    { variables: { nodeId, ruleId, direction }, pollInterval: 5_000 },
   )
   const s = data?.nodeRuleStats
   if (loading && !s) return <td className="px-2 py-1 text-gray-600 text-xs">…</td>
@@ -161,7 +161,8 @@ export default function RuleList({ rules, direction, nodeId, interfaceName, onRe
     try {
       const result = await clearRuleStats({ variables: { nodeId, ruleId, direction: ruleDirection } })
       const cr = (result.data as any)?.clearRuleStats
-      onFlash?.(cr?.success ? 'Rule stats cleared — updating on next refresh' : `Clear failed: ${cr?.message ?? 'unknown error'}`)
+      // Success is assumed silently; only surface failures.
+      if (cr?.success === false) onFlash?.(`Clear failed: ${cr?.message ?? 'unknown error'}`)
     } catch (e) {
       onFlash?.(String(e).replace(/^ApolloError:\s*/, ''))
     }
