@@ -1618,6 +1618,63 @@ impl MutationRoot {
         }
     }
 
+    /// Clear all statistics (global + ethertype) for a single interface on a node.
+    ///
+    /// `direction` is "ingress"/"egress"; pass null to clear both. Fire-and-forget:
+    /// stats live only in the engine's BPF maps, so nothing is committed to the
+    /// controller store. Returns ok once the request is delivered to a connected
+    /// agent — the UI re-queries stats to confirm they are zeroed.
+    #[graphql(guard = "Require::new(\"interface:write\")")]
+    async fn clear_interface_stats(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+        interface_name: String,
+        direction: Option<String>,
+    ) -> Result<OperationResult> {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        push_clear_stats(
+            sessions,
+            &node_id.0,
+            ClearStats {
+                scope: Scope::Interface as i32,
+                interface_name,
+                rule_id: String::new(),
+                direction: direction.unwrap_or_default(),
+            },
+        )
+        .await
+    }
+
+    /// Clear interface statistics for every attached interface on a node.
+    #[graphql(guard = "Require::new(\"interface:write\")")]
+    async fn clear_all_interface_stats(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+    ) -> Result<OperationResult> {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        push_clear_stats(
+            sessions,
+            &node_id.0,
+            ClearStats {
+                scope: Scope::AllInterfaces as i32,
+                interface_name: String::new(),
+                rule_id: String::new(),
+                direction: String::new(),
+            },
+        )
+        .await
+    }
+
     // ── Alert pipeline (step 4) ──────────────────────────────────────────
 
     #[graphql(guard = "Require::new(\"alert:write\")")]
@@ -1825,6 +1882,39 @@ async fn ensure_node_in_tenant(
             "Node not found: {}",
             node_id
         ))),
+    }
+}
+
+/// Push a fire-and-forget [`ClearStats`] request to a node.
+///
+/// Stats live only in the engine's BPF maps — never the controller store — so
+/// unlike config changes this bypasses the pending-generation/confirm machinery
+/// (mirroring `refresh_node_metrics`). We deliver the message and report only
+/// whether the node was connected; the operator observes the result by
+/// re-querying stats.
+async fn push_clear_stats(
+    sessions: &Arc<NodeSessionManager>,
+    node_id: &str,
+    req: policy_controller_proto::controller::ClearStats,
+) -> Result<OperationResult> {
+    use policy_controller_proto::controller::{
+        controller_message::Payload as CtrlPayload, ControllerMessage,
+    };
+    let sent = sessions
+        .push(
+            node_id,
+            ControllerMessage {
+                payload: Some(CtrlPayload::ClearStats(req)),
+            },
+        )
+        .await;
+    if sent {
+        Ok(OperationResult::ok())
+    } else {
+        Ok(OperationResult::err(format!(
+            "Node '{}' is not currently connected",
+            node_id
+        )))
     }
 }
 
@@ -2168,6 +2258,86 @@ mod tests {
         let res3 = schema.execute(r#"{ rules(nodeId: "n1") { id } }"#).await;
         let data3 = res3.data.into_json().unwrap();
         assert!(data3["rules"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_clear_interface_stats_offline_node_reports_disconnected() {
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let res = h
+            .schema
+            .execute(
+                r#"mutation { clearInterfaceStats(nodeId: "n1", interfaceName: "eth0") { success message } }"#,
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let data = res.data.into_json().unwrap();
+        assert_eq!(data["clearInterfaceStats"]["success"], false);
+        assert!(data["clearInterfaceStats"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not currently connected"));
+    }
+
+    #[tokio::test]
+    async fn test_clear_interface_stats_pushes_clear_stats_message() {
+        use policy_controller_proto::controller::{
+            clear_stats::Scope, controller_message::Payload as P,
+        };
+        use tokio::sync::mpsc;
+
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let (tx, mut rx) = mpsc::channel(4);
+        h.sessions
+            .register("n1".to_string(), "default".to_string(), tx);
+
+        let res = h
+            .schema
+            .execute(
+                r#"mutation { clearInterfaceStats(nodeId: "n1", interfaceName: "eth0", direction: "ingress") { success } }"#,
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert!(res.data.into_json().unwrap()["clearInterfaceStats"]["success"]
+            .as_bool()
+            .unwrap());
+
+        let msg = rx.recv().await.expect("a message").expect("ok message");
+        match msg.payload {
+            Some(P::ClearStats(c)) => {
+                assert_eq!(c.scope, Scope::Interface as i32);
+                assert_eq!(c.interface_name, "eth0");
+                assert_eq!(c.direction, "ingress");
+            }
+            other => panic!("expected ClearStats, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clear_all_interface_stats_pushes_all_interfaces_scope() {
+        use policy_controller_proto::controller::{
+            clear_stats::Scope, controller_message::Payload as P,
+        };
+        use tokio::sync::mpsc;
+
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let (tx, mut rx) = mpsc::channel(4);
+        h.sessions
+            .register("n1".to_string(), "default".to_string(), tx);
+
+        let res = h
+            .schema
+            .execute(r#"mutation { clearAllInterfaceStats(nodeId: "n1") { success } }"#)
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+
+        let msg = rx.recv().await.expect("a message").expect("ok message");
+        match msg.payload {
+            Some(P::ClearStats(c)) => assert_eq!(c.scope, Scope::AllInterfaces as i32),
+            other => panic!("expected ClearStats, got {other:?}"),
+        }
     }
 
     #[tokio::test]

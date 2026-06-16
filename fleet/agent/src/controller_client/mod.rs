@@ -859,11 +859,100 @@ async fn handle_controller_message(
             log::debug!("Received MetricsQuery — waking metrics forwarder");
             metrics_trigger.notify_one();
         }
+        Some(CtrlPayload::ClearStats(req)) => {
+            use policy_controller_proto::controller::clear_stats::Scope;
+            let scope = Scope::try_from(req.scope).unwrap_or(Scope::Unspecified);
+            log::info!(
+                "Received ClearStats (scope={:?}, interface='{}', rule_id='{}', direction='{}')",
+                scope,
+                req.interface_name,
+                req.rule_id,
+                req.direction,
+            );
+            // Fire-and-forget: stats live only in the engine's BPF maps, so there
+            // is nothing to confirm or roll back. We log the outcome; the operator
+            // observes the result by re-querying stats from the controller.
+            if let Some(url) = local_graphql_url {
+                let url = url.to_string();
+                let req = req.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    use policy_engine_dev::{ClientConfig, PolicyClient};
+                    let client = PolicyClient::with_config(ClientConfig {
+                        server_url: url,
+                        ..Default::default()
+                    });
+                    apply_clear_stats(&client, scope, &req)
+                })
+                .await
+                .context("clear-stats spawn_blocking panicked")?;
+
+                match outcome {
+                    Ok(msg) => log::info!("ClearStats applied: {}", msg),
+                    Err(e) => log::warn!("ClearStats failed: {:#}", e),
+                }
+            } else {
+                log::warn!("No local GraphQL URL configured — cannot clear stats");
+            }
+        }
         None => {
             log::warn!("Received ControllerMessage with no payload");
         }
     }
     Ok(())
+}
+
+/// Apply a [`ClearStats`] request against the local policy-engine, returning a
+/// human-readable summary on success.
+///
+/// `INTERFACE` and `ALL_INTERFACES` clear per-interface counters (global +
+/// ethertype). Where the request leaves `direction` empty, both directions are
+/// cleared. For `ALL_INTERFACES` the engine is asked which interfaces are
+/// attached and each is cleared in its attached direction — the engine has no
+/// single "all interfaces" call, only per-interface and clear-everything.
+fn apply_clear_stats(
+    client: &policy_engine_dev::PolicyClient,
+    scope: policy_controller_proto::controller::clear_stats::Scope,
+    req: &policy_controller_proto::controller::ClearStats,
+) -> Result<String> {
+    use policy_controller_proto::controller::clear_stats::Scope;
+    use policy_engine_dev::GqlDirection;
+
+    // Directions to act on: the one named, or both when unspecified.
+    let dirs: Vec<GqlDirection> = match req.direction.as_str() {
+        "" => vec![GqlDirection::Ingress, GqlDirection::Egress],
+        other => vec![other
+            .parse::<GqlDirection>()
+            .map_err(|_| anyhow::anyhow!("invalid direction '{other}'"))?],
+    };
+
+    match scope {
+        Scope::Interface => {
+            if req.interface_name.is_empty() {
+                bail!("INTERFACE scope requires interface_name");
+            }
+            for dir in &dirs {
+                let op = client.clear_interface_stats(&req.interface_name, *dir)?;
+                if !op.success {
+                    bail!(op.message);
+                }
+            }
+            Ok(format!("cleared interface stats for {}", req.interface_name))
+        }
+        Scope::AllInterfaces => {
+            let attachments = client.list_interfaces()?;
+            let mut cleared = 0usize;
+            for att in &attachments {
+                let dir: GqlDirection = att.direction.parse().unwrap_or(GqlDirection::Ingress);
+                let op = client.clear_interface_stats(&att.interface, dir)?;
+                if !op.success {
+                    bail!(op.message);
+                }
+                cleared += 1;
+            }
+            Ok(format!("cleared interface stats for {cleared} attachment(s)"))
+        }
+        other => bail!("unsupported ClearStats scope: {other:?}"),
+    }
 }
 
 /// Aborts the wrapped task when dropped, binding a per-connection background
@@ -1104,6 +1193,43 @@ mod tests {
     use policy_controller_proto::controller::{DeltaConfigPush, StateQuery};
     use std::{collections::VecDeque, sync::Arc};
     use tokio::sync::Mutex;
+
+    #[test]
+    fn apply_clear_stats_rejects_invalid_direction() {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        use policy_engine_dev::{ClientConfig, PolicyClient};
+        // URL is never dialed — validation bails before any HTTP call.
+        let client = PolicyClient::with_config(ClientConfig {
+            server_url: "http://127.0.0.1:0".to_string(),
+            ..Default::default()
+        });
+        let req = ClearStats {
+            scope: Scope::Interface as i32,
+            interface_name: "eth0".to_string(),
+            rule_id: String::new(),
+            direction: "sideways".to_string(),
+        };
+        let err = apply_clear_stats(&client, Scope::Interface, &req).unwrap_err();
+        assert!(err.to_string().contains("invalid direction"), "{err}");
+    }
+
+    #[test]
+    fn apply_clear_stats_interface_requires_name() {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        use policy_engine_dev::{ClientConfig, PolicyClient};
+        let client = PolicyClient::with_config(ClientConfig {
+            server_url: "http://127.0.0.1:0".to_string(),
+            ..Default::default()
+        });
+        let req = ClearStats {
+            scope: Scope::Interface as i32,
+            interface_name: String::new(),
+            rule_id: String::new(),
+            direction: "ingress".to_string(),
+        };
+        let err = apply_clear_stats(&client, Scope::Interface, &req).unwrap_err();
+        assert!(err.to_string().contains("interface_name"), "{err}");
+    }
 
     /// In-memory stream handle driven by pre-loaded messages from the controller.
     struct MockStreamHandle {
