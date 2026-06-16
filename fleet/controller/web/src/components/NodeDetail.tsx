@@ -381,7 +381,7 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
           <>
             <div className="grid grid-cols-2 gap-4">
               {/* Node info card */}
-              <div className="bg-gray-800 rounded-lg p-4 border border-gray-700 space-y-2 text-sm">
+              <div className="self-start bg-gray-800 rounded-lg p-4 border border-gray-700 space-y-2 text-sm">
                 <h3 className="text-sm font-semibold text-gray-300 mb-2">Node Info</h3>
                 {node && (
                   <>
@@ -405,7 +405,7 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
                         </div>
                       ))}
                     </dl>
-                    <div className="flex items-center justify-between pt-2 mt-2 border-t border-gray-700">
+                    <div className="flex items-center justify-between">
                       <span className="text-gray-500">Stop behavior</span>
                       <span className={`inline-flex rounded overflow-hidden text-xs border border-gray-600 ${stopBehaviorPending ? 'opacity-40 pointer-events-none' : ''}`}>
                         <button
