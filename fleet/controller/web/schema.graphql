@@ -112,6 +112,10 @@ type ControlledNodeOutput {
 	"""
 	stopBehavior: String
 	"""
+	Operator-configured metrics scrape/forward interval in seconds. None = agent default.
+	"""
+	metricsIntervalSecs: Int
+	"""
 	JSON-encoded `Capabilities` from the most recent AgentHello. Raw
 	string (not a typed sub-object) so adding fields in the proto
 	doesn't churn the GraphQL schema. `"{}"` until the agent reconnects
@@ -382,6 +386,16 @@ type MutationRoot {
 	Pass null to clear the override and use the node's local default.
 	"""
 	setNodeStopBehavior(nodeId: ID!, behavior: String): OperationResult!
+	"""
+	Set how often the node's agent scrapes the local engine and forwards
+	metrics to the controller, in seconds. Pass null to clear the override so
+	the agent reverts to its local default.
+	
+	The value is persisted on the node and re-sent to the agent on every
+	(re)connect, so it survives agent restarts. If the node is offline the
+	value is still saved and applied when it next connects.
+	"""
+	setNodeMetricsInterval(nodeId: ID!, seconds: Int): OperationResult!
 	"""
 	Create the same rule on multiple nodes at once. Each node gets its own
 	unique rule ID. Returns the list of all created rules.

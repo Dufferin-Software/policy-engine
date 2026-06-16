@@ -16,7 +16,7 @@ import { wsUrl } from '../lib/auth'
 const GET_NODE_DETAIL = gql`
   query GetNodeDetail($id: ID!) {
     node(id: $id) {
-      id label hostname status dmiUuid certExpiry lastSeen enrolledAt tpmBacked agentVersion osPrettyName kernelVersion dmiSysVendor dmiProductName tenantId stopBehavior
+      id label hostname status dmiUuid certExpiry lastSeen enrolledAt tpmBacked agentVersion osPrettyName kernelVersion dmiSysVendor dmiProductName tenantId stopBehavior metricsIntervalSecs
     }
     nodeInterfaces(nodeId: $id) {
       nodeId name macAddress linkState addressesJson tag lastReported xdpAttached tcAttached fibForwarding ingressDefaultAction egressDefaultAction
@@ -67,6 +67,12 @@ const SET_STOP_BEHAVIOR = gql`
 const CLEAR_ALL_POLICY_STATS = gql`
   mutation ClearAllPolicyStats($nodeId: ID!) {
     clearAllPolicyStats(nodeId: $nodeId) { success message }
+  }
+`
+
+const SET_METRICS_INTERVAL = gql`
+  mutation SetNodeMetricsInterval($nodeId: ID!, $seconds: Int) {
+    setNodeMetricsInterval(nodeId: $nodeId, seconds: $seconds) { success message }
   }
 `
 
@@ -164,6 +170,9 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
   const [setNodeStopBehavior] = useMutation(SET_STOP_BEHAVIOR)
   const [stopBehaviorPending, setStopBehaviorPending] = useState(false)
   const [clearAllPolicyStats] = useMutation(CLEAR_ALL_POLICY_STATS)
+  const [setNodeMetricsInterval] = useMutation(SET_METRICS_INTERVAL)
+  // Mirrors the node's configured interval; empty string means "agent default".
+  const [metricsInterval, setMetricsInterval] = useState<string>('')
 
   // Stats live in the node's engine and are scraped periodically, so cleared
   // counters surface on the next metrics refresh rather than instantly.
@@ -200,6 +209,33 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
   function flash(m: string) {
     setMsg(m)
     setTimeout(() => setMsg(null), 4000)
+  }
+
+  // Keep the input in sync with the persisted value as the node refetches.
+  useEffect(() => {
+    setMetricsInterval(node?.metricsIntervalSecs != null ? String(node.metricsIntervalSecs) : '')
+  }, [node?.metricsIntervalSecs])
+
+  async function handleSetMetricsInterval() {
+    const trimmed = metricsInterval.trim()
+    // Empty clears the override so the agent reverts to its local default.
+    const seconds = trimmed === '' ? null : Number(trimmed)
+    if (seconds !== null && (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600)) {
+      flash('Metrics interval must be a whole number of seconds between 1 and 3600')
+      return
+    }
+    try {
+      const res = await setNodeMetricsInterval({ variables: { nodeId, seconds } })
+      const r = res.data?.setNodeMetricsInterval
+      if (r?.success) {
+        flash(r.message ?? (seconds === null ? 'Reverted to default metrics interval' : `Metrics interval set to ${seconds}s`))
+        refetch()
+      } else {
+        flash(r?.message ?? 'Failed to set metrics interval')
+      }
+    } catch (e) {
+      flash(String(e).replace(/^ApolloError:\s*/, ''))
+    }
   }
 
   function handlePendingChange(pending: boolean, opKind?: string) {
@@ -444,6 +480,30 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
                           title="On shutdown: leaves XDP/TC programs attached and maps in the kernel. Enforcement continues with zero gap across daemon restarts. Note: a crash (kill -9) always preserves state regardless of this setting."
                         >
                           preserve-state
+                        </button>
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-gray-500" title="How often the node's agent scrapes the local engine and forwards metrics to the controller. Empty = agent default.">
+                        Metrics interval
+                      </span>
+                      <span className="inline-flex items-center gap-1 text-xs">
+                        <input
+                          type="number"
+                          min={1}
+                          max={3600}
+                          value={metricsInterval}
+                          onChange={(e) => setMetricsInterval(e.target.value)}
+                          placeholder="default"
+                          className="w-20 bg-gray-900 border border-gray-600 rounded px-1 py-0.5 text-gray-200 text-right"
+                        />
+                        <span className="text-gray-500">s</span>
+                        <button
+                          onClick={handleSetMetricsInterval}
+                          className="px-2 py-0.5 bg-gray-700 text-gray-200 rounded hover:bg-blue-700"
+                          title="Apply the metrics scrape interval to this node. Empty reverts to the agent default."
+                        >
+                          Apply
                         </button>
                       </span>
                     </div>

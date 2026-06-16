@@ -126,6 +126,16 @@ impl ControllerStore for InMemoryControllerStore {
         Ok(())
     }
 
+    async fn update_node_metrics_interval(&self, id: &str, secs: Option<u32>) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        state
+            .nodes
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("Node not found: {}", id))?
+            .metrics_interval_secs = secs;
+        Ok(())
+    }
+
     async fn update_node_last_seen(&self, id: &str, ts: DateTime<Utc>) -> Result<()> {
         let mut state = self.inner.lock().unwrap();
         state
@@ -711,6 +721,7 @@ mod tests {
             dmi_product_name: None,
             tenant_id: "default".to_string(),
             stop_behavior: None,
+            metrics_interval_secs: None,
             capabilities: "{}".to_string(),
         }
     }

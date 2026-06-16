@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::sync::{mpsc, Notify};
 
 use policy_controller_proto::controller::{
@@ -9,7 +15,12 @@ use policy_controller_proto::controller::{
 };
 
 /// Default metrics scrape interval when none is configured.
-pub const METRICS_INTERVAL: Duration = Duration::from_secs(30);
+/// Keep in sync with `config::default_metrics_interval_secs`.
+pub const METRICS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Floor for the scrape interval, so an operator (or a bad push) can't pin an
+/// agent into a tight scrape loop that hammers the local engine and controller.
+pub const MIN_METRICS_INTERVAL_SECS: u64 = 1;
 
 /// Scrapes `/metrics` from the local policy-engine on a configurable interval and
 /// forwards the raw Prometheus exposition text to the controller via the agent
@@ -18,10 +29,14 @@ pub const METRICS_INTERVAL: Duration = Duration::from_secs(30);
 /// The `trigger` notify can be signalled to request an immediate push ahead of
 /// the normal interval (used by the `refreshNodeMetrics` GraphQL mutation).
 ///
+/// `interval_secs` is read fresh each iteration so a controller-driven
+/// `SetMetricsInterval` takes effect without restarting the forwarder (a change
+/// applies after at most one current-interval sleep).
+///
 /// Runs until `tx` is closed (stream disconnected).
 pub async fn run(
     base_url: String,
-    interval: Duration,
+    interval_secs: Arc<AtomicU64>,
     trigger: Arc<Notify>,
     tx: mpsc::Sender<AgentMessage>,
 ) {
@@ -38,8 +53,11 @@ pub async fn run(
     };
 
     loop {
+        let secs = interval_secs
+            .load(Ordering::Relaxed)
+            .max(MIN_METRICS_INTERVAL_SECS);
         tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
             _ = trigger.notified() => {
                 log::debug!("MetricsForwarder: early wake-up via MetricsQuery");
             }

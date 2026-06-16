@@ -5,7 +5,13 @@ use anyhow::{bail, Context, Result};
 pub mod renewal;
 
 use async_trait::async_trait;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::sync::{mpsc, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -164,7 +170,7 @@ pub async fn run_stream_loop(
     net_info: Option<&dyn NetworkInfo>,
     sys_info: Option<&dyn SystemInfo>,
     interface_blocklist: &[String],
-    metrics_interval: Duration,
+    metrics_interval: Arc<AtomicU64>,
     change_detector: Option<Arc<dyn ChangeDetector>>,
 ) -> Result<()> {
     // Outbound channel: forwarders push messages here; the loop drains it.
@@ -275,7 +281,7 @@ pub async fn run_stream_loop(
         let trigger = Arc::clone(&metrics_trigger);
         _connection_tasks.push(AbortOnDrop(tokio::spawn(crate::metrics_forwarder::run(
             base.clone(),
-            metrics_interval,
+            Arc::clone(&metrics_interval),
             trigger,
             metrics_tx,
         ))));
@@ -321,6 +327,7 @@ pub async fn run_stream_loop(
         &mut outbound_rx,
         &mut heartbeat_interval,
         &metrics_trigger,
+        &metrics_interval,
         change_detector.as_ref(),
     )
     .await;
@@ -348,6 +355,7 @@ async fn run_event_loop<S: AgentStreamHandle>(
     outbound_rx: &mut mpsc::Receiver<AgentMessage>,
     heartbeat_interval: &mut tokio::time::Interval,
     metrics_trigger: &Arc<Notify>,
+    metrics_interval: &Arc<AtomicU64>,
     change_detector: Option<&Arc<dyn ChangeDetector>>,
 ) -> Result<()> {
     loop {
@@ -383,6 +391,7 @@ async fn run_event_loop<S: AgentStreamHandle>(
                             pending,
                             outbound_tx,
                             metrics_trigger,
+                            metrics_interval,
                             change_detector,
                         )
                         .await?;
@@ -405,6 +414,7 @@ async fn handle_controller_message(
     pending: &Arc<PendingChangeRegistry>,
     outbound_tx: &mpsc::Sender<AgentMessage>,
     metrics_trigger: &Arc<Notify>,
+    metrics_interval: &Arc<AtomicU64>,
     change_detector: Option<&Arc<dyn ChangeDetector>>,
 ) -> Result<()> {
     match msg.payload {
@@ -859,6 +869,16 @@ async fn handle_controller_message(
             log::debug!("Received MetricsQuery — waking metrics forwarder");
             metrics_trigger.notify_one();
         }
+        Some(CtrlPayload::SetMetricsInterval(req)) => {
+            let secs =
+                (req.interval_secs as u64).max(crate::metrics_forwarder::MIN_METRICS_INTERVAL_SECS);
+            log::info!("Setting metrics scrape interval to {}s", secs);
+            // Live-applied to the running forwarder (takes effect after at most
+            // one current-interval sleep). Wake it so the new cadence — and a
+            // fresh push — happen promptly rather than after the old interval.
+            metrics_interval.store(secs, Ordering::Relaxed);
+            metrics_trigger.notify_one();
+        }
         Some(CtrlPayload::ClearStats(req)) => {
             use policy_controller_proto::controller::clear_stats::Scope;
             let scope = Scope::try_from(req.scope).unwrap_or(Scope::Unspecified);
@@ -936,7 +956,10 @@ fn apply_clear_stats(
                     bail!(op.message);
                 }
             }
-            Ok(format!("cleared interface stats for {}", req.interface_name))
+            Ok(format!(
+                "cleared interface stats for {}",
+                req.interface_name
+            ))
         }
         Scope::AllInterfaces => {
             let attachments = client.list_interfaces()?;
@@ -949,7 +972,9 @@ fn apply_clear_stats(
                 }
                 cleared += 1;
             }
-            Ok(format!("cleared interface stats for {cleared} attachment(s)"))
+            Ok(format!(
+                "cleared interface stats for {cleared} attachment(s)"
+            ))
         }
         Scope::Rule => {
             let id: u64 = req
@@ -1329,7 +1354,7 @@ mod tests {
             None,
             None,
             &[],
-            Duration::from_secs(30),
+            Arc::new(AtomicU64::new(30)),
             None,
         )
         .await;
@@ -1345,6 +1370,65 @@ mod tests {
             }
             other => panic!("Expected Hello, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_set_metrics_interval_updates_shared_atomic() {
+        use policy_controller_proto::controller::SetMetricsInterval;
+
+        let msg = ControllerMessage {
+            payload: Some(CtrlPayload::SetMetricsInterval(SetMetricsInterval {
+                interval_secs: 7,
+            })),
+        };
+        let (stream, _sent) = MockStreamHandle::new(vec![msg]);
+        let id = mock_identity();
+        let interval = Arc::new(AtomicU64::new(30));
+        let _ = run_stream_loop(
+            stream,
+            &id,
+            "0.1.0",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            Arc::clone(&interval),
+            None,
+        )
+        .await;
+        assert_eq!(interval.load(Ordering::Relaxed), 7);
+    }
+
+    #[tokio::test]
+    async fn test_set_metrics_interval_clamps_below_minimum() {
+        use policy_controller_proto::controller::SetMetricsInterval;
+
+        let msg = ControllerMessage {
+            payload: Some(CtrlPayload::SetMetricsInterval(SetMetricsInterval {
+                interval_secs: 0,
+            })),
+        };
+        let (stream, _sent) = MockStreamHandle::new(vec![msg]);
+        let id = mock_identity();
+        let interval = Arc::new(AtomicU64::new(30));
+        let _ = run_stream_loop(
+            stream,
+            &id,
+            "0.1.0",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            Arc::clone(&interval),
+            None,
+        )
+        .await;
+        assert_eq!(
+            interval.load(Ordering::Relaxed),
+            crate::metrics_forwarder::MIN_METRICS_INTERVAL_SECS
+        );
     }
 
     #[tokio::test]
@@ -1372,7 +1456,7 @@ mod tests {
             None,
             None,
             &[],
-            Duration::from_secs(30),
+            Arc::new(AtomicU64::new(30)),
             None,
         )
         .await
@@ -1408,7 +1492,7 @@ mod tests {
             None,
             None,
             &[],
-            Duration::from_secs(30),
+            Arc::new(AtomicU64::new(30)),
             None,
         )
         .await
@@ -1444,7 +1528,7 @@ mod tests {
             None,
             None,
             &[],
-            Duration::from_secs(30),
+            Arc::new(AtomicU64::new(30)),
             None,
         )
         .await;
@@ -1476,7 +1560,7 @@ mod tests {
             None,
             Some(&sys),
             &[],
-            Duration::from_secs(30),
+            Arc::new(AtomicU64::new(30)),
             None,
         )
         .await;
@@ -1506,7 +1590,7 @@ mod tests {
             None,
             None,
             &[],
-            Duration::from_secs(30),
+            Arc::new(AtomicU64::new(30)),
             None,
         )
         .await;

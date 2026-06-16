@@ -14,11 +14,10 @@ pub mod controller {
 pub use controller::{
     agent_message, clear_stats, config_confirm, controller_message, AddressReport, AgentHello,
     AgentMessage, ClearStats, ConfigApplyResult, ConfigCommitAck, ConfigConfirm, ControllerMessage,
-    DeltaConfigPush,
-    Disconnect, EnrollmentRequest, EnrollmentResponse, EnrollmentStatus, EnrollmentStatusRequest,
-    EnrollmentStatusResponse, EventBatch, Heartbeat, InterfaceReport, InterfaceUpdate,
-    LocalChangeReport, MetricsUpdate, PersistedAttachment, PersistedRule, RuleAdd, StateQuery,
-    StateRestoreRequest, StateSnapshot,
+    DeltaConfigPush, Disconnect, EnrollmentRequest, EnrollmentResponse, EnrollmentStatus,
+    EnrollmentStatusRequest, EnrollmentStatusResponse, EventBatch, Heartbeat, InterfaceReport,
+    InterfaceUpdate, LocalChangeReport, MetricsUpdate, PersistedAttachment, PersistedRule, RuleAdd,
+    SetMetricsInterval, StateQuery, StateRestoreRequest, StateSnapshot,
 };
 
 pub use controller::{

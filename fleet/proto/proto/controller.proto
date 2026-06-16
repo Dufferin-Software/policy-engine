@@ -196,6 +196,7 @@ message ControllerMessage {
         ConfigCommitAck    commit_ack     = 7;
         MetricsQuery       metrics_query  = 8;
         ClearStats         clear_stats    = 9;
+        SetMetricsInterval set_metrics_interval = 10;
     }
 }
 
@@ -268,6 +269,16 @@ message ClearStats {
     string rule_id        = 3;  // Required for RULE; ignored otherwise.
     // "ingress" or "egress" for INTERFACE/RULE. Empty means both directions.
     string direction      = 4;
+}
+
+// Set how often the agent scrapes the local engine's /metrics and forwards the
+// result to the controller. Applied live to the running metrics forwarder; not
+// gated (it is an idempotent agent-runtime knob with nothing to roll back).
+//
+// The controller persists the operator-chosen value per node and re-sends this
+// on each agent (re)connect, so the agent does not need to durably store it.
+message SetMetricsInterval {
+    uint32 interval_secs = 1;  // Clamped to a sane minimum by the agent.
 }
 
 // Controller requesting a fresh StateSnapshot from the agent.

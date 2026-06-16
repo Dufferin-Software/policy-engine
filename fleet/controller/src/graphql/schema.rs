@@ -96,6 +96,8 @@ pub struct ControlledNodeOutput {
     pub tenant_id: String,
     /// Operator-configured stop behavior: "clear-state" or "preserve-state". None = controller default.
     pub stop_behavior: Option<String>,
+    /// Operator-configured metrics scrape/forward interval in seconds. None = agent default.
+    pub metrics_interval_secs: Option<i32>,
     /// JSON-encoded `Capabilities` from the most recent AgentHello. Raw
     /// string (not a typed sub-object) so adding fields in the proto
     /// doesn't churn the GraphQL schema. `"{}"` until the agent reconnects
@@ -124,6 +126,7 @@ impl From<NodeRecord> for ControlledNodeOutput {
             dmi_product_name: n.dmi_product_name,
             tenant_id: n.tenant_id,
             stop_behavior: n.stop_behavior,
+            metrics_interval_secs: n.metrics_interval_secs.map(|v| v as i32),
             capabilities: n.capabilities,
         }
     }
@@ -1031,6 +1034,45 @@ impl MutationRoot {
             Ok(()) => Ok(OperationResult::ok()),
             Err(e) => Ok(OperationResult::err(e.message)),
         }
+    }
+
+    /// Set how often the node's agent scrapes the local engine and forwards
+    /// metrics to the controller, in seconds. Pass null to clear the override so
+    /// the agent reverts to its local default.
+    ///
+    /// The value is persisted on the node and re-sent to the agent on every
+    /// (re)connect, so it survives agent restarts. If the node is offline the
+    /// value is still saved and applied when it next connects.
+    #[graphql(guard = "Require::new(\"node:write\")")]
+    async fn set_node_metrics_interval(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+        seconds: Option<i32>,
+    ) -> Result<OperationResult> {
+        let secs: Option<u32> = match seconds {
+            None => None,
+            Some(s) if (METRICS_INTERVAL_MIN_SECS..=METRICS_INTERVAL_MAX_SECS).contains(&s) => {
+                Some(s as u32)
+            }
+            Some(_) => {
+                return Ok(OperationResult::err(format!(
+                    "seconds must be between {} and {}",
+                    METRICS_INTERVAL_MIN_SECS, METRICS_INTERVAL_MAX_SECS
+                )))
+            }
+        };
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+
+        // Persist first so the value survives reconnects (it is re-sent on
+        // connect). Clearing the override pushes the agent default so a
+        // connected node reverts immediately rather than only on restart.
+        store.update_node_metrics_interval(&node_id.0, secs).await?;
+        let interval_secs = secs.unwrap_or(METRICS_INTERVAL_DEFAULT_SECS);
+        Ok(push_set_metrics_interval(sessions, &node_id.0, interval_secs).await)
     }
 
     /// Create the same rule on multiple nodes at once. Each node gets its own
@@ -1963,6 +2005,45 @@ async fn ensure_node_in_tenant(
     }
 }
 
+/// Bounds for the operator-configurable metrics scrape interval (seconds).
+const METRICS_INTERVAL_MIN_SECS: i32 = 1;
+const METRICS_INTERVAL_MAX_SECS: i32 = 3600;
+/// Mirrors the agent's compiled default (`config::default_metrics_interval_secs`).
+/// Pushed when an operator clears the per-node override so a connected agent
+/// reverts to the default cadence immediately rather than only on restart.
+const METRICS_INTERVAL_DEFAULT_SECS: u32 = 5;
+
+/// Push a [`SetMetricsInterval`] to a node. The value is already persisted by
+/// the caller, so an offline node still picks it up on its next connect — hence
+/// a successful result either way, with a note when delivery was deferred.
+async fn push_set_metrics_interval(
+    sessions: &Arc<NodeSessionManager>,
+    node_id: &str,
+    interval_secs: u32,
+) -> OperationResult {
+    use policy_controller_proto::controller::{
+        controller_message::Payload as CtrlPayload, ControllerMessage, SetMetricsInterval,
+    };
+    let sent = sessions
+        .push(
+            node_id,
+            ControllerMessage {
+                payload: Some(CtrlPayload::SetMetricsInterval(SetMetricsInterval {
+                    interval_secs,
+                })),
+            },
+        )
+        .await;
+    if sent {
+        OperationResult::ok()
+    } else {
+        OperationResult {
+            success: true,
+            message: Some("Saved; will apply when the node reconnects".to_string()),
+        }
+    }
+}
+
 /// Push a fire-and-forget [`ClearStats`] request to a node.
 ///
 /// Stats live only in the engine's BPF maps — never the controller store — so
@@ -2200,6 +2281,7 @@ mod tests {
                 dmi_product_name: None,
                 tenant_id: "default".to_string(),
                 stop_behavior: None,
+                metrics_interval_secs: None,
                 capabilities: "{}".to_string(),
             })
             .await;
@@ -2377,9 +2459,11 @@ mod tests {
             )
             .await;
         assert!(res.errors.is_empty(), "{:?}", res.errors);
-        assert!(res.data.into_json().unwrap()["clearInterfaceStats"]["success"]
-            .as_bool()
-            .unwrap());
+        assert!(
+            res.data.into_json().unwrap()["clearInterfaceStats"]["success"]
+                .as_bool()
+                .unwrap()
+        );
 
         let msg = rx.recv().await.expect("a message").expect("ok message");
         match msg.payload {
@@ -2445,6 +2529,95 @@ mod tests {
             }
             other => panic!("expected ClearStats, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_set_node_metrics_interval_persists_and_pushes() {
+        use policy_controller_proto::controller::controller_message::Payload as P;
+        use tokio::sync::mpsc;
+
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let (tx, mut rx) = mpsc::channel(4);
+        h.sessions
+            .register("n1".to_string(), "default".to_string(), tx);
+
+        let res = h
+            .schema
+            .execute(
+                r#"mutation { setNodeMetricsInterval(nodeId: "n1", seconds: 10) { success } }"#,
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert!(
+            res.data.into_json().unwrap()["setNodeMetricsInterval"]["success"]
+                .as_bool()
+                .unwrap()
+        );
+
+        // Persisted to the store…
+        let node = h.store.get_node("n1").await.unwrap().unwrap();
+        assert_eq!(node.metrics_interval_secs, Some(10));
+
+        // …and pushed live to the connected agent.
+        let msg = rx.recv().await.expect("a message").expect("ok message");
+        match msg.payload {
+            Some(P::SetMetricsInterval(s)) => assert_eq!(s.interval_secs, 10),
+            other => panic!("expected SetMetricsInterval, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_node_metrics_interval_clear_pushes_default() {
+        use policy_controller_proto::controller::controller_message::Payload as P;
+        use tokio::sync::mpsc;
+
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        h.store
+            .update_node_metrics_interval("n1", Some(10))
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        h.sessions
+            .register("n1".to_string(), "default".to_string(), tx);
+
+        let res = h
+            .schema
+            .execute(
+                r#"mutation { setNodeMetricsInterval(nodeId: "n1", seconds: null) { success } }"#,
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+
+        // Override cleared in the store…
+        let node = h.store.get_node("n1").await.unwrap().unwrap();
+        assert_eq!(node.metrics_interval_secs, None);
+
+        // …and the agent is told to revert to the default cadence.
+        let msg = rx.recv().await.expect("a message").expect("ok message");
+        match msg.payload {
+            Some(P::SetMetricsInterval(s)) => {
+                assert_eq!(s.interval_secs, METRICS_INTERVAL_DEFAULT_SECS)
+            }
+            other => panic!("expected SetMetricsInterval, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_node_metrics_interval_rejects_out_of_range() {
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let res = h
+            .schema
+            .execute(r#"mutation { setNodeMetricsInterval(nodeId: "n1", seconds: 0) { success message } }"#)
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let data = res.data.into_json().unwrap();
+        assert_eq!(data["setNodeMetricsInterval"]["success"], false);
+        // Out-of-range must not have been persisted.
+        let node = h.store.get_node("n1").await.unwrap().unwrap();
+        assert_eq!(node.metrics_interval_secs, None);
     }
 
     #[tokio::test]

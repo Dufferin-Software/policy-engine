@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS nodes (
     -- Operator-configured stop behavior ("clear-state" or "preserve-state").
     -- NULL means controller has not set a preference (node uses its local default).
     stop_behavior     TEXT,
+    -- Operator-configured metrics scrape/forward interval in seconds.
+    -- NULL means the controller has not set a preference (agent uses its local default).
+    metrics_interval_secs INTEGER,
     -- JSON-encoded Capabilities (features/engine_version/sources) reported in
     -- the most recent AgentHello. Used by alert-rule write-time validation to
     -- reject rules referencing sources no node in the fleet advertises.

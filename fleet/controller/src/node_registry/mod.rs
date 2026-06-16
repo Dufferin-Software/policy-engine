@@ -148,6 +148,7 @@ impl NodeRegistry {
             dmi_product_name: None,
             tenant_id: "default".to_string(),
             stop_behavior: None,
+            metrics_interval_secs: None,
             capabilities: "{}".to_string(),
         };
 
@@ -1281,6 +1282,7 @@ mod tests {
             dmi_product_name: None,
             tenant_id: "default".to_string(),
             stop_behavior: None,
+            metrics_interval_secs: None,
             capabilities: "{}".to_string(),
         };
         store.upsert_node(&node).await.unwrap();
@@ -1327,6 +1329,7 @@ mod tests {
             dmi_product_name: None,
             tenant_id: "default".to_string(),
             stop_behavior: None,
+            metrics_interval_secs: None,
             capabilities: "{}".to_string(),
         };
         store.upsert_node(&node).await.unwrap();
@@ -1372,6 +1375,7 @@ mod tests {
             dmi_product_name: None,
             tenant_id: "default".to_string(),
             stop_behavior: None,
+            metrics_interval_secs: None,
             capabilities: "{}".to_string(),
         };
         store.upsert_node(&node).await.unwrap();
@@ -1429,6 +1433,7 @@ mod tests {
             dmi_product_name: None,
             tenant_id: "default".to_string(),
             stop_behavior: None,
+            metrics_interval_secs: None,
             capabilities: "{}".to_string(),
         };
         store.upsert_node(&node).await.unwrap();
