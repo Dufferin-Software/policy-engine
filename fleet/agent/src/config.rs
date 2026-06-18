@@ -79,7 +79,8 @@ pub struct AgentConfig {
     pub interface_blocklist: Vec<String>,
 
     /// How often (in seconds) the agent scrapes and forwards Prometheus metrics to the controller.
-    /// Defaults to 30.
+    /// Defaults to 5 so controller-side stats refresh promptly; raise it for large fleets where
+    /// the extra metrics traffic and controller parse load matter more than refresh latency.
     #[serde(default = "default_metrics_interval_secs")]
     pub metrics_interval_secs: u64,
 
@@ -149,7 +150,7 @@ fn default_interface_blocklist() -> Vec<String> {
     vec!["lo".to_string()]
 }
 fn default_metrics_interval_secs() -> u64 {
-    30
+    5
 }
 fn default_mtls_key_rotation_renewals() -> u32 {
     4

@@ -40,7 +40,9 @@ tokio = { version = "1", features = ["full"] }
 async-graphql = { version = "7", features = ["log"] }
 async-graphql-actix-web = "7"
 actix-web = { version = "4", features = ["rustls-0_23"] }
-rustls = "0.23"
+# `ring` enabled explicitly so `rustls::crypto::ring` is available regardless of
+# workspace feature unification; the provider is installed in bin/server.rs.
+rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 actix-rt = "2"
 actix-cors = "0.7"

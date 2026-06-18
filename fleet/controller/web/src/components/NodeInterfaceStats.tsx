@@ -1,8 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
 
-import { useQuery, gql } from '@apollo/client'
+import { useState } from 'react'
+import { useQuery, useMutation, gql } from '@apollo/client'
 import { NodeInterfaceOutput, fmtBytes, fmtCount } from './types.ts'
+
+const CLEAR_ALL_INTERFACE_STATS = gql`
+  mutation ClearAllInterfaceStats($nodeId: ID!) {
+    clearAllInterfaceStats(nodeId: $nodeId) {
+      success
+      message
+    }
+  }
+`
 
 const GET_INTERFACE_STATS = gql`
   query NodeInterfaceStats($nodeId: ID!, $interfaceName: String!, $direction: String!) {
@@ -31,7 +41,7 @@ function StatRow({
 }) {
   const { data, loading } = useQuery<{ nodeInterfaceStats: StatsResult | null }>(
     GET_INTERFACE_STATS,
-    { variables: { nodeId, interfaceName, direction }, pollInterval: 30_000 },
+    { variables: { nodeId, interfaceName, direction }, pollInterval: 5_000 },
   )
   const s = data?.nodeInterfaceStats
 
@@ -74,17 +84,46 @@ interface Props {
 }
 
 export default function NodeInterfaceStats({ nodeId, interfaces, onShowStats }: Props) {
+  const [clearAllInterfaceStats, { loading: clearing }] = useMutation(CLEAR_ALL_INTERFACE_STATS, {
+    refetchQueries: ['NodeInterfaceStats', 'NodeInterfaceStatsDetail', 'NodeEthertypeStats'],
+  })
+  const [feedback, setFeedback] = useState<string | null>(null)
+
   if (interfaces.length === 0) return null
 
+  const handleClearAll = async () => {
+    if (!window.confirm('Clear interface statistics for every attached interface on this node?')) return
+    try {
+      const res = await clearAllInterfaceStats({ variables: { nodeId } })
+      const r = res.data?.clearAllInterfaceStats
+      // Success is assumed silently; only surface failures.
+      setFeedback(r?.success ? null : (r?.message ?? 'Failed to clear stats'))
+    } catch (e) {
+      setFeedback(e instanceof Error ? e.message : 'Failed to clear stats')
+    }
+  }
+
   return (
-    <div className="grid grid-cols-2 gap-4">
+    <div className="space-y-2">
+      <div className="flex items-center justify-end gap-3">
+        {feedback && <span className="text-xs text-gray-400">{feedback}</span>}
+        <button
+          onClick={handleClearAll}
+          disabled={clearing}
+          className="text-xs px-2 py-0.5 rounded bg-gray-700 text-gray-300 hover:bg-red-700 hover:text-white disabled:opacity-50"
+          title="Clear interface statistics for every attached interface on this node"
+        >
+          {clearing ? 'Clearing…' : 'Clear all interface stats'}
+        </button>
+      </div>
+      <div className="grid grid-cols-2 gap-4">
       {(['ingress', 'egress'] as const).map((dir) => (
         <div key={dir} className="bg-gray-800 rounded-lg border border-gray-700">
           <div className="px-4 py-2 border-b border-gray-700 flex items-center justify-between">
             <h3 className={`text-sm font-semibold ${dir === 'ingress' ? 'text-cyan-400' : 'text-orange-400'}`}>
               {dir === 'ingress' ? 'Ingress Traffic' : 'Egress Traffic'}
             </h3>
-            <span className="text-xs text-gray-600">30s refresh</span>
+            <span className="text-xs text-gray-600">5s refresh</span>
           </div>
           <table className="w-full">
             <thead className="text-gray-500 uppercase bg-gray-900/50">
@@ -108,6 +147,7 @@ export default function NodeInterfaceStats({ nodeId, interfaces, onShowStats }: 
           </table>
         </div>
       ))}
+      </div>
     </div>
   )
 }

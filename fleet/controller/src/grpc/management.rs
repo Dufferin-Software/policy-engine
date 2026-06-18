@@ -496,6 +496,25 @@ async fn drive_stream(
         Err(e) => log::warn!("Failed to load rules for {}: {:#}", node_id, e),
     }
 
+    // Re-apply the operator-configured metrics interval (if any) on connect, so
+    // it survives agent restarts without the agent persisting it locally.
+    if let Some(secs) = node.metrics_interval_secs {
+        log::info!(
+            "Sending SetMetricsInterval({}s) to node {} on connect",
+            secs,
+            node_id
+        );
+        let _ = tx
+            .send(Ok(ControllerMessage {
+                payload: Some(CtrlPayload::SetMetricsInterval(
+                    policy_controller_proto::controller::SetMetricsInterval {
+                        interval_secs: secs,
+                    },
+                )),
+            }))
+            .await;
+    }
+
     // ── Step 6: message loop ──────────────────────────────────────────────────
     while let Some(item) = inbound.next().await {
         let msg = match item {
@@ -996,6 +1015,7 @@ mod tests {
                 dmi_sys_vendor: None,
                 dmi_product_name: None,
                 stop_behavior: None,
+                metrics_interval_secs: None,
                 capabilities: "{}".to_string(),
             })
             .await

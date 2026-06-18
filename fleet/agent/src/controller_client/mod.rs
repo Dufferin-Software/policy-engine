@@ -5,7 +5,13 @@ use anyhow::{bail, Context, Result};
 pub mod renewal;
 
 use async_trait::async_trait;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::sync::{mpsc, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -164,7 +170,7 @@ pub async fn run_stream_loop(
     net_info: Option<&dyn NetworkInfo>,
     sys_info: Option<&dyn SystemInfo>,
     interface_blocklist: &[String],
-    metrics_interval: Duration,
+    metrics_interval: Arc<AtomicU64>,
     change_detector: Option<Arc<dyn ChangeDetector>>,
 ) -> Result<()> {
     // Outbound channel: forwarders push messages here; the loop drains it.
@@ -275,7 +281,7 @@ pub async fn run_stream_loop(
         let trigger = Arc::clone(&metrics_trigger);
         _connection_tasks.push(AbortOnDrop(tokio::spawn(crate::metrics_forwarder::run(
             base.clone(),
-            metrics_interval,
+            Arc::clone(&metrics_interval),
             trigger,
             metrics_tx,
         ))));
@@ -321,6 +327,7 @@ pub async fn run_stream_loop(
         &mut outbound_rx,
         &mut heartbeat_interval,
         &metrics_trigger,
+        &metrics_interval,
         change_detector.as_ref(),
     )
     .await;
@@ -348,6 +355,7 @@ async fn run_event_loop<S: AgentStreamHandle>(
     outbound_rx: &mut mpsc::Receiver<AgentMessage>,
     heartbeat_interval: &mut tokio::time::Interval,
     metrics_trigger: &Arc<Notify>,
+    metrics_interval: &Arc<AtomicU64>,
     change_detector: Option<&Arc<dyn ChangeDetector>>,
 ) -> Result<()> {
     loop {
@@ -383,6 +391,7 @@ async fn run_event_loop<S: AgentStreamHandle>(
                             pending,
                             outbound_tx,
                             metrics_trigger,
+                            metrics_interval,
                             change_detector,
                         )
                         .await?;
@@ -405,6 +414,7 @@ async fn handle_controller_message(
     pending: &Arc<PendingChangeRegistry>,
     outbound_tx: &mpsc::Sender<AgentMessage>,
     metrics_trigger: &Arc<Notify>,
+    metrics_interval: &Arc<AtomicU64>,
     change_detector: Option<&Arc<dyn ChangeDetector>>,
 ) -> Result<()> {
     match msg.payload {
@@ -859,11 +869,145 @@ async fn handle_controller_message(
             log::debug!("Received MetricsQuery — waking metrics forwarder");
             metrics_trigger.notify_one();
         }
+        Some(CtrlPayload::SetMetricsInterval(req)) => {
+            let secs =
+                (req.interval_secs as u64).max(crate::metrics_forwarder::MIN_METRICS_INTERVAL_SECS);
+            log::info!("Setting metrics scrape interval to {}s", secs);
+            // Live-applied to the running forwarder (takes effect after at most
+            // one current-interval sleep). Wake it so the new cadence — and a
+            // fresh push — happen promptly rather than after the old interval.
+            metrics_interval.store(secs, Ordering::Relaxed);
+            metrics_trigger.notify_one();
+        }
+        Some(CtrlPayload::ClearStats(req)) => {
+            use policy_controller_proto::controller::clear_stats::Scope;
+            let scope = Scope::try_from(req.scope).unwrap_or(Scope::Unspecified);
+            log::info!(
+                "Received ClearStats (scope={:?}, interface='{}', rule_id='{}', direction='{}')",
+                scope,
+                req.interface_name,
+                req.rule_id,
+                req.direction,
+            );
+            // Fire-and-forget: stats live only in the engine's BPF maps, so there
+            // is nothing to confirm or roll back. We log the outcome; the operator
+            // observes the result by re-querying stats from the controller.
+            if let Some(url) = local_graphql_url {
+                let url = url.to_string();
+                let req = req.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    use policy_engine_dev::{ClientConfig, PolicyClient};
+                    let client = PolicyClient::with_config(ClientConfig {
+                        server_url: url,
+                        ..Default::default()
+                    });
+                    apply_clear_stats(&client, scope, &req)
+                })
+                .await
+                .context("clear-stats spawn_blocking panicked")?;
+
+                match outcome {
+                    Ok(msg) => log::info!("ClearStats applied: {}", msg),
+                    Err(e) => log::warn!("ClearStats failed: {:#}", e),
+                }
+            } else {
+                log::warn!("No local GraphQL URL configured — cannot clear stats");
+            }
+        }
         None => {
             log::warn!("Received ControllerMessage with no payload");
         }
     }
     Ok(())
+}
+
+/// Apply a [`ClearStats`] request against the local policy-engine, returning a
+/// human-readable summary on success.
+///
+/// `INTERFACE` and `ALL_INTERFACES` clear per-interface counters (global +
+/// ethertype). Where the request leaves `direction` empty, both directions are
+/// cleared. For `ALL_INTERFACES` the engine is asked which interfaces are
+/// attached and each is cleared in its attached direction — the engine has no
+/// single "all interfaces" call, only per-interface and clear-everything.
+fn apply_clear_stats(
+    client: &policy_engine_dev::PolicyClient,
+    scope: policy_controller_proto::controller::clear_stats::Scope,
+    req: &policy_controller_proto::controller::ClearStats,
+) -> Result<String> {
+    use policy_controller_proto::controller::clear_stats::Scope;
+    use policy_engine_dev::GqlDirection;
+
+    // Directions to act on: the one named, or both when unspecified.
+    let dirs: Vec<GqlDirection> = match req.direction.as_str() {
+        "" => vec![GqlDirection::Ingress, GqlDirection::Egress],
+        other => vec![other
+            .parse::<GqlDirection>()
+            .map_err(|_| anyhow::anyhow!("invalid direction '{other}'"))?],
+    };
+
+    match scope {
+        Scope::Interface => {
+            if req.interface_name.is_empty() {
+                bail!("INTERFACE scope requires interface_name");
+            }
+            for dir in &dirs {
+                let op = client.clear_interface_stats(&req.interface_name, *dir)?;
+                if !op.success {
+                    bail!(op.message);
+                }
+            }
+            Ok(format!(
+                "cleared interface stats for {}",
+                req.interface_name
+            ))
+        }
+        Scope::AllInterfaces => {
+            let attachments = client.list_interfaces()?;
+            let mut cleared = 0usize;
+            for att in &attachments {
+                let dir: GqlDirection = att.direction.parse().unwrap_or(GqlDirection::Ingress);
+                let op = client.clear_interface_stats(&att.interface, dir)?;
+                if !op.success {
+                    bail!(op.message);
+                }
+                cleared += 1;
+            }
+            Ok(format!(
+                "cleared interface stats for {cleared} attachment(s)"
+            ))
+        }
+        Scope::Rule => {
+            let id: u64 = req
+                .rule_id
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid rule_id '{}'", req.rule_id))?;
+            for dir in &dirs {
+                let op = client.clear_rule_stats(id, *dir)?;
+                if !op.success {
+                    bail!(op.message);
+                }
+            }
+            Ok(format!("cleared rule stats for {}", req.rule_id))
+        }
+        Scope::AllRules => {
+            // Rule stats are per-direction; clear both regardless of the request.
+            for dir in [GqlDirection::Ingress, GqlDirection::Egress] {
+                let op = client.clear_all_rule_stats(dir)?;
+                if !op.success {
+                    bail!(op.message);
+                }
+            }
+            Ok("cleared all rule stats".to_string())
+        }
+        Scope::All => {
+            let op = client.clear_all_stats()?;
+            if !op.success {
+                bail!(op.message);
+            }
+            Ok("cleared all stats".to_string())
+        }
+        Scope::Unspecified => bail!("ClearStats scope unspecified"),
+    }
 }
 
 /// Aborts the wrapped task when dropped, binding a per-connection background
@@ -1105,6 +1249,61 @@ mod tests {
     use std::{collections::VecDeque, sync::Arc};
     use tokio::sync::Mutex;
 
+    #[test]
+    fn apply_clear_stats_rejects_invalid_direction() {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        use policy_engine_dev::{ClientConfig, PolicyClient};
+        // URL is never dialed — validation bails before any HTTP call.
+        let client = PolicyClient::with_config(ClientConfig {
+            server_url: "http://127.0.0.1:0".to_string(),
+            ..Default::default()
+        });
+        let req = ClearStats {
+            scope: Scope::Interface as i32,
+            interface_name: "eth0".to_string(),
+            rule_id: String::new(),
+            direction: "sideways".to_string(),
+        };
+        let err = apply_clear_stats(&client, Scope::Interface, &req).unwrap_err();
+        assert!(err.to_string().contains("invalid direction"), "{err}");
+    }
+
+    #[test]
+    fn apply_clear_stats_interface_requires_name() {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        use policy_engine_dev::{ClientConfig, PolicyClient};
+        let client = PolicyClient::with_config(ClientConfig {
+            server_url: "http://127.0.0.1:0".to_string(),
+            ..Default::default()
+        });
+        let req = ClearStats {
+            scope: Scope::Interface as i32,
+            interface_name: String::new(),
+            rule_id: String::new(),
+            direction: "ingress".to_string(),
+        };
+        let err = apply_clear_stats(&client, Scope::Interface, &req).unwrap_err();
+        assert!(err.to_string().contains("interface_name"), "{err}");
+    }
+
+    #[test]
+    fn apply_clear_stats_rule_requires_numeric_id() {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        use policy_engine_dev::{ClientConfig, PolicyClient};
+        let client = PolicyClient::with_config(ClientConfig {
+            server_url: "http://127.0.0.1:0".to_string(),
+            ..Default::default()
+        });
+        let req = ClearStats {
+            scope: Scope::Rule as i32,
+            interface_name: String::new(),
+            rule_id: "not-a-number".to_string(),
+            direction: "ingress".to_string(),
+        };
+        let err = apply_clear_stats(&client, Scope::Rule, &req).unwrap_err();
+        assert!(err.to_string().contains("invalid rule_id"), "{err}");
+    }
+
     /// In-memory stream handle driven by pre-loaded messages from the controller.
     struct MockStreamHandle {
         sent: Arc<Mutex<Vec<AgentMessage>>>,
@@ -1155,7 +1354,7 @@ mod tests {
             None,
             None,
             &[],
-            Duration::from_secs(30),
+            Arc::new(AtomicU64::new(30)),
             None,
         )
         .await;
@@ -1171,6 +1370,65 @@ mod tests {
             }
             other => panic!("Expected Hello, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_set_metrics_interval_updates_shared_atomic() {
+        use policy_controller_proto::controller::SetMetricsInterval;
+
+        let msg = ControllerMessage {
+            payload: Some(CtrlPayload::SetMetricsInterval(SetMetricsInterval {
+                interval_secs: 7,
+            })),
+        };
+        let (stream, _sent) = MockStreamHandle::new(vec![msg]);
+        let id = mock_identity();
+        let interval = Arc::new(AtomicU64::new(30));
+        let _ = run_stream_loop(
+            stream,
+            &id,
+            "0.1.0",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            Arc::clone(&interval),
+            None,
+        )
+        .await;
+        assert_eq!(interval.load(Ordering::Relaxed), 7);
+    }
+
+    #[tokio::test]
+    async fn test_set_metrics_interval_clamps_below_minimum() {
+        use policy_controller_proto::controller::SetMetricsInterval;
+
+        let msg = ControllerMessage {
+            payload: Some(CtrlPayload::SetMetricsInterval(SetMetricsInterval {
+                interval_secs: 0,
+            })),
+        };
+        let (stream, _sent) = MockStreamHandle::new(vec![msg]);
+        let id = mock_identity();
+        let interval = Arc::new(AtomicU64::new(30));
+        let _ = run_stream_loop(
+            stream,
+            &id,
+            "0.1.0",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            Arc::clone(&interval),
+            None,
+        )
+        .await;
+        assert_eq!(
+            interval.load(Ordering::Relaxed),
+            crate::metrics_forwarder::MIN_METRICS_INTERVAL_SECS
+        );
     }
 
     #[tokio::test]
@@ -1198,7 +1456,7 @@ mod tests {
             None,
             None,
             &[],
-            Duration::from_secs(30),
+            Arc::new(AtomicU64::new(30)),
             None,
         )
         .await
@@ -1234,7 +1492,7 @@ mod tests {
             None,
             None,
             &[],
-            Duration::from_secs(30),
+            Arc::new(AtomicU64::new(30)),
             None,
         )
         .await
@@ -1270,7 +1528,7 @@ mod tests {
             None,
             None,
             &[],
-            Duration::from_secs(30),
+            Arc::new(AtomicU64::new(30)),
             None,
         )
         .await;
@@ -1302,7 +1560,7 @@ mod tests {
             None,
             Some(&sys),
             &[],
-            Duration::from_secs(30),
+            Arc::new(AtomicU64::new(30)),
             None,
         )
         .await;
@@ -1332,7 +1590,7 @@ mod tests {
             None,
             None,
             &[],
-            Duration::from_secs(30),
+            Arc::new(AtomicU64::new(30)),
             None,
         )
         .await;

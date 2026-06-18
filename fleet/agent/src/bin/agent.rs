@@ -284,6 +284,13 @@ async fn main() -> Result<()> {
         },
     );
 
+    // Shared, live-updatable metrics scrape interval. Created once here so a
+    // controller-driven SetMetricsInterval survives stream reconnects (the
+    // forwarder is re-spawned per connection but reads this same atomic).
+    let metrics_interval = Arc::new(std::sync::atomic::AtomicU64::new(
+        config.metrics_interval_secs,
+    ));
+
     // ── Management stream (reconnect loop) ──────────────────────────────────────
     log::info!("Starting management stream loop");
     let mut reconnect_delay = RECONNECT_DELAY_INITIAL;
@@ -300,7 +307,7 @@ async fn main() -> Result<()> {
             Arc::clone(&net_info),
             Arc::clone(&sys_info),
             &config.interface_blocklist,
-            std::time::Duration::from_secs(config.metrics_interval_secs),
+            Arc::clone(&metrics_interval),
             Arc::clone(&change_detector),
         );
 
@@ -390,7 +397,7 @@ async fn run_management_stream(
     net_info: Arc<SystemNetworkInfo>,
     sys_info: Arc<RealSystemInfo>,
     interface_blocklist: &[String],
-    metrics_interval: std::time::Duration,
+    metrics_interval: Arc<std::sync::atomic::AtomicU64>,
     change_detector: Arc<dyn ChangeDetector>,
 ) -> Result<()> {
     let stream = controller_client::connect(

@@ -51,6 +51,16 @@ fn main() -> Result<()> {
         .format_timestamp(None)
         .init();
 
+    // Install a process-default rustls CryptoProvider before any TLS is set up.
+    // The dependency tree compiles rustls 0.23 with both the `aws-lc-rs` and
+    // `ring` providers enabled (the `ring` feature is pulled in workspace-wide
+    // via lettre in the controller), so rustls cannot auto-select one and
+    // `ServerConfig::builder()` would panic at HTTPS bind time. Pick `ring`
+    // explicitly, matching the fleet controller/agent binaries.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install ring crypto provider");
+
     let provider = FileConfigProvider::default();
     let cfg = provider.load();
     let total = std::thread::available_parallelism()

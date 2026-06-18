@@ -12,12 +12,12 @@ pub mod controller {
 
 // Re-export the most commonly used types at crate root for convenience.
 pub use controller::{
-    agent_message, config_confirm, controller_message, AddressReport, AgentHello, AgentMessage,
-    ConfigApplyResult, ConfigCommitAck, ConfigConfirm, ControllerMessage, DeltaConfigPush,
-    Disconnect, EnrollmentRequest, EnrollmentResponse, EnrollmentStatus, EnrollmentStatusRequest,
-    EnrollmentStatusResponse, EventBatch, Heartbeat, InterfaceReport, InterfaceUpdate,
-    LocalChangeReport, MetricsUpdate, PersistedAttachment, PersistedRule, RuleAdd, StateQuery,
-    StateRestoreRequest, StateSnapshot,
+    agent_message, clear_stats, config_confirm, controller_message, AddressReport, AgentHello,
+    AgentMessage, ClearStats, ConfigApplyResult, ConfigCommitAck, ConfigConfirm, ControllerMessage,
+    DeltaConfigPush, Disconnect, EnrollmentRequest, EnrollmentResponse, EnrollmentStatus,
+    EnrollmentStatusRequest, EnrollmentStatusResponse, EventBatch, Heartbeat, InterfaceReport,
+    InterfaceUpdate, LocalChangeReport, MetricsUpdate, PersistedAttachment, PersistedRule, RuleAdd,
+    SetMetricsInterval, StateQuery, StateRestoreRequest, StateSnapshot,
 };
 
 pub use controller::{

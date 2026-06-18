@@ -195,6 +195,8 @@ message ControllerMessage {
         SetFibForwarding   set_fib        = 6;
         ConfigCommitAck    commit_ack     = 7;
         MetricsQuery       metrics_query  = 8;
+        ClearStats         clear_stats    = 9;
+        SetMetricsInterval set_metrics_interval = 10;
     }
 }
 
@@ -244,6 +246,39 @@ message RuleAdd {
     string interface_name = 2;
     string direction      = 3;  // "INGRESS" or "EGRESS"
     bytes  params_json    = 4;  // JSON-serialized AddRuleInput
+}
+
+// Imperative, fire-and-forget request to clear policy-engine statistics.
+//
+// Stats live only in the engine's BPF maps — never in the controller DB — so
+// this is NOT gated by the pending-generation/confirm machinery. The agent
+// applies it immediately against the local engine; the operator's UI re-queries
+// stats afterward to observe the cleared counters. No generation_id is carried
+// because there is nothing to commit or roll back.
+message ClearStats {
+    enum Scope {
+        SCOPE_UNSPECIFIED = 0;
+        INTERFACE         = 1;  // one interface (global + ethertype): interface_name + direction
+        RULE              = 2;  // one policy rule: rule_id + direction
+        ALL_INTERFACES    = 3;  // every attached interface, both directions
+        ALL_RULES         = 4;  // all policy rule stats, both directions
+        ALL               = 5;  // everything (global + ethertype + rules)
+    }
+    Scope  scope          = 1;
+    string interface_name = 2;  // Required for INTERFACE; ignored otherwise.
+    string rule_id        = 3;  // Required for RULE; ignored otherwise.
+    // "ingress" or "egress" for INTERFACE/RULE. Empty means both directions.
+    string direction      = 4;
+}
+
+// Set how often the agent scrapes the local engine's /metrics and forwards the
+// result to the controller. Applied live to the running metrics forwarder; not
+// gated (it is an idempotent agent-runtime knob with nothing to roll back).
+//
+// The controller persists the operator-chosen value per node and re-sends this
+// on each agent (re)connect, so the agent does not need to durably store it.
+message SetMetricsInterval {
+    uint32 interval_secs = 1;  // Clamped to a sane minimum by the agent.
 }
 
 // Controller requesting a fresh StateSnapshot from the agent.

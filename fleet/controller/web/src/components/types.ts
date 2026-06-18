@@ -20,6 +20,7 @@ export interface ControlledNode {
   dmiProductName: string | null
   tenantId: string
   stopBehavior: string | null
+  metricsIntervalSecs: number | null
 }
 
 export interface RuleOutput {

@@ -96,6 +96,8 @@ pub struct ControlledNodeOutput {
     pub tenant_id: String,
     /// Operator-configured stop behavior: "clear-state" or "preserve-state". None = controller default.
     pub stop_behavior: Option<String>,
+    /// Operator-configured metrics scrape/forward interval in seconds. None = agent default.
+    pub metrics_interval_secs: Option<i32>,
     /// JSON-encoded `Capabilities` from the most recent AgentHello. Raw
     /// string (not a typed sub-object) so adding fields in the proto
     /// doesn't churn the GraphQL schema. `"{}"` until the agent reconnects
@@ -124,6 +126,7 @@ impl From<NodeRecord> for ControlledNodeOutput {
             dmi_product_name: n.dmi_product_name,
             tenant_id: n.tenant_id,
             stop_behavior: n.stop_behavior,
+            metrics_interval_secs: n.metrics_interval_secs.map(|v| v as i32),
             capabilities: n.capabilities,
         }
     }
@@ -1033,6 +1036,45 @@ impl MutationRoot {
         }
     }
 
+    /// Set how often the node's agent scrapes the local engine and forwards
+    /// metrics to the controller, in seconds. Pass null to clear the override so
+    /// the agent reverts to its local default.
+    ///
+    /// The value is persisted on the node and re-sent to the agent on every
+    /// (re)connect, so it survives agent restarts. If the node is offline the
+    /// value is still saved and applied when it next connects.
+    #[graphql(guard = "Require::new(\"node:write\")")]
+    async fn set_node_metrics_interval(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+        seconds: Option<i32>,
+    ) -> Result<OperationResult> {
+        let secs: Option<u32> = match seconds {
+            None => None,
+            Some(s) if (METRICS_INTERVAL_MIN_SECS..=METRICS_INTERVAL_MAX_SECS).contains(&s) => {
+                Some(s as u32)
+            }
+            Some(_) => {
+                return Ok(OperationResult::err(format!(
+                    "seconds must be between {} and {}",
+                    METRICS_INTERVAL_MIN_SECS, METRICS_INTERVAL_MAX_SECS
+                )))
+            }
+        };
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+
+        // Persist first so the value survives reconnects (it is re-sent on
+        // connect). Clearing the override pushes the agent default so a
+        // connected node reverts immediately rather than only on restart.
+        store.update_node_metrics_interval(&node_id.0, secs).await?;
+        let interval_secs = secs.unwrap_or(METRICS_INTERVAL_DEFAULT_SECS);
+        Ok(push_set_metrics_interval(sessions, &node_id.0, interval_secs).await)
+    }
+
     /// Create the same rule on multiple nodes at once. Each node gets its own
     /// unique rule ID. Returns the list of all created rules.
     #[graphql(guard = "Require::new(\"rule:write\")")]
@@ -1618,6 +1660,141 @@ impl MutationRoot {
         }
     }
 
+    /// Clear all statistics (global + ethertype) for a single interface on a node.
+    ///
+    /// `direction` is "ingress"/"egress"; pass null to clear both. Fire-and-forget:
+    /// stats live only in the engine's BPF maps, so nothing is committed to the
+    /// controller store. Returns ok once the request is delivered to a connected
+    /// agent — the UI re-queries stats to confirm they are zeroed.
+    #[graphql(guard = "Require::new(\"interface:write\")")]
+    async fn clear_interface_stats(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+        interface_name: String,
+        direction: Option<String>,
+    ) -> Result<OperationResult> {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        push_clear_stats(
+            sessions,
+            &node_id.0,
+            ClearStats {
+                scope: Scope::Interface as i32,
+                interface_name,
+                rule_id: String::new(),
+                direction: direction.unwrap_or_default(),
+            },
+        )
+        .await
+    }
+
+    /// Clear interface statistics for every attached interface on a node.
+    #[graphql(guard = "Require::new(\"interface:write\")")]
+    async fn clear_all_interface_stats(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+    ) -> Result<OperationResult> {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        push_clear_stats(
+            sessions,
+            &node_id.0,
+            ClearStats {
+                scope: Scope::AllInterfaces as i32,
+                interface_name: String::new(),
+                rule_id: String::new(),
+                direction: String::new(),
+            },
+        )
+        .await
+    }
+
+    /// Clear statistics for a single policy rule on a node.
+    ///
+    /// `ruleId` is the controller-assigned rule ID (which the engine also uses
+    /// as its per-rule stats key). `direction` is "ingress"/"egress"; pass null
+    /// to clear both. Fire-and-forget, same as the interface clears.
+    #[graphql(guard = "Require::new(\"rule:write\")")]
+    async fn clear_rule_stats(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+        rule_id: ID,
+        direction: Option<String>,
+    ) -> Result<OperationResult> {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        push_clear_stats(
+            sessions,
+            &node_id.0,
+            ClearStats {
+                scope: Scope::Rule as i32,
+                interface_name: String::new(),
+                rule_id: rule_id.0,
+                direction: direction.unwrap_or_default(),
+            },
+        )
+        .await
+    }
+
+    /// Clear statistics for every policy rule on a node (both directions).
+    #[graphql(guard = "Require::new(\"rule:write\")")]
+    async fn clear_all_policy_stats(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+    ) -> Result<OperationResult> {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        push_clear_stats(
+            sessions,
+            &node_id.0,
+            ClearStats {
+                scope: Scope::AllRules as i32,
+                interface_name: String::new(),
+                rule_id: String::new(),
+                direction: String::new(),
+            },
+        )
+        .await
+    }
+
+    /// Clear ALL statistics on a node — every interface counter and every rule
+    /// counter, in one shot.
+    #[graphql(guard = "Require::new(\"node:write\")")]
+    async fn clear_all_stats(&self, ctx: &Context<'_>, node_id: ID) -> Result<OperationResult> {
+        use policy_controller_proto::controller::{clear_stats::Scope, ClearStats};
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        push_clear_stats(
+            sessions,
+            &node_id.0,
+            ClearStats {
+                scope: Scope::All as i32,
+                interface_name: String::new(),
+                rule_id: String::new(),
+                direction: String::new(),
+            },
+        )
+        .await
+    }
+
     // ── Alert pipeline (step 4) ──────────────────────────────────────────
 
     #[graphql(guard = "Require::new(\"alert:write\")")]
@@ -1828,6 +2005,78 @@ async fn ensure_node_in_tenant(
     }
 }
 
+/// Bounds for the operator-configurable metrics scrape interval (seconds).
+const METRICS_INTERVAL_MIN_SECS: i32 = 1;
+const METRICS_INTERVAL_MAX_SECS: i32 = 3600;
+/// Mirrors the agent's compiled default (`config::default_metrics_interval_secs`).
+/// Pushed when an operator clears the per-node override so a connected agent
+/// reverts to the default cadence immediately rather than only on restart.
+const METRICS_INTERVAL_DEFAULT_SECS: u32 = 5;
+
+/// Push a [`SetMetricsInterval`] to a node. The value is already persisted by
+/// the caller, so an offline node still picks it up on its next connect — hence
+/// a successful result either way, with a note when delivery was deferred.
+async fn push_set_metrics_interval(
+    sessions: &Arc<NodeSessionManager>,
+    node_id: &str,
+    interval_secs: u32,
+) -> OperationResult {
+    use policy_controller_proto::controller::{
+        controller_message::Payload as CtrlPayload, ControllerMessage, SetMetricsInterval,
+    };
+    let sent = sessions
+        .push(
+            node_id,
+            ControllerMessage {
+                payload: Some(CtrlPayload::SetMetricsInterval(SetMetricsInterval {
+                    interval_secs,
+                })),
+            },
+        )
+        .await;
+    if sent {
+        OperationResult::ok()
+    } else {
+        OperationResult {
+            success: true,
+            message: Some("Saved; will apply when the node reconnects".to_string()),
+        }
+    }
+}
+
+/// Push a fire-and-forget [`ClearStats`] request to a node.
+///
+/// Stats live only in the engine's BPF maps — never the controller store — so
+/// unlike config changes this bypasses the pending-generation/confirm machinery
+/// (mirroring `refresh_node_metrics`). We deliver the message and report only
+/// whether the node was connected; the operator observes the result by
+/// re-querying stats.
+async fn push_clear_stats(
+    sessions: &Arc<NodeSessionManager>,
+    node_id: &str,
+    req: policy_controller_proto::controller::ClearStats,
+) -> Result<OperationResult> {
+    use policy_controller_proto::controller::{
+        controller_message::Payload as CtrlPayload, ControllerMessage,
+    };
+    let sent = sessions
+        .push(
+            node_id,
+            ControllerMessage {
+                payload: Some(CtrlPayload::ClearStats(req)),
+            },
+        )
+        .await;
+    if sent {
+        Ok(OperationResult::ok())
+    } else {
+        Ok(OperationResult::err(format!(
+            "Node '{}' is not currently connected",
+            node_id
+        )))
+    }
+}
+
 /// Gate → push → await agent confirm → commit to store.
 /// Returns Ok(()) only when the agent applied AND the controller committed.
 async fn drive_pending(
@@ -2032,6 +2281,7 @@ mod tests {
                 dmi_product_name: None,
                 tenant_id: "default".to_string(),
                 stop_behavior: None,
+                metrics_interval_secs: None,
                 capabilities: "{}".to_string(),
             })
             .await;
@@ -2168,6 +2418,232 @@ mod tests {
         let res3 = schema.execute(r#"{ rules(nodeId: "n1") { id } }"#).await;
         let data3 = res3.data.into_json().unwrap();
         assert!(data3["rules"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_clear_interface_stats_offline_node_reports_disconnected() {
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let res = h
+            .schema
+            .execute(
+                r#"mutation { clearInterfaceStats(nodeId: "n1", interfaceName: "eth0") { success message } }"#,
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let data = res.data.into_json().unwrap();
+        assert_eq!(data["clearInterfaceStats"]["success"], false);
+        assert!(data["clearInterfaceStats"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not currently connected"));
+    }
+
+    #[tokio::test]
+    async fn test_clear_interface_stats_pushes_clear_stats_message() {
+        use policy_controller_proto::controller::{
+            clear_stats::Scope, controller_message::Payload as P,
+        };
+        use tokio::sync::mpsc;
+
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let (tx, mut rx) = mpsc::channel(4);
+        h.sessions
+            .register("n1".to_string(), "default".to_string(), tx);
+
+        let res = h
+            .schema
+            .execute(
+                r#"mutation { clearInterfaceStats(nodeId: "n1", interfaceName: "eth0", direction: "ingress") { success } }"#,
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert!(
+            res.data.into_json().unwrap()["clearInterfaceStats"]["success"]
+                .as_bool()
+                .unwrap()
+        );
+
+        let msg = rx.recv().await.expect("a message").expect("ok message");
+        match msg.payload {
+            Some(P::ClearStats(c)) => {
+                assert_eq!(c.scope, Scope::Interface as i32);
+                assert_eq!(c.interface_name, "eth0");
+                assert_eq!(c.direction, "ingress");
+            }
+            other => panic!("expected ClearStats, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clear_all_interface_stats_pushes_all_interfaces_scope() {
+        use policy_controller_proto::controller::{
+            clear_stats::Scope, controller_message::Payload as P,
+        };
+        use tokio::sync::mpsc;
+
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let (tx, mut rx) = mpsc::channel(4);
+        h.sessions
+            .register("n1".to_string(), "default".to_string(), tx);
+
+        let res = h
+            .schema
+            .execute(r#"mutation { clearAllInterfaceStats(nodeId: "n1") { success } }"#)
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+
+        let msg = rx.recv().await.expect("a message").expect("ok message");
+        match msg.payload {
+            Some(P::ClearStats(c)) => assert_eq!(c.scope, Scope::AllInterfaces as i32),
+            other => panic!("expected ClearStats, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clear_rule_stats_pushes_rule_scope() {
+        use policy_controller_proto::controller::{
+            clear_stats::Scope, controller_message::Payload as P,
+        };
+        use tokio::sync::mpsc;
+
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let (tx, mut rx) = mpsc::channel(4);
+        h.sessions
+            .register("n1".to_string(), "default".to_string(), tx);
+
+        let res = h
+            .schema
+            .execute(r#"mutation { clearRuleStats(nodeId: "n1", ruleId: "42") { success } }"#)
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+
+        let msg = rx.recv().await.expect("a message").expect("ok message");
+        match msg.payload {
+            Some(P::ClearStats(c)) => {
+                assert_eq!(c.scope, Scope::Rule as i32);
+                assert_eq!(c.rule_id, "42");
+            }
+            other => panic!("expected ClearStats, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_node_metrics_interval_persists_and_pushes() {
+        use policy_controller_proto::controller::controller_message::Payload as P;
+        use tokio::sync::mpsc;
+
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let (tx, mut rx) = mpsc::channel(4);
+        h.sessions
+            .register("n1".to_string(), "default".to_string(), tx);
+
+        let res = h
+            .schema
+            .execute(
+                r#"mutation { setNodeMetricsInterval(nodeId: "n1", seconds: 10) { success } }"#,
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert!(
+            res.data.into_json().unwrap()["setNodeMetricsInterval"]["success"]
+                .as_bool()
+                .unwrap()
+        );
+
+        // Persisted to the store…
+        let node = h.store.get_node("n1").await.unwrap().unwrap();
+        assert_eq!(node.metrics_interval_secs, Some(10));
+
+        // …and pushed live to the connected agent.
+        let msg = rx.recv().await.expect("a message").expect("ok message");
+        match msg.payload {
+            Some(P::SetMetricsInterval(s)) => assert_eq!(s.interval_secs, 10),
+            other => panic!("expected SetMetricsInterval, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_node_metrics_interval_clear_pushes_default() {
+        use policy_controller_proto::controller::controller_message::Payload as P;
+        use tokio::sync::mpsc;
+
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        h.store
+            .update_node_metrics_interval("n1", Some(10))
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        h.sessions
+            .register("n1".to_string(), "default".to_string(), tx);
+
+        let res = h
+            .schema
+            .execute(
+                r#"mutation { setNodeMetricsInterval(nodeId: "n1", seconds: null) { success } }"#,
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+
+        // Override cleared in the store…
+        let node = h.store.get_node("n1").await.unwrap().unwrap();
+        assert_eq!(node.metrics_interval_secs, None);
+
+        // …and the agent is told to revert to the default cadence.
+        let msg = rx.recv().await.expect("a message").expect("ok message");
+        match msg.payload {
+            Some(P::SetMetricsInterval(s)) => {
+                assert_eq!(s.interval_secs, METRICS_INTERVAL_DEFAULT_SECS)
+            }
+            other => panic!("expected SetMetricsInterval, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_node_metrics_interval_rejects_out_of_range() {
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let res = h
+            .schema
+            .execute(r#"mutation { setNodeMetricsInterval(nodeId: "n1", seconds: 0) { success message } }"#)
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let data = res.data.into_json().unwrap();
+        assert_eq!(data["setNodeMetricsInterval"]["success"], false);
+        // Out-of-range must not have been persisted.
+        let node = h.store.get_node("n1").await.unwrap().unwrap();
+        assert_eq!(node.metrics_interval_secs, None);
+    }
+
+    #[tokio::test]
+    async fn test_clear_all_stats_pushes_all_scope() {
+        use policy_controller_proto::controller::{
+            clear_stats::Scope, controller_message::Payload as P,
+        };
+        use tokio::sync::mpsc;
+
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let (tx, mut rx) = mpsc::channel(4);
+        h.sessions
+            .register("n1".to_string(), "default".to_string(), tx);
+
+        let res = h
+            .schema
+            .execute(r#"mutation { clearAllStats(nodeId: "n1") { success } }"#)
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+
+        let msg = rx.recv().await.expect("a message").expect("ok message");
+        match msg.payload {
+            Some(P::ClearStats(c)) => assert_eq!(c.scope, Scope::All as i32),
+            other => panic!("expected ClearStats, got {other:?}"),
+        }
     }
 
     #[tokio::test]

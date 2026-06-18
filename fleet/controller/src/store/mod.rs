@@ -94,6 +94,9 @@ pub struct NodeRecord {
     /// Operator-configured stop behavior for this node ("clear-state" or "preserve-state").
     /// None means the controller has not set a preference (node uses its local default).
     pub stop_behavior: Option<String>,
+    /// Operator-configured metrics scrape/forward interval in seconds.
+    /// None means the controller has not set a preference (agent uses its local default).
+    pub metrics_interval_secs: Option<u32>,
     /// JSON-encoded `Capabilities` from the most recent AgentHello. `"{}"`
     /// until the agent reconnects after step-6 was deployed (pre-step-6
     /// rows surface the same default).
@@ -375,6 +378,10 @@ pub trait ControllerStore: Send + Sync {
 
     /// Set the desired stop behavior for a node ("clear-state" or "preserve-state").
     async fn update_node_stop_behavior(&self, id: &str, behavior: Option<&str>) -> Result<()>;
+
+    /// Set the desired metrics scrape/forward interval (seconds) for a node.
+    /// `None` clears the override so the agent falls back to its local default.
+    async fn update_node_metrics_interval(&self, id: &str, secs: Option<u32>) -> Result<()>;
 
     // ── Cert revocation ──
     async fn revoke_cert(&self, serial: &[u8]) -> Result<()>;

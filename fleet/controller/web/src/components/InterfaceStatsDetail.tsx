@@ -1,8 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
 
-import { useQuery, gql } from '@apollo/client'
+import { useState } from 'react'
+import { useQuery, useMutation, gql } from '@apollo/client'
 import { fmtBytes, fmtCount } from './types.ts'
+
+const CLEAR_INTERFACE_STATS = gql`
+  mutation ClearInterfaceStats($nodeId: ID!, $interfaceName: String!) {
+    clearInterfaceStats(nodeId: $nodeId, interfaceName: $interfaceName) {
+      success
+      message
+    }
+  }
+`
 
 const GET_INTERFACE_STATS = gql`
   query NodeInterfaceStatsDetail($nodeId: ID!, $interfaceName: String!, $direction: String!) {
@@ -92,11 +102,11 @@ function DirectionPanel({
   const isIngress = direction === 'ingress'
   const { data: statsData, loading: statsLoading } = useQuery<{ nodeInterfaceStats: FullStats | null }>(
     GET_INTERFACE_STATS,
-    { variables: { nodeId, interfaceName, direction }, pollInterval: 30_000 },
+    { variables: { nodeId, interfaceName, direction }, pollInterval: 5_000 },
   )
   const { data: etData } = useQuery<{ nodeEthertypeStats: EthertypeStat[] }>(
     GET_ETHERTYPE_STATS,
-    { variables: { nodeId, interfaceName, direction }, pollInterval: 30_000 },
+    { variables: { nodeId, interfaceName, direction }, pollInterval: 5_000 },
   )
 
   const s = statsData?.nodeInterfaceStats
@@ -108,7 +118,7 @@ function DirectionPanel({
     <div className="bg-gray-800 rounded-lg border border-gray-700 p-3">
       <div className={`text-xs font-semibold uppercase mb-3 ${dirColor}`}>
         {isIngress ? 'Ingress' : 'Egress'}
-        <span className="ml-2 text-gray-600 font-normal normal-case">30s refresh</span>
+        <span className="ml-2 text-gray-600 font-normal normal-case">5s refresh</span>
       </div>
 
       {statsLoading && !s ? (
@@ -205,13 +215,44 @@ interface Props {
 }
 
 export default function InterfaceStatsDetail({ nodeId, interfaceName, onClose }: Props) {
+  // Stats are scraped from the node's engine, so cleared counters appear on the
+  // next metrics refresh rather than instantly. We refetch the stats queries to
+  // pick up the update as soon as the agent's next scrape lands.
+  const [clearInterfaceStats, { loading: clearing }] = useMutation(CLEAR_INTERFACE_STATS, {
+    refetchQueries: ['NodeInterfaceStatsDetail', 'NodeEthertypeStats', 'NodeInterfaceStats'],
+  })
+  const [feedback, setFeedback] = useState<string | null>(null)
+
+  const handleClear = async () => {
+    if (!window.confirm(`Clear all statistics for ${interfaceName} (both directions)?`)) return
+    try {
+      const res = await clearInterfaceStats({ variables: { nodeId, interfaceName } })
+      const r = res.data?.clearInterfaceStats
+      // Success is assumed silently; only surface failures.
+      setFeedback(r?.success ? null : (r?.message ?? 'Failed to clear stats'))
+    } catch (e) {
+      setFeedback(e instanceof Error ? e.message : 'Failed to clear stats')
+    }
+  }
+
   return (
     <div className="mt-3 bg-gray-900 border border-gray-700 rounded-lg">
       <div className="flex items-center justify-between px-4 py-2 border-b border-gray-700">
         <h3 className="text-sm font-semibold text-gray-200">
           Stats: <span className="font-mono text-gray-100">{interfaceName}</span>
         </h3>
-        <button onClick={onClose} className="text-gray-500 hover:text-gray-300 text-sm">&times;</button>
+        <div className="flex items-center gap-3">
+          {feedback && <span className="text-xs text-gray-400">{feedback}</span>}
+          <button
+            onClick={handleClear}
+            disabled={clearing}
+            className="text-xs px-2 py-0.5 rounded bg-gray-700 text-gray-300 hover:bg-red-700 hover:text-white disabled:opacity-50"
+            title="Clear all statistics (global + ethertype) for this interface, both directions"
+          >
+            {clearing ? 'Clearing…' : 'Clear stats'}
+          </button>
+          <button onClick={onClose} className="text-gray-500 hover:text-gray-300 text-sm">&times;</button>
+        </div>
       </div>
       <div className="p-3 grid grid-cols-2 gap-3">
         <DirectionPanel nodeId={nodeId} interfaceName={interfaceName} direction="ingress" />

@@ -142,6 +142,7 @@ mod tests {
                 dmi_sys_vendor: None,
                 dmi_product_name: None,
                 stop_behavior: None,
+                metrics_interval_secs: None,
                 capabilities: "{}".to_string(),
             })
             .await

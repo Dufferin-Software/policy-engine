@@ -127,7 +127,7 @@ impl ControllerStore for SqliteControllerStore {
         let row = sqlx::query(
             "SELECT id, label, public_key_der, dmi_uuid, status, cert_serial, cert_expiry, \
              last_seen, enrolled_at, decommissioned_at, enrollment_id, tpm_backed, \
-             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at \
+             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at, metrics_interval_secs \
              FROM nodes WHERE id = ?",
         )
         .bind(id)
@@ -142,7 +142,7 @@ impl ControllerStore for SqliteControllerStore {
         let row = sqlx::query(
             "SELECT id, label, public_key_der, dmi_uuid, status, cert_serial, cert_expiry, \
              last_seen, enrolled_at, decommissioned_at, enrollment_id, tpm_backed, \
-             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at \
+             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at, metrics_interval_secs \
              FROM nodes WHERE enrollment_id = ?",
         )
         .bind(enrollment_id)
@@ -160,7 +160,7 @@ impl ControllerStore for SqliteControllerStore {
     ) -> Result<Vec<NodeRecord>> {
         const COLS: &str = "id, label, public_key_der, dmi_uuid, status, cert_serial, cert_expiry, \
              last_seen, enrolled_at, decommissioned_at, enrollment_id, tpm_backed, \
-             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at";
+             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at, metrics_interval_secs";
         let mut sql = format!("SELECT {COLS} FROM nodes");
         let mut clauses: Vec<&'static str> = Vec::new();
         if status.is_some() {
@@ -249,6 +249,16 @@ impl ControllerStore for SqliteControllerStore {
             .execute(&self.pool)
             .await
             .context("Failed to update node stop_behavior")?;
+        Ok(())
+    }
+
+    async fn update_node_metrics_interval(&self, id: &str, secs: Option<u32>) -> Result<()> {
+        sqlx::query("UPDATE nodes SET metrics_interval_secs = ? WHERE id = ?")
+            .bind(secs.map(|s| s as i64))
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update node metrics_interval_secs")?;
         Ok(())
     }
 
@@ -1166,6 +1176,10 @@ fn row_to_node(row: sqlx::sqlite::SqliteRow) -> Result<NodeRecord> {
             .try_get("tenant_id")
             .unwrap_or_else(|_| "default".to_string()),
         stop_behavior: row.try_get("stop_behavior").unwrap_or(None),
+        metrics_interval_secs: row
+            .try_get::<Option<i64>, _>("metrics_interval_secs")
+            .unwrap_or(None)
+            .map(|v| v as u32),
         capabilities: row
             .try_get("capabilities")
             .unwrap_or_else(|_| "{}".to_string()),
@@ -1234,4 +1248,71 @@ fn row_to_node_interface(row: sqlx::sqlite::SqliteRow) -> Result<NodeInterface> 
         ingress_default_action: row.try_get("ingress_default_action").unwrap_or(None),
         egress_default_action: row.try_get("egress_default_action").unwrap_or(None),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    async fn temp_store() -> (SqliteControllerStore, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SqliteControllerStore::new(&dir.path().join("controller.db"))
+            .await
+            .unwrap();
+        (store, dir)
+    }
+
+    fn sample_node(id: &str) -> NodeRecord {
+        NodeRecord {
+            id: id.to_string(),
+            label: None,
+            public_key_der: vec![1, 2, 3],
+            dmi_uuid: None,
+            status: NodeStatus::Active,
+            cert_serial: None,
+            cert_expiry: None,
+            last_seen: None,
+            enrolled_at: Some(Utc::now()),
+            decommissioned_at: None,
+            last_renewed_at: None,
+            enrollment_id: Some(format!("e-{id}")),
+            tpm_backed: false,
+            agent_version: None,
+            hostname: None,
+            os_pretty_name: None,
+            kernel_version: None,
+            dmi_sys_vendor: None,
+            dmi_product_name: None,
+            tenant_id: "default".to_string(),
+            stop_behavior: None,
+            metrics_interval_secs: None,
+            capabilities: "{}".to_string(),
+        }
+    }
+
+    // Regression: the node SELECT column lists must include the operator-config
+    // columns row_to_node reads, or get_node/list_nodes silently return None for
+    // them (try_get(...).unwrap_or(None)) even after a successful UPDATE.
+    #[tokio::test]
+    async fn metrics_interval_round_trips_through_sqlite() {
+        let (store, _dir) = temp_store().await;
+        store.upsert_node(&sample_node("n1")).await.unwrap();
+
+        store.update_node_metrics_interval("n1", Some(15)).await.unwrap();
+        assert_eq!(
+            store.get_node("n1").await.unwrap().unwrap().metrics_interval_secs,
+            Some(15)
+        );
+        // …and via the list path (different SELECT).
+        let listed = store.list_nodes(Some("default"), None).await.unwrap();
+        assert_eq!(listed[0].metrics_interval_secs, Some(15));
+
+        // Clearing the override reads back as None.
+        store.update_node_metrics_interval("n1", None).await.unwrap();
+        assert_eq!(
+            store.get_node("n1").await.unwrap().unwrap().metrics_interval_secs,
+            None
+        );
+    }
 }

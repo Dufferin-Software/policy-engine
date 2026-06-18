@@ -50,6 +50,10 @@ type AlertRuleOutput {
 type ApiTokenOutput {
 	id: ID!
 	name: String!
+	"""
+	"static" or "session". UI uses this to filter session noise.
+	"""
+	kind: String!
 	createdAt: DateTime!
 	createdBy: String
 	expiresAt: DateTime
@@ -107,6 +111,10 @@ type ControlledNodeOutput {
 	Operator-configured stop behavior: "clear-state" or "preserve-state". None = controller default.
 	"""
 	stopBehavior: String
+	"""
+	Operator-configured metrics scrape/forward interval in seconds. None = agent default.
+	"""
+	metricsIntervalSecs: Int
 	"""
 	JSON-encoded `Capabilities` from the most recent AgentHello. Raw
 	string (not a typed sub-object) so adding fields in the proto
@@ -326,6 +334,18 @@ type IssuedEnrollmentToken {
 	usesRemaining: Int!
 }
 
+"""
+The authenticated caller's view of themselves. `operator` is None for
+static (non-session) tokens.
+"""
+type MeOutput {
+	tokenId: ID!
+	tenantId: ID!
+	operator: OperatorOutput
+	permissions: [String!]!
+	scopes: [TokenScopeOutput!]!
+}
+
 type MutationRoot {
 	"""
 	Approve a pending enrollment. Optionally sets a human-readable label.
@@ -366,6 +386,16 @@ type MutationRoot {
 	Pass null to clear the override and use the node's local default.
 	"""
 	setNodeStopBehavior(nodeId: ID!, behavior: String): OperationResult!
+	"""
+	Set how often the node's agent scrapes the local engine and forwards
+	metrics to the controller, in seconds. Pass null to clear the override so
+	the agent reverts to its local default.
+	
+	The value is persisted on the node and re-sent to the agent on every
+	(re)connect, so it survives agent restarts. If the node is offline the
+	value is still saved and applied when it next connects.
+	"""
+	setNodeMetricsInterval(nodeId: ID!, seconds: Int): OperationResult!
 	"""
 	Create the same rule on multiple nodes at once. Each node gets its own
 	unique rule ID. Returns the list of all created rules.
@@ -428,6 +458,36 @@ type MutationRoot {
 	the node is not currently connected.
 	"""
 	refreshNodeMetrics(nodeId: ID!): OperationResult!
+	"""
+	Clear all statistics (global + ethertype) for a single interface on a node.
+	
+	`direction` is "ingress"/"egress"; pass null to clear both. Fire-and-forget:
+	stats live only in the engine's BPF maps, so nothing is committed to the
+	controller store. Returns ok once the request is delivered to a connected
+	agent — the UI re-queries stats to confirm they are zeroed.
+	"""
+	clearInterfaceStats(nodeId: ID!, interfaceName: String!, direction: String): OperationResult!
+	"""
+	Clear interface statistics for every attached interface on a node.
+	"""
+	clearAllInterfaceStats(nodeId: ID!): OperationResult!
+	"""
+	Clear statistics for a single policy rule on a node.
+	
+	`ruleId` is the controller-assigned rule ID (which the engine also uses
+	as its per-rule stats key). `direction` is "ingress"/"egress"; pass null
+	to clear both. Fire-and-forget, same as the interface clears.
+	"""
+	clearRuleStats(nodeId: ID!, ruleId: ID!, direction: String): OperationResult!
+	"""
+	Clear statistics for every policy rule on a node (both directions).
+	"""
+	clearAllPolicyStats(nodeId: ID!): OperationResult!
+	"""
+	Clear ALL statistics on a node — every interface counter and every rule
+	counter, in one shot.
+	"""
+	clearAllStats(nodeId: ID!): OperationResult!
 	createAlertRule(input: CreateAlertRuleInput!): AlertRuleOutput!
 	updateAlertRule(id: ID!, input: CreateAlertRuleInput!): AlertRuleOutput!
 	deleteAlertRule(id: ID!): Boolean!
@@ -442,12 +502,20 @@ type MutationRoot {
 	be retrieved afterwards. Only the operator-facing label, expiry, and
 	usage metadata are queryable from then on.
 	"""
-	createApiToken(name: String!, expiresAt: DateTime): ApiTokenWithSecret!
+	createApiToken(name: String!, expiresAt: DateTime, roleIds: [ID!]! = []): ApiTokenWithSecret!
 	"""
 	Revoke an existing API bearer token. Subsequent authentication
 	attempts with the corresponding plaintext are rejected.
 	"""
 	revokeApiToken(id: ID!): ApiTokenOutput!
+	createOperator(username: String!, password: String!, roleIds: [ID!]! = []): OperatorOutput!
+	disableOperator(id: ID!): OperatorOutput!
+	enableOperator(id: ID!): OperatorOutput!
+	setOperatorPassword(id: ID!, newPassword: String!): Boolean!
+	grantRole(operatorId: ID!, roleId: ID!): OperatorOutput!
+	revokeRole(operatorId: ID!, roleId: ID!): OperatorOutput!
+	setTokenRoles(tokenId: ID!, roleIds: [ID!]!): ApiTokenOutput!
+	setTokenScopes(tokenId: ID!, scopes: [TokenScopeInput!]!): ApiTokenOutput!
 }
 
 """
@@ -539,6 +607,15 @@ type OperationResult {
 	message: String
 }
 
+type OperatorOutput {
+	id: ID!
+	username: String!
+	createdAt: DateTime!
+	lastLoginAt: DateTime
+	disabledAt: DateTime
+	roles: [RoleSummary!]!
+}
+
 """
 In-flight config mutation awaiting agent confirmation.
 """
@@ -626,7 +703,7 @@ type QueryRoot {
 	"""
 	caCertPem: String!
 	"""
-	IDs of currently connected agent nodes.
+	IDs of currently connected agent nodes (scoped to the caller's tenant).
 	"""
 	onlineNodes: [String!]!
 	"""
@@ -638,7 +715,7 @@ type QueryRoot {
 	"""
 	pendingGeneration(nodeId: ID!): PendingGenerationOutput
 	"""
-	All currently in-flight config generations (across all nodes).
+	In-flight config generations across nodes in the caller's tenant.
 	"""
 	pendingGenerations: [PendingGenerationOutput!]!
 	"""
@@ -659,6 +736,20 @@ type QueryRoot {
 	Returns an empty list when no metrics have been received for the node yet.
 	"""
 	nodeEthertypeStats(nodeId: ID!, interfaceName: String!, direction: String!): [NodeEthertypeStatOutput!]!
+	"""
+	The authenticated caller's identity, permissions, and scope set.
+	Unguarded by design — every authenticated principal can see itself.
+	"""
+	me: MeOutput!
+	"""
+	All operators in the deployment.
+	"""
+	operators: [OperatorOutput!]!
+	operator(id: ID!): OperatorOutput
+	"""
+	Roles available in the caller's tenant, with their permission sets.
+	"""
+	roles: [RoleOutput!]!
 }
 
 type ReceiverOutput {
@@ -666,6 +757,24 @@ type ReceiverOutput {
 	name: String!
 	kind: String!
 	configJson: String!
+}
+
+type RoleOutput {
+	id: ID!
+	name: String!
+	description: String
+	builtIn: Boolean!
+	permissions: [String!]!
+}
+
+"""
+Lightweight role view used inside operator/token listings, without the
+full permission set — saves a query per row.
+"""
+type RoleSummary {
+	id: ID!
+	name: String!
+	builtIn: Boolean!
 }
 
 type RuleOutput {
@@ -708,6 +817,19 @@ type SilenceOutput {
 	endsAt: DateTime!
 	createdBy: String
 	comment: String
+}
+
+input TokenScopeInput {
+	scopeType: String!
+	scopeValue: String!
+}
+
+type TokenScopeOutput {
+	"""
+	`"node_id"` or `"node_label"`.
+	"""
+	scopeType: String!
+	scopeValue: String!
 }
 
 """

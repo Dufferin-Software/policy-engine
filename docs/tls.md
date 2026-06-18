@@ -1,10 +1,10 @@
 # TLS / HTTPS
 
 Policy-engine has native TLS support using [rustls](https://github.com/rustls/rustls)
-(no OpenSSL dependency).  When TLS is enabled the daemon serves HTTPS on the
-configured port; the WebSocket event stream (`/ws/events`) and all other
-endpoints are served over the same TLS connection — no separate port or proxy
-is needed.
+with the `ring` crypto provider (no OpenSSL dependency).  When TLS is enabled the
+daemon serves HTTPS on the configured port; the WebSocket event stream
+(`/ws/events`) and all other endpoints are served over the same TLS connection —
+no separate port or proxy is needed.
 
 TLS is **opt-in**.  If neither `tls_cert` nor `tls_key` is configured the
 daemon falls back to plain HTTP, preserving backward compatibility.
@@ -41,7 +41,7 @@ policy-engine \
 | Flag | Description |
 |---|---|
 | `--tls-cert <path>` | PEM certificate file (may include full chain) |
-| `--tls-key <path>` | PEM private key (RSA, EC, or PKCS8) |
+| `--tls-key <path>` | PEM private key (RSA ≥2048, ECDSA P-256/P-384, or Ed25519; PKCS8 or PKCS1) |
 | `--port <n>` | Override the listen port from config file |
 | `--host <addr>` | Override the bind address from config file |
 
@@ -172,6 +172,9 @@ clients from reaching the API even if they trust the server's certificate.
   required, though using one (nginx, Caddy) is still valid and supported.
 - The daemon requires TLS 1.2 or 1.3; older protocol versions are not
   negotiated.
+- The `ring` crypto provider accepts RSA (≥2048-bit), ECDSA P-256/P-384, and
+  Ed25519 server keys.  Other curves (e.g. P-521) are not supported — generate
+  certificates with one of the algorithms above.
 - Certificate files are read at startup.  To rotate certificates, update the
   files and restart the service (`systemctl restart policy-engine`).
 - Private key files should be owned by the `policy-engine` service user and
