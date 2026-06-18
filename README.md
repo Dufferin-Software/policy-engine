@@ -12,10 +12,9 @@ A high-performance XDP/TC packet policy engine for Linux. Rules are expressed as
 | [docs/tls.md](docs/tls.md) | TLS/HTTPS configuration |
 | [docs/authentication.md](docs/authentication.md) | Bearer token authentication |
 | [docs/prometheus-metrics.md](docs/prometheus-metrics.md) | Prometheus metrics reference |
-| [docs/timed-rules.md](docs/timed-rules.md) | TTL and scheduled rules |
+| [docs/rule-matching.md](docs/rule-matching.md) | Rule matching reference (LPM, MAC, SNI/QUIC, timed rules) down to the BPF level |
 | [docs/xdp-forward-mode.md](docs/xdp-forward-mode.md) | XDP FIB forwarding |
 | [docs/ipfix-flow-export.md](docs/ipfix-flow-export.md) | IPFIX flow export |
-| [docs/mac-matching.md](docs/mac-matching.md) | Layer 2 MAC address matching |
 | [docs/cpu-affinity.md](docs/cpu-affinity.md) | CPU affinity configuration |
 | [docs/containers.md](docs/containers.md) | Container deployment guide |
 
@@ -288,7 +287,7 @@ policy-client rule managed-rules --direction ingress
 Every state change (activated, deactivated, expired, deleted) is broadcast as
 a JSON event over the WebSocket endpoint `GET /ws/rule-events`.
 
-See [docs/timed-rules.md](docs/timed-rules.md) for the full reference.
+See [docs/rule-matching.md § Timed rules](docs/rule-matching.md#timed-rules) for the full reference.
 
 ## XDP Forward Mode
 
@@ -333,7 +332,7 @@ policy-client rule add --direction ingress \
     --dst-mac 11:22:33:44:55:66
 ```
 
-See [docs/mac-matching.md](docs/mac-matching.md) for the full reference.
+See [docs/rule-matching.md § MAC matching](docs/rule-matching.md#mac-matching) for the full reference.
 
 ## CPU affinity
 

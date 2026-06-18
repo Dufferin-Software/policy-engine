@@ -122,104 +122,15 @@ Side packages (combine with any server package):
 
 ## BPF Data Plane
 
-### Program Architecture
-
 Two programs run in the kernel fast path:
 
 **XDP (ingress):** `xdp_policy_main` — attached to the network interface receive path via XDP hook. Processes packets before the kernel networking stack. Returns `XDP_PASS`, `XDP_DROP`, or `XDP_REDIRECT`.
 
 **TC egress:** `tc_policy_main` — attached to the TC (Traffic Control) subsystem on the transmit side. Returns `TC_ACT_OK` (pass) or `TC_ACT_SHOT` (drop).
 
-Both programs use a **tail call dispatcher** to offload optional processing to separate programs, staying within the BPF verifier's 1M processed-instruction limit.
+Both programs use a **tail call dispatcher** to offload optional processing (SNI inspection, QUIC mirroring, FIB forwarding) to separate programs, staying within the BPF verifier's 1M processed-instruction limit.
 
-### Tail Call Slots
-
-| Direction | Slot | Program | Purpose |
-|-----------|------|---------|---------|
-| XDP | 0 | `xdp_sni_inspect` | TLS SNI matching |
-| XDP | 1 | `xdp_fib_dispatch` | Line-rate FIB forwarding |
-| TC | 0 | `tc_sni_inspect` | TLS SNI matching (egress) |
-
-### Packet Processing Pipeline
-
-```
-Packet arrives
-    │
-    ▼
-Parse L2 (Ethernet, VLAN)
-    │
-    ▼
-Parse L3 (IPv4 / IPv6) → update per-L3 stats
-    │
-    ▼
-Parse L4 (TCP / UDP / ICMP / QUIC detection)
-    │
-    ▼
-Check flow_verdict_cache (Suricata IPS/IDS)
-    │ Cache hit → apply cached verdict (PASS or DROP)
-    │ Cache miss ↓
-    ▼
-Two-level LPM lookup:
-    Level 1: src_lpm_v4/v6  → src_group_id
-    Level 2: src_groups_v4/v6[group_id] → dst LPM → L4 rules
-    (Ancestor walk: up to 8 levels per trie for prefix fallback)
-    │
-    ▼
-For each matching L4 rule (priority order):
-    ├── PASS  → update stats, continue to next rule
-    ├── DROP  → update stats, stop, return XDP_DROP
-    ├── LOG   → update stats, rate-limit check, emit ring buffer event
-    └── INSPECT → write to flows_to_inspect, seed PASS in verdict cache
-    │
-    ▼
-SNI matching (tail call if rule has SNI pattern)
-    │
-    ▼
-Default action (per-interface, configured)
-    │
-    ▼
-FIB forwarding (tail call if enabled)
-    │
-    ▼
-Return XDP_PASS / XDP_DROP / XDP_REDIRECT
-```
-
-### Two-Level LPM Architecture
-
-IP matching uses a two-level Longest Prefix Match trie to support independent source and destination prefixes without the exponential blowup of a combined trie.
-
-```
-src_lpm_v4  (LPM_TRIE)
-  key: src_ip / prefixlen
-  value: { src_prefixlen, src_group_id }
-      │
-      └─→ src_groups_v4 (HASH_OF_MAPS)
-            key: src_group_id
-            value: inner map (dst_lpm_v4_inner, LPM_TRIE)
-                      key: dst_ip / prefixlen
-                      value: { dst_prefixlen, count, rules[MAX_L4_RULES] }
-                                              │
-                                              └─→ l4_rule[] {
-                                                    sport, dport, protocol
-                                                    sni_match_type, rule_id
-                                                    priority, actions[]
-                                                  }
-```
-
-Both levels use ancestor walking (up to `MAX_LPM_ANCESTORS=8`), so a packet from `10.1.2.3` will match rules for `10.1.2.0/24`, `10.1.0.0/16`, `10.0.0.0/8`, and `0.0.0.0/0` in order of specificity.
-
-### BPF Map Constants
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `MAX_SRC_GROUPS` | 4096 | Level-1 source prefix groups |
-| `MAX_DST_ENTRIES_PER_GROUP` | 512 | Destination prefixes per source group |
-| `MAX_L4_RULES` | 8 | L4 rules per destination prefix |
-| `MAX_LPM_ANCESTORS` | 8 | Ancestor walk depth |
-| `MAX_ACTIONS_PER_RULE` | 4 | Actions per rule |
-| `MAX_FLOW_VERDICTS` | 65536 | Suricata verdict cache entries |
-| `MAX_FLOWS_TO_INSPECT` | 65536 | Flows queued for Suricata |
-| `MAX_SNI_LEN` | 128 | TLS SNI pattern bytes |
+How packets are matched against rules — the processing pipeline, the two-level LPM trie, tail-call slots, action loop, BPF map constants, and the MAC/SNI/QUIC matchers — is documented in full in [rule-matching.md](rule-matching.md).
 
 ### BPF Map Lifecycle
 
@@ -235,38 +146,9 @@ The daemon only ever detaches programs from interfaces it owns (tracked via meta
 
 ---
 
-## Action Types
+## Rules, Actions, and Matching
 
-| Action | Value | Description |
-|--------|-------|-------------|
-| `PASS` | 0 | Allow packet, continue processing |
-| `DROP` | 1 | Drop packet silently, stop processing |
-| `LOG` | 2 | Emit ring buffer event, allow packet. Optional `param`: rate-limit interval in milliseconds (0 = unlimited) |
-| `INSPECT` | 3 | Mirror packet to Suricata for deep inspection. Requires IPS package. |
-
-Rules may have up to 4 actions in priority order. DROP is terminal — no further actions are evaluated after a DROP.
-
----
-
-## Rule Matching Dimensions
-
-Each rule matches on any combination of:
-
-| Field | Description |
-|-------|-------------|
-| `src` | Source IPv4/IPv6 CIDR prefix (LPM) |
-| `dst` | Destination IPv4/IPv6 CIDR prefix (LPM) |
-| `sport` | Source port (0 = wildcard) |
-| `dport` | Destination port (0 = wildcard) |
-| `protocol` | `tcp`, `udp`, `icmp`, `icmpv6`, `any` |
-| `sni` | TLS Server Name Indication (exact or `*.suffix`) |
-| `quic_version` | QUIC version filter (`v1`, `v2`, or specific value) |
-| `src_mac` | Source MAC address (exact) |
-| `dst_mac` | Destination MAC address (exact) |
-
-MAC matching uses a sidecar map (`mac_rules` / `tc_mac_rules`) keyed by rule ID, consulted after the LPM match identifies the rule.
-
-SNI matching tail-calls `xdp_sni_inspect` which parses the TLS ClientHello to extract the SNI extension, then performs exact or suffix comparison.
+Rules match on any combination of source/destination IP prefix (LPM), ports, protocol, TLS SNI, QUIC version, and source/destination MAC, with up to four prioritised actions each (`PASS`, `DROP`, `LOG`, `INSPECT`; DROP is terminal). The full match-dimension reference, action loop semantics, and protocol-specific matchers are in [rule-matching.md](rule-matching.md). Rules may also carry a TTL or weekly schedule (see [rule-matching.md § Timed rules](rule-matching.md#timed-rules)).
 
 ---
 
