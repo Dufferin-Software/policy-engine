@@ -135,6 +135,36 @@ real-time review in the GraphQL Playground or from a monitoring script, but is
 **not a substitute for the on-disk log** — the ring buffer is lost on daemon
 restart.
 
+## Exporting the audit log
+
+The `exportAuditLog` query renders the audit log in a downloadable format over
+an optional time window. Unlike `auditLog`, it reads the **full on-disk NDJSON
+log**, not the in-memory ring, so it is not limited to the last 1000 events.
+
+```graphql
+{
+  exportAuditLog(
+    format: "csv"                       # "csv" or "json"
+    from: "2026-03-01T00:00:00Z"        # optional, inclusive, RFC 3339
+    to:   "2026-03-31T23:59:59Z"        # optional, inclusive, RFC 3339
+  ) {
+    filename       # suggested download name, e.g. audit-export-20260619T120000Z.csv
+    contentType    # MIME type, e.g. text/csv
+    data           # the formatted log (UTF-8 text)
+  }
+}
+```
+
+Either time bound may be omitted to leave that side of the window open; omit
+both to export everything. The **Audit** tab in the web UI wraps this query with
+a format picker and from/to fields and downloads the result.
+
+Formats are pluggable: each is an implementation of the `AuditExporter` trait
+(`src/server/audit_export.rs`), resolved by name in `exporter_for`. Adding a new
+format (e.g. NDJSON, syslog) is a single new `impl` plus a match arm — the query
+and UI are unchanged. The CSV exporter serialises `input_json` into a single
+quoted cell.
+
 ## Persistence
 
 > **Current status**: the audit log file at `/var/log/policy-engine/audit.log`
@@ -393,6 +423,37 @@ The same query is available from the controller CLI:
 ```bash
 policy-controller-client audit list --limit 50 --offset 0
 ```
+
+## Exporting the audit log
+
+The `exportAuditLog` query (also guarded by `audit:read`) renders the log in a
+downloadable format over an optional time window. Results are **tenant-scoped**
+to the caller and capped at 100,000 rows per export.
+
+```graphql
+{
+  exportAuditLog(
+    format: "csv"                       # "csv" or "json"
+    from: "2026-03-01T00:00:00Z"        # optional, inclusive, RFC 3339
+    to:   "2026-03-31T23:59:59Z"        # optional, inclusive, RFC 3339
+  ) {
+    filename       # suggested download name, e.g. audit-export-20260619T120000Z.csv
+    contentType    # MIME type, e.g. text/csv
+    data           # the formatted log (UTF-8 text)
+  }
+}
+```
+
+Either time bound may be omitted to leave that side open; omit both to export
+the whole (tenant-scoped) history up to the cap. The **Audit Log** tab in the
+controller web UI wraps this query with a format picker and from/to fields and
+downloads the result. Exports carry the same columns as `auditLog`
+(`id, ts, operator, action, node_id, detail`); `tenant_id` is never exported,
+since readers are already tenant-scoped.
+
+Formats are pluggable: each is an implementation of the `AuditExporter` trait
+(`fleet/controller/src/audit_export.rs`), resolved by name in `exporter_for`.
+Adding a new format is a single new `impl` plus a match arm.
 
 ## Persistence and retention
 

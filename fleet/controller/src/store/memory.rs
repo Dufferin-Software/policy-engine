@@ -624,6 +624,29 @@ impl ControllerStore for InMemoryControllerStore {
         Ok(entries)
     }
 
+    async fn list_audit_between(
+        &self,
+        tenant_id: Option<&str>,
+        from: Option<i64>,
+        to: Option<i64>,
+        cap: u32,
+    ) -> Result<Vec<AuditEntry>> {
+        let state = self.inner.lock().unwrap();
+        let entries: Vec<AuditEntry> = state
+            .audit_log
+            .iter()
+            .rev()
+            .filter(|e| tenant_id.is_none_or(|t| e.tenant_id == t))
+            .filter(|e| {
+                let ts = e.ts.timestamp();
+                from.is_none_or(|f| ts >= f) && to.is_none_or(|t| ts <= t)
+            })
+            .take(cap as usize)
+            .cloned()
+            .collect();
+        Ok(entries)
+    }
+
     // ── Enrollment tokens ────────────────────────────────────────────────────
 
     async fn insert_enrollment_token(&self, token: &EnrollmentTokenRecord) -> Result<()> {
@@ -930,6 +953,66 @@ mod tests {
         let log = store.list_audit(None, 3, 0).await.unwrap();
         assert_eq!(log.len(), 3);
         assert!(log[0].action.contains("4"));
+    }
+
+    #[tokio::test]
+    async fn test_audit_list_between_filters_and_caps() {
+        let store = InMemoryControllerStore::new();
+        for i in 0..5u32 {
+            store
+                .append_audit(NewAuditEntry {
+                    operator: None,
+                    action: format!("action-{}", i),
+                    node_id: None,
+                    detail: None,
+                    tenant_id: Some("acme".to_string()),
+                })
+                .await
+                .unwrap();
+        }
+        // A row in a different tenant must stay invisible to acme-scoped reads.
+        store
+            .append_audit(NewAuditEntry {
+                operator: None,
+                action: "other".to_string(),
+                node_id: None,
+                detail: None,
+                tenant_id: Some("globex".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let now = Utc::now().timestamp();
+
+        // Wide-open window, tenant-scoped, capped: newest-first, 3 of 5 rows.
+        let capped = store
+            .list_audit_between(Some("acme"), None, None, 3)
+            .await
+            .unwrap();
+        assert_eq!(capped.len(), 3);
+        assert!(capped[0].action.contains("4"));
+
+        // A window straddling "now" returns all acme rows and only acme rows.
+        let in_window = store
+            .list_audit_between(Some("acme"), Some(now - 60), Some(now + 60), 100)
+            .await
+            .unwrap();
+        assert_eq!(in_window.len(), 5);
+        assert!(in_window.iter().all(|e| e.tenant_id == "acme"));
+
+        // A window entirely in the past matches nothing.
+        let empty = store
+            .list_audit_between(Some("acme"), Some(0), Some(now - 3600), 100)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+
+        // Cross-tenant (None) sees every tenant's rows.
+        let all = store
+            .list_audit_between(None, None, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 6);
     }
 
     /// B3 resolution: explicit > derived from node > 'default'. Exercised

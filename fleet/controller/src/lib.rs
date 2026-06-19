@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
 
 pub mod api_tokens;
+pub mod audit_export;
 pub mod auth;
 pub mod config;
 pub mod controller_metrics;

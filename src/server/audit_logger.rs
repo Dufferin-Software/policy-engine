@@ -15,17 +15,19 @@
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use async_graphql::SimpleObject;
+use chrono::{DateTime, Utc};
 use log::warn;
 #[cfg(test)]
 use mockall::automock;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A single audit log entry.
-#[derive(SimpleObject, Clone, Serialize)]
+#[derive(SimpleObject, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub timestamp: String,
     pub operation: String,
@@ -54,6 +56,24 @@ pub trait AuditBackend: Send + Sync {
     /// in-process querying (e.g. a remote database) should return an empty vec.
     fn recent_entries(&self, limit: usize) -> Vec<AuditEntry>;
 
+    /// Return every entry whose `timestamp` falls within the inclusive window
+    /// `[from, to]` (either bound may be `None` to leave that side open).
+    ///
+    /// Used by the audit export. The default implementation filters the
+    /// in-memory ring (via [`recent_entries`](Self::recent_entries)), which is
+    /// capped and lost on restart; backends with durable storage (e.g.
+    /// [`FileAuditLogger`]) should override this to scan their full history.
+    fn entries_between(
+        &self,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> Vec<AuditEntry> {
+        self.recent_entries(1000)
+            .into_iter()
+            .filter(|e| entry_in_window(e, from, to))
+            .collect()
+    }
+
     /// Convenience method: build an [`AuditEntry`] and call [`record`](Self::record).
     fn log_event(
         &self,
@@ -75,6 +95,22 @@ pub trait AuditBackend: Send + Sync {
     }
 }
 
+/// Whether `entry`'s RFC 3339 `timestamp` falls within the inclusive window
+/// `[from, to]`. An entry whose timestamp cannot be parsed is included only
+/// when no bounds are given, so an unparseable row never silently drops from
+/// an unfiltered export.
+fn entry_in_window(
+    entry: &AuditEntry,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+) -> bool {
+    let ts = match DateTime::parse_from_rfc3339(&entry.timestamp) {
+        Ok(t) => t.with_timezone(&Utc),
+        Err(_) => return from.is_none() && to.is_none(),
+    };
+    from.is_none_or(|f| ts >= f) && to.is_none_or(|t| ts <= t)
+}
+
 // ---------------------------------------------------------------------------
 // FileAuditLogger — append-only file + in-memory ring buffer
 // ---------------------------------------------------------------------------
@@ -84,6 +120,7 @@ pub trait AuditBackend: Send + Sync {
 pub struct FileAuditLogger {
     file: Mutex<File>,
     ring: Mutex<VecDeque<AuditEntry>>,
+    path: PathBuf,
 }
 
 impl FileAuditLogger {
@@ -97,6 +134,7 @@ impl FileAuditLogger {
         Ok(Self {
             file: Mutex::new(file),
             ring: Mutex::new(VecDeque::new()),
+            path: PathBuf::from(path),
         })
     }
 }
@@ -129,6 +167,38 @@ impl AuditBackend for FileAuditLogger {
             }
             Err(_) => vec![],
         }
+    }
+
+    /// Scan the full on-disk NDJSON log — the durable source of truth — rather
+    /// than the capped ring buffer. Malformed or unreadable lines are skipped;
+    /// if the file can't be opened at all we fall back to filtering the ring
+    /// (per the crate's never-propagate-errors convention).
+    fn entries_between(
+        &self,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> Vec<AuditEntry> {
+        let file = match File::open(&self.path) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(
+                    "Audit export: cannot read {}: {}; using in-memory buffer instead",
+                    self.path.display(),
+                    e
+                );
+                return self
+                    .recent_entries(1000)
+                    .into_iter()
+                    .filter(|entry| entry_in_window(entry, from, to))
+                    .collect();
+            }
+        };
+        BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter_map(|line| serde_json::from_str::<AuditEntry>(&line).ok())
+            .filter(|entry| entry_in_window(entry, from, to))
+            .collect()
     }
 }
 
@@ -211,6 +281,37 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].operation, "op_2");
         assert_eq!(entries[2].operation, "op_4");
+    }
+
+    #[test]
+    fn file_logger_entries_between_reads_disk_and_filters() {
+        let path = temp_log_path("between");
+        let _ = std::fs::remove_file(&path);
+        let logger = FileAuditLogger::new(&path).unwrap();
+        let mk = |ts: &str, op: &str| AuditEntry {
+            timestamp: ts.to_string(),
+            operation: op.to_string(),
+            input_json: serde_json::Value::Null,
+            result: "ok".to_string(),
+            message: "m".to_string(),
+            source_ip: "::1".to_string(),
+        };
+        logger.record(&mk("2026-03-01T00:00:00Z", "early"));
+        logger.record(&mk("2026-03-15T12:00:00Z", "mid"));
+        logger.record(&mk("2026-04-01T00:00:00Z", "late"));
+
+        let parse = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        let from = parse("2026-03-10T00:00:00Z");
+        let to = parse("2026-03-20T00:00:00Z");
+
+        let got = logger.entries_between(Some(from), Some(to));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].operation, "mid");
+
+        // Open-ended bounds.
+        assert_eq!(logger.entries_between(None, None).len(), 3);
+        assert_eq!(logger.entries_between(Some(from), None).len(), 2); // mid + late
+        assert_eq!(logger.entries_between(None, Some(to)).len(), 2); // early + mid
     }
 
     // --- Trait object usage ---

@@ -807,6 +807,39 @@ impl QueryRoot {
         Ok(state.audit_logger.recent_entries(limit))
     }
 
+    /// Export audit log entries within an optional time window.
+    ///
+    /// `format` selects the output (`"csv"` or `"json"`). `from`/`to` are
+    /// optional inclusive RFC 3339 timestamps; either may be omitted to leave
+    /// that side of the window open. Entries are read from the durable on-disk
+    /// log, not just the in-memory ring.
+    async fn export_audit_log<'ctx>(
+        &self,
+        ctx: &Context<'ctx>,
+        format: String,
+        from: Option<String>,
+        to: Option<String>,
+    ) -> Result<AuditExport> {
+        let state = ctx.data::<Arc<AppState>>()?;
+        let exporter = crate::server::audit_export::exporter_for(&format)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let from = parse_opt_rfc3339(from.as_deref())?;
+        let to = parse_opt_rfc3339(to.as_deref())?;
+        let entries = state.audit_logger.entries_between(from, to);
+        let data = exporter
+            .export(&entries)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(AuditExport {
+            filename: format!(
+                "audit-export-{}.{}",
+                chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+                exporter.extension()
+            ),
+            content_type: exporter.content_type().to_string(),
+            data,
+        })
+    }
+
     /// Get the current stop behavior setting.
     async fn stop_behavior<'ctx>(&self, ctx: &Context<'ctx>) -> Result<StopBehaviorOutput> {
         let state = ctx.data::<Arc<AppState>>()?;
@@ -2394,6 +2427,18 @@ fn get_source_ip(ctx: &Context<'_>) -> String {
     ctx.data::<PeerAddr>()
         .map(|p| p.0.clone())
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Parse an optional RFC 3339 timestamp into UTC, treating `None`/empty as no
+/// bound. Returns a GraphQL error on malformed input.
+fn parse_opt_rfc3339(s: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    match s {
+        None => Ok(None),
+        Some(s) if s.trim().is_empty() => Ok(None),
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|t| Some(t.with_timezone(&chrono::Utc)))
+            .map_err(|e| async_graphql::Error::new(format!("invalid timestamp {s:?}: {e}"))),
+    }
 }
 
 /// Get interface index from name

@@ -11,6 +11,7 @@
 //! - Suricata IPS integration (veth mirroring, EVE consumption, flow verdicts)
 //!   (only available with the `suricata` feature)
 
+pub mod audit_export;
 pub mod audit_logger;
 pub mod auth_middleware;
 mod bpf_manager;

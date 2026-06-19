@@ -1010,6 +1010,46 @@ impl ControllerStore for SqliteControllerStore {
             .collect()
     }
 
+    async fn list_audit_between(
+        &self,
+        tenant_id: Option<&str>,
+        from: Option<i64>,
+        to: Option<i64>,
+        cap: u32,
+    ) -> Result<Vec<AuditEntry>> {
+        // Numbered placeholders so each optional bound becomes a NULL-guarded
+        // clause (`?N IS NULL OR ...`) — one query covers every combination of
+        // tenant/from/to without branching the SQL.
+        let rows = sqlx::query(
+            "SELECT id, ts, operator, action, node_id, detail, tenant_id FROM audit_log \
+             WHERE (?1 IS NULL OR tenant_id = ?1) \
+               AND (?2 IS NULL OR ts >= ?2) \
+               AND (?3 IS NULL OR ts <= ?3) \
+             ORDER BY id DESC LIMIT ?4",
+        )
+        .bind(tenant_id.map(|t| t.to_string()))
+        .bind(from)
+        .bind(to)
+        .bind(cap)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list audit log window")?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(AuditEntry {
+                    id: row.get("id"),
+                    ts: DateTime::from_timestamp(row.get::<i64, _>("ts"), 0).unwrap_or_default(),
+                    operator: row.get("operator"),
+                    action: row.get("action"),
+                    node_id: row.get("node_id"),
+                    detail: row.get("detail"),
+                    tenant_id: row.get("tenant_id"),
+                })
+            })
+            .collect()
+    }
+
     // ── Enrollment tokens ────────────────────────────────────────────────────
 
     async fn insert_enrollment_token(&self, token: &EnrollmentTokenRecord) -> Result<()> {

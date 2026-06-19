@@ -52,6 +52,22 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Upper bound on rows returned by a single audit export, so a wide time
+/// window can't pull an unbounded result set into memory.
+const AUDIT_EXPORT_CAP: u32 = 100_000;
+
+/// Parse an optional RFC 3339 timestamp into unix epoch seconds, treating
+/// `None`/empty as no bound. Returns a GraphQL error on malformed input.
+fn parse_opt_rfc3339_epoch(s: Option<&str>) -> Result<Option<i64>> {
+    match s {
+        None => Ok(None),
+        Some(s) if s.trim().is_empty() => Ok(None),
+        Some(s) => DateTime::parse_from_rfc3339(s)
+            .map(|t| Some(t.timestamp()))
+            .map_err(|e| async_graphql::Error::new(format!("invalid timestamp {s:?}: {e}"))),
+    }
+}
+
 /// Generate a timestamp-based numeric rule ID.
 ///
 /// Uses microseconds since epoch with an atomic counter to guarantee uniqueness
@@ -248,6 +264,17 @@ impl From<AuditEntry> for AuditEntryOutput {
             detail: e.detail,
         }
     }
+}
+
+/// A formatted audit log export, ready for the client to download.
+#[derive(SimpleObject, Clone)]
+pub struct AuditExportOutput {
+    /// Suggested download filename, e.g. `audit-export-20260619T120000Z.csv`.
+    pub filename: String,
+    /// MIME content type for the payload (e.g. `text/csv`).
+    pub content_type: String,
+    /// The formatted audit log as UTF-8 text.
+    pub data: String,
 }
 
 /// In-flight config mutation awaiting agent confirmation.
@@ -643,6 +670,43 @@ impl QueryRoot {
             .list_audit(Some(&principal.tenant_slug), limit, offset)
             .await?;
         Ok(entries.into_iter().map(Into::into).collect())
+    }
+
+    /// Export the audit log within an optional time window, formatted for download.
+    ///
+    /// `format` selects the output (`"csv"` or `"json"`). `from`/`to` are
+    /// optional inclusive RFC 3339 timestamps; either may be omitted to leave
+    /// that side of the window open. Results are tenant-scoped and capped at
+    /// [`AUDIT_EXPORT_CAP`] rows.
+    #[graphql(guard = "Require::new(\"audit:read\")")]
+    async fn export_audit_log(
+        &self,
+        ctx: &Context<'_>,
+        format: String,
+        from: Option<String>,
+        to: Option<String>,
+    ) -> Result<AuditExportOutput> {
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        let exporter = crate::audit_export::exporter_for(&format)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let from = parse_opt_rfc3339_epoch(from.as_deref())?;
+        let to = parse_opt_rfc3339_epoch(to.as_deref())?;
+        let entries = store
+            .list_audit_between(Some(&principal.tenant_slug), from, to, AUDIT_EXPORT_CAP)
+            .await?;
+        let data = exporter
+            .export(&entries)
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(AuditExportOutput {
+            filename: format!(
+                "audit-export-{}.{}",
+                Utc::now().format("%Y%m%dT%H%M%SZ"),
+                exporter.extension()
+            ),
+            content_type: exporter.content_type().to_string(),
+            data,
+        })
     }
 
     /// Controller CA certificate in PEM format. Distribute to agents.

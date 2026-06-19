@@ -3,7 +3,7 @@
 
 import { useState } from 'react'
 import { gql, useQuery } from '@apollo/client'
-import { StatusCard, InterfaceList, RulesList, StatsPanel, EventStream, InspectPanel, PerformancePanel, FibPanel, FlowExportPanel, RuleLifecycleStream } from './components'
+import { StatusCard, InterfaceList, RulesList, StatsPanel, EventStream, InspectPanel, PerformancePanel, FibPanel, FlowExportPanel, RuleLifecycleStream, AuditLogPanel } from './components'
 
 const GET_INSPECT_SUPPORTED = gql`
   query GetInspectSupported {
@@ -16,13 +16,14 @@ const GET_INSPECT_SUPPORTED = gql`
   }
 `
 
-type Tab = 'overview' | 'rules' | 'inspect' | 'performance'
+type Tab = 'overview' | 'rules' | 'inspect' | 'performance' | 'audit'
 
 const TAB_LABELS: Record<Tab, string> = {
   overview: 'Overview',
   rules: 'Rules',
   inspect: 'Inspect',
   performance: 'Performance',
+  audit: 'Audit',
 }
 
 function App() {
@@ -35,8 +36,8 @@ function App() {
   const inspectSupported = statusData !== undefined && statusData.status.inspectMode !== null
   const ipfixSupported = statusData?.serverFeatures?.ipfix ?? false
   const tabs: Tab[] = inspectSupported
-    ? ['overview', 'rules', 'inspect', 'performance']
-    : ['overview', 'rules', 'performance']
+    ? ['overview', 'rules', 'inspect', 'performance', 'audit']
+    : ['overview', 'rules', 'performance', 'audit']
 
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col">
@@ -110,6 +111,7 @@ function App() {
         {activeTab === 'rules' && <RulesList />}
         {activeTab === 'inspect' && inspectSupported && <InspectPanel />}
         {activeTab === 'performance' && <PerformancePanel />}
+        {activeTab === 'audit' && <AuditLogPanel />}
       </main>
 
       {/* Footer */}

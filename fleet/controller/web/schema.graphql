@@ -80,6 +80,24 @@ type AuditEntryOutput {
 	detail: String
 }
 
+"""
+A formatted audit log export, ready for the client to download.
+"""
+type AuditExportOutput {
+	"""
+	Suggested download filename, e.g. `audit-export-20260619T120000Z.csv`.
+	"""
+	filename: String!
+	"""
+	MIME content type for the payload (e.g. `text/csv`).
+	"""
+	contentType: String!
+	"""
+	The formatted audit log as UTF-8 text.
+	"""
+	data: String!
+}
+
 type ControlledNodeOutput {
 	id: ID!
 	label: String
@@ -698,6 +716,15 @@ type QueryRoot {
 	Audit log, newest first.
 	"""
 	auditLog(limit: Int, offset: Int): [AuditEntryOutput!]!
+	"""
+	Export the audit log within an optional time window, formatted for download.
+	
+	`format` selects the output (`"csv"` or `"json"`). `from`/`to` are
+	optional inclusive RFC 3339 timestamps; either may be omitted to leave
+	that side of the window open. Results are tenant-scoped and capped at
+	[`AUDIT_EXPORT_CAP`] rows.
+	"""
+	exportAuditLog(format: String!, from: String, to: String): AuditExportOutput!
 	"""
 	Controller CA certificate in PEM format. Distribute to agents.
 	"""

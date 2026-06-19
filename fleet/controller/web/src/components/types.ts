@@ -69,6 +69,12 @@ export interface AuditEntry {
   detail: string | null
 }
 
+export interface AuditExport {
+  filename: string
+  contentType: string
+  data: string
+}
+
 export interface OperationResult {
   success: boolean
   message: string | null

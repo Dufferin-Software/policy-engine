@@ -1,27 +1,48 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
 
+import { gql, useQuery, useLazyQuery } from '@apollo/client'
 import { useState } from 'react'
-import { useQuery, useLazyQuery, gql } from '@apollo/client'
-import { AuditEntry, AuditExport } from './types.ts'
 
 const GET_AUDIT = gql`
-  query GetAudit($limit: Int, $offset: Int) {
-    auditLog(limit: $limit, offset: $offset) {
-      id ts operator action nodeId detail
+  query GetAuditLog($limit: Int) {
+    auditLog(limit: $limit) {
+      timestamp
+      operation
+      input
+      result
+      message
+      sourceIp
     }
   }
 `
 
 const EXPORT_AUDIT = gql`
-  query ExportAudit($format: String!, $from: String, $to: String) {
+  query ExportAuditLog($format: String!, $from: String, $to: String) {
     exportAuditLog(format: $format, from: $from, to: $to) {
-      filename contentType data
+      filename
+      contentType
+      data
     }
   }
 `
 
-const PAGE_SIZE = 50
+interface AuditEntry {
+  timestamp: string
+  operation: string
+  input: unknown
+  result: string
+  message: string
+  sourceIp: string
+}
+
+interface AuditExport {
+  filename: string
+  contentType: string
+  data: string
+}
+
+const LIMIT = 100
 
 /** datetime-local value ("2026-06-19T12:00") → RFC 3339 UTC, or undefined. */
 function toRfc3339(local: string): string | undefined {
@@ -43,22 +64,20 @@ function downloadBlob(filename: string, contentType: string, data: string) {
   URL.revokeObjectURL(url)
 }
 
-function actionColor(action: string): string {
-  if (action.includes('fail') || action.includes('reject')) return 'text-red-400'
-  if (action.includes('push') || action.includes('apply')) return 'text-green-400'
-  if (action.includes('decommission') || action.includes('remove')) return 'text-orange-400'
-  if (action.includes('enroll') || action.includes('approve')) return 'text-blue-400'
-  return 'text-gray-400'
+function resultColor(result: string): string {
+  return result === 'ok' ? 'text-green-400' : 'text-red-400'
 }
 
-export default function AuditLog() {
-  const [offset, setOffset] = useState(0)
+export function AuditLogPanel() {
   const [format, setFormat] = useState<'csv' | 'json'>('csv')
   const [from, setFrom] = useState('')
   const [to, setTo] = useState('')
-  const [exportError, setExportError] = useState<string | null>(null)
+  const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(
+    null
+  )
+
   const { data, loading, error, refetch } = useQuery<{ auditLog: AuditEntry[] }>(GET_AUDIT, {
-    variables: { limit: PAGE_SIZE, offset },
+    variables: { limit: LIMIT },
     fetchPolicy: 'network-only',
   })
 
@@ -67,8 +86,12 @@ export default function AuditLog() {
     { fetchPolicy: 'network-only' }
   )
 
+  const showFeedback = (type: 'success' | 'error', message: string) => {
+    setFeedback({ type, message })
+    setTimeout(() => setFeedback(null), 5000)
+  }
+
   const handleExport = async () => {
-    setExportError(null)
     try {
       const result = await runExport({
         variables: { format, from: toRfc3339(from), to: toRfc3339(to) },
@@ -76,36 +99,36 @@ export default function AuditLog() {
       const exp = result.data?.exportAuditLog
       if (exp) {
         downloadBlob(exp.filename, exp.contentType, exp.data)
+        showFeedback('success', `Exported ${exp.filename}`)
       } else if (result.error) {
-        setExportError(result.error.message)
+        showFeedback('error', result.error.message)
       }
     } catch (e) {
-      setExportError(String(e))
+      showFeedback('error', String(e))
     }
   }
 
   const entries = data?.auditLog ?? []
-  const hasMore = entries.length === PAGE_SIZE
 
   return (
-    <div className="space-y-4">
+    <div className="bg-gray-800 rounded-lg p-6 shadow-lg space-y-4">
       <div className="flex items-center justify-between">
-        <h2 className="text-lg font-semibold text-gray-200">Audit Log</h2>
+        <h2 className="text-xl font-semibold">Audit Log</h2>
         <button
-          onClick={() => { setOffset(0); refetch() }}
-          className="bg-gray-700 hover:bg-gray-600 text-white px-3 py-1.5 rounded text-sm"
+          onClick={() => refetch()}
+          className="px-3 py-1 text-xs bg-gray-700 hover:bg-gray-600 text-gray-300 hover:text-white rounded transition-colors"
         >
           Refresh
         </button>
       </div>
 
       {/* Export controls */}
-      <div className="flex flex-wrap items-end gap-3 rounded-lg border border-gray-700 bg-gray-800/40 p-3">
+      <div className="flex flex-wrap items-end gap-3 bg-gray-900/40 rounded-lg p-3 border border-gray-700">
         <div>
           <label className="block text-gray-400 mb-1 text-xs">Format</label>
           <select
             value={format}
-            onChange={(e) => setFormat(e.target.value as 'csv' | 'json')}
+            onChange={e => setFormat(e.target.value as 'csv' | 'json')}
             className="bg-gray-700 text-white rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
           >
             <option value="csv">CSV</option>
@@ -117,7 +140,7 @@ export default function AuditLog() {
           <input
             type="datetime-local"
             value={from}
-            onChange={(e) => setFrom(e.target.value)}
+            onChange={e => setFrom(e.target.value)}
             className="bg-gray-700 text-white rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
           />
         </div>
@@ -126,7 +149,7 @@ export default function AuditLog() {
           <input
             type="datetime-local"
             value={to}
-            onChange={(e) => setTo(e.target.value)}
+            onChange={e => setTo(e.target.value)}
             className="bg-gray-700 text-white rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
           />
         </div>
@@ -141,38 +164,44 @@ export default function AuditLog() {
           Leave the time fields blank to export the full history.
         </span>
       </div>
-      {exportError && <div className="text-red-400 text-sm">Export failed: {exportError}</div>}
+
+      {feedback && (
+        <div
+          className={`p-2 rounded text-sm ${
+            feedback.type === 'success'
+              ? 'bg-green-500/20 text-green-400'
+              : 'bg-red-500/20 text-red-400'
+          }`}
+        >
+          {feedback.message}
+        </div>
+      )}
 
       {loading && <div className="text-gray-500">Loading…</div>}
       {error && <div className="text-red-400">Error: {error.message}</div>}
 
+      {/* Recent entries (last {LIMIT}) */}
       <div className="rounded-lg border border-gray-700 overflow-hidden">
         <table className="w-full text-xs font-mono">
-          <thead className="bg-gray-800 text-gray-400">
+          <thead className="bg-gray-900 text-gray-400">
             <tr>
-              {['Time', 'Action', 'Node', 'Operator', 'Detail'].map((h) => (
-                <th key={h} className="px-4 py-2 text-left">{h}</th>
+              {['Time', 'Operation', 'Result', 'Message', 'Source'].map(h => (
+                <th key={h} className="px-4 py-2 text-left">
+                  {h}
+                </th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {entries.map((e) => (
-              <tr key={e.id} className="border-t border-gray-800 hover:bg-gray-800/40">
+            {entries.map((e, i) => (
+              <tr key={i} className="border-t border-gray-800 hover:bg-gray-800/40">
                 <td className="px-4 py-1.5 text-gray-500 whitespace-nowrap">
-                  {new Date(e.ts).toLocaleString()}
+                  {new Date(e.timestamp).toLocaleString()}
                 </td>
-                <td className={`px-4 py-1.5 font-medium ${actionColor(e.action)}`}>
-                  {e.action}
-                </td>
-                <td className="px-4 py-1.5 text-gray-400">
-                  {e.nodeId ? e.nodeId.slice(0, 12) + '…' : '—'}
-                </td>
-                <td className="px-4 py-1.5 text-gray-500">
-                  {e.operator ?? 'system'}
-                </td>
-                <td className="px-4 py-1.5 text-gray-400 max-w-xs truncate">
-                  {e.detail ?? '—'}
-                </td>
+                <td className="px-4 py-1.5 text-gray-200">{e.operation}</td>
+                <td className={`px-4 py-1.5 font-medium ${resultColor(e.result)}`}>{e.result}</td>
+                <td className="px-4 py-1.5 text-gray-400 max-w-md truncate">{e.message}</td>
+                <td className="px-4 py-1.5 text-gray-500">{e.sourceIp}</td>
               </tr>
             ))}
             {!loading && entries.length === 0 && (
@@ -185,27 +214,10 @@ export default function AuditLog() {
           </tbody>
         </table>
       </div>
-
-      {/* Pagination */}
-      <div className="flex gap-2 justify-end items-center text-sm">
-        <button
-          disabled={offset === 0}
-          onClick={() => setOffset((o) => Math.max(0, o - PAGE_SIZE))}
-          className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 disabled:opacity-40"
-        >
-          ← Prev
-        </button>
-        <span className="text-gray-500">
-          {offset + 1}–{offset + entries.length}
-        </span>
-        <button
-          disabled={!hasMore}
-          onClick={() => setOffset((o) => o + PAGE_SIZE)}
-          className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 disabled:opacity-40"
-        >
-          Next →
-        </button>
-      </div>
+      <p className="text-xs text-gray-600">
+        Showing the most recent {LIMIT} entries from the in-memory buffer. Export reads the full
+        on-disk log.
+      </p>
     </div>
   )
 }

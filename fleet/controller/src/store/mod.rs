@@ -487,6 +487,19 @@ pub trait ControllerStore: Send + Sync {
         offset: u32,
     ) -> Result<Vec<AuditEntry>>;
 
+    /// Audit rows within the inclusive unix-epoch-second window `[from, to]`
+    /// (either bound may be `None` to leave that side open), newest-first.
+    /// `cap` bounds the number of rows returned so a wide export can't exhaust
+    /// memory. `tenant_id` follows the same `None` = cross-tenant convention as
+    /// [`list_audit`]. Used by the audit export.
+    async fn list_audit_between(
+        &self,
+        tenant_id: Option<&str>,
+        from: Option<i64>,
+        to: Option<i64>,
+        cap: u32,
+    ) -> Result<Vec<AuditEntry>>;
+
     // ── Enrollment tokens (ZTP) ──
     async fn insert_enrollment_token(&self, token: &EnrollmentTokenRecord) -> Result<()>;
     /// `tenant_id`: `Some(slug)` restricts to one tenant; `None` is

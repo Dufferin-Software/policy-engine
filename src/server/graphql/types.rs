@@ -841,6 +841,17 @@ pub struct ConfigureStopBehaviorInput {
     pub stop_behavior: String,
 }
 
+/// A formatted audit log export, ready for the client to download.
+#[derive(SimpleObject, Clone, Debug, Serialize, Deserialize)]
+pub struct AuditExport {
+    /// Suggested download filename, e.g. `audit-export-20260619T120000Z.csv`.
+    pub filename: String,
+    /// MIME content type for the payload (e.g. `text/csv`).
+    pub content_type: String,
+    /// The formatted audit log as UTF-8 text.
+    pub data: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
