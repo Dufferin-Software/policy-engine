@@ -258,17 +258,18 @@ export default function RuleCreator({ nodeId, interfaceName, direction, onClose,
           </div>
         </div>
 
-        {(protocol === 'tcp' || protocol === 'udp') && (
-          <div>
-            <label className="block text-xs text-gray-400 mb-1">SNI Pattern (TCP or UDP/QUIC)</label>
-            <input
-              value={sniPattern}
-              onChange={(e) => setSniPattern(e.target.value)}
-              placeholder="e.g. *.example.com"
-              className="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1 text-xs focus:outline-none focus:border-blue-500"
-            />
-          </div>
-        )}
+        <div>
+          <label className="block text-xs text-gray-400 mb-1">SNI Pattern</label>
+          <input
+            value={sniPattern}
+            onChange={(e) => setSniPattern(e.target.value)}
+            placeholder="e.g. *.example.com"
+            className="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1 text-xs focus:outline-none focus:border-blue-500"
+          />
+          <p className="text-[11px] text-gray-500 mt-1">
+            Matches the server name in TLS (TCP) or QUIC (UDP) handshakes. Leave blank to ignore SNI.
+          </p>
+        </div>
 
         {protocol === 'udp' && (
           <div>

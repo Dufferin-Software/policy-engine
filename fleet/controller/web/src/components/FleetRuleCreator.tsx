@@ -3,12 +3,12 @@
 
 import { useState, useMemo } from 'react'
 import { useMutation, useQuery, gql } from '@apollo/client'
-import { ControlledNode, shortId } from './types.ts'
+import { ControlledNode, nodeDisplayName, shortId } from './types.ts'
 import ConfirmDropDialog, { DropCriterion } from './ConfirmDropDialog.tsx'
 
 const GET_ALL_INTERFACES = gql`
   query GetAllNodeInterfaces {
-    allNodeInterfaces { nodeId name }
+    allNodeInterfaces { nodeId name xdpAttached tcAttached }
   }
 `
 
@@ -52,7 +52,15 @@ function validateCidr(v: string): boolean { return v === '' || CIDR_RE.test(v) }
 function validateMac(v: string): boolean { return v === '' || MAC_RE.test(v) }
 
 interface AllIfaceData {
-  allNodeInterfaces: { nodeId: string; name: string }[]
+  allNodeInterfaces: { nodeId: string; name: string; xdpAttached: boolean; tcAttached: boolean }[]
+}
+
+// An interface is "active" for a direction only when the matching program is
+// attached: XDP for ingress, TC for egress. Rules on an interface with no
+// program attached are stored but never evaluated until it is enabled.
+function ifaceActiveForDir(att: { xdpAttached: boolean; tcAttached: boolean } | undefined, dir: string): boolean {
+  if (!att) return false
+  return dir === 'ingress' ? att.xdpAttached : att.tcAttached
 }
 
 export default function FleetRuleCreator({ nodes, onClose, onCreated }: Props) {
@@ -104,6 +112,22 @@ export default function FleetRuleCreator({ nodes, onClose, onCreated }: Props) {
     return map
   }, [ifaceData])
 
+  // Attachment status keyed by "nodeId|interfaceName" so targets can be checked
+  // against the program (XDP/TC) actually attached for their direction.
+  const attachByKey = useMemo(() => {
+    const map = new Map<string, { xdpAttached: boolean; tcAttached: boolean }>()
+    for (const iface of ifaceData?.allNodeInterfaces ?? []) {
+      map.set(`${iface.nodeId}|${iface.name}`, { xdpAttached: iface.xdpAttached, tcAttached: iface.tcAttached })
+    }
+    return map
+  }, [ifaceData])
+
+  function targetIsActive(t: Target): boolean {
+    return ifaceActiveForDir(attachByKey.get(`${t.nodeId}|${t.interfaceName}`), t.direction)
+  }
+
+  const inactiveTargets = targets.filter((t) => !targetIsActive(t))
+
   const pickedNodeInterfaces = pickNodeId ? (ifacesByNode.get(pickNodeId) ?? []) : []
 
   function onPickNodeChange(nodeId: string) {
@@ -127,7 +151,7 @@ export default function FleetRuleCreator({ nodes, onClose, onCreated }: Props) {
   function addTargets() {
     if (!pickNodeId || pickSelections.size === 0) return
     const node = activeNodes.find((n) => n.id === pickNodeId)
-    const nodeLabel = node ? (node.label ?? node.hostname ?? shortId(node.id)) : shortId(pickNodeId)
+    const nodeLabel = node ? nodeDisplayName(node) : shortId(pickNodeId)
     const newTargets: Target[] = []
     for (const [ifaceName, dir] of pickSelections) {
       // Avoid exact duplicates
@@ -280,7 +304,7 @@ export default function FleetRuleCreator({ nodes, onClose, onCreated }: Props) {
               <option value="">— select a node —</option>
               {activeNodes.map((n) => (
                 <option key={n.id} value={n.id}>
-                  {n.label ?? n.hostname ?? shortId(n.id)}
+                  {nodeDisplayName(n)}{n.hostname && n.label ? ` — ${n.label}` : ''}
                 </option>
               ))}
             </select>
@@ -356,25 +380,48 @@ export default function FleetRuleCreator({ nodes, onClose, onCreated }: Props) {
                 </div>
                 <table className="w-full text-xs">
                   <tbody>
-                    {targets.map((t, i) => (
-                      <tr key={i} className="border-t border-gray-700/50">
-                        <td className="px-3 py-1 text-gray-300">{t.nodeLabel}</td>
-                        <td className="px-3 py-1 font-mono text-gray-300">{t.interfaceName}</td>
-                        <td className="px-3 py-1 text-gray-400">{t.direction}</td>
-                        <td className="px-3 py-1 text-right">
-                          <button
-                            type="button"
-                            onClick={() => removeTarget(i)}
-                            className="text-red-500 hover:text-red-400"
-                            title="Remove"
-                          >
-                            &times;
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                    {targets.map((t, i) => {
+                      const inactive = !targetIsActive(t)
+                      return (
+                        <tr key={i} className="border-t border-gray-700/50">
+                          <td className="px-3 py-1 text-gray-300">{t.nodeLabel}</td>
+                          <td className="px-3 py-1 font-mono text-gray-300">{t.interfaceName}</td>
+                          <td className="px-3 py-1 text-gray-400">
+                            {t.direction}
+                            {inactive && (
+                              <span
+                                className="ml-2 px-1.5 py-0.5 rounded bg-amber-900/50 text-amber-300 text-[10px] font-medium"
+                                title={`No ${t.direction === 'ingress' ? 'XDP' : 'TC'} program attached — rule will not take effect until the interface is enabled.`}
+                              >
+                                inactive
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-3 py-1 text-right">
+                            <button
+                              type="button"
+                              onClick={() => removeTarget(i)}
+                              className="text-red-500 hover:text-red-400"
+                              title="Remove"
+                            >
+                              &times;
+                            </button>
+                          </td>
+                        </tr>
+                      )
+                    })}
                   </tbody>
                 </table>
+              </div>
+            )}
+
+            {inactiveTargets.length > 0 && (
+              <div className="text-xs text-amber-300 bg-amber-900/30 border border-amber-800/50 px-3 py-2 rounded">
+                <span className="font-semibold">Heads up:</span>{' '}
+                {inactiveTargets.length} of {targets.length} target{targets.length !== 1 ? 's' : ''}{' '}
+                {inactiveTargets.length === 1 ? 'is' : 'are'} on interfaces with no program attached for
+                the chosen direction (ingress&nbsp;→&nbsp;XDP, egress&nbsp;→&nbsp;TC). The rule will be
+                stored but has no effect until each interface is explicitly enabled.
               </div>
             )}
           </div>
@@ -433,15 +480,16 @@ export default function FleetRuleCreator({ nodes, onClose, onCreated }: Props) {
               </div>
             </div>
 
-            {(protocol === 'tcp' || protocol === 'udp') && (
-              <div>
-                <label className="block text-xs text-gray-400 mb-1">SNI Pattern (TCP or UDP/QUIC)</label>
-                <input value={sniPattern} onChange={(e) => setSniPattern(e.target.value)}
-                  placeholder="e.g. *.example.com"
-                  className="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1 text-xs focus:outline-none focus:border-blue-500"
-                />
-              </div>
-            )}
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">SNI Pattern</label>
+              <input value={sniPattern} onChange={(e) => setSniPattern(e.target.value)}
+                placeholder="e.g. *.example.com"
+                className="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1 text-xs focus:outline-none focus:border-blue-500"
+              />
+              <p className="text-[11px] text-gray-500 mt-1">
+                Matches the server name in TLS (TCP) or QUIC (UDP) handshakes. Leave blank to ignore SNI.
+              </p>
+            </div>
             {protocol === 'udp' && (
               <div>
                 <label className="block text-xs text-gray-400 mb-1">QUIC Version</label>

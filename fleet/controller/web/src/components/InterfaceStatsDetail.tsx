@@ -94,19 +94,21 @@ function DirectionPanel({
   nodeId,
   interfaceName,
   direction,
+  refreshSecs,
 }: {
   nodeId: string
   interfaceName: string
   direction: 'ingress' | 'egress'
+  refreshSecs: number
 }) {
   const isIngress = direction === 'ingress'
   const { data: statsData, loading: statsLoading } = useQuery<{ nodeInterfaceStats: FullStats | null }>(
     GET_INTERFACE_STATS,
-    { variables: { nodeId, interfaceName, direction }, pollInterval: 5_000 },
+    { variables: { nodeId, interfaceName, direction }, pollInterval: refreshSecs * 1_000 },
   )
   const { data: etData } = useQuery<{ nodeEthertypeStats: EthertypeStat[] }>(
     GET_ETHERTYPE_STATS,
-    { variables: { nodeId, interfaceName, direction }, pollInterval: 5_000 },
+    { variables: { nodeId, interfaceName, direction }, pollInterval: refreshSecs * 1_000 },
   )
 
   const s = statsData?.nodeInterfaceStats
@@ -118,7 +120,7 @@ function DirectionPanel({
     <div className="bg-gray-800 rounded-lg border border-gray-700 p-3">
       <div className={`text-xs font-semibold uppercase mb-3 ${dirColor}`}>
         {isIngress ? 'Ingress' : 'Egress'}
-        <span className="ml-2 text-gray-600 font-normal normal-case">5s refresh</span>
+        <span className="ml-2 text-gray-600 font-normal normal-case">{refreshSecs}s refresh</span>
       </div>
 
       {statsLoading && !s ? (
@@ -211,10 +213,11 @@ function DirectionPanel({
 interface Props {
   nodeId: string
   interfaceName: string
+  refreshSecs: number
   onClose: () => void
 }
 
-export default function InterfaceStatsDetail({ nodeId, interfaceName, onClose }: Props) {
+export default function InterfaceStatsDetail({ nodeId, interfaceName, refreshSecs, onClose }: Props) {
   // Stats are scraped from the node's engine, so cleared counters appear on the
   // next metrics refresh rather than instantly. We refetch the stats queries to
   // pick up the update as soon as the agent's next scrape lands.
@@ -255,8 +258,8 @@ export default function InterfaceStatsDetail({ nodeId, interfaceName, onClose }:
         </div>
       </div>
       <div className="p-3 grid grid-cols-2 gap-3">
-        <DirectionPanel nodeId={nodeId} interfaceName={interfaceName} direction="ingress" />
-        <DirectionPanel nodeId={nodeId} interfaceName={interfaceName} direction="egress" />
+        <DirectionPanel nodeId={nodeId} interfaceName={interfaceName} direction="ingress" refreshSecs={refreshSecs} />
+        <DirectionPanel nodeId={nodeId} interfaceName={interfaceName} direction="egress" refreshSecs={refreshSecs} />
       </div>
     </div>
   )

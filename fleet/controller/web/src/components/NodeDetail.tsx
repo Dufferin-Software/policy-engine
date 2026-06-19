@@ -191,6 +191,9 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
   const node = data?.node
   const interfaces = data?.nodeInterfaces ?? []
   const rules = data?.rules ?? []
+  // Effective metrics scrape interval; null means the node uses the agent
+  // default of 5s. Drives the stats poll cadence and the "Ns refresh" label.
+  const refreshSecs = node?.metricsIntervalSecs ?? 5
   const pendingGeneration = pendingPollData?.pendingGeneration ?? data?.pendingGeneration ?? null
 
   const [tab, setTab] = useState<NodeTab>(initialTab ?? 'overview')
@@ -220,8 +223,8 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
     const trimmed = metricsInterval.trim()
     // Empty clears the override so the agent reverts to its local default.
     const seconds = trimmed === '' ? null : Number(trimmed)
-    if (seconds !== null && (!Number.isInteger(seconds) || seconds < 1 || seconds > 3600)) {
-      flash('Metrics interval must be a whole number of seconds between 1 and 3600')
+    if (seconds !== null && (!Number.isInteger(seconds) || seconds < 5 || seconds > 3600)) {
+      flash('Metrics interval must be a whole number of seconds between 5 and 3600')
       return
     }
     try {
@@ -390,6 +393,11 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
             ← Fleet
           </button>
           <h2 className="text-lg font-bold text-white">{nodeTitle}</h2>
+          {node?.hostname && node.hostname !== nodeTitle && (
+            <span className="text-sm text-gray-400 font-mono" title="Hostname">
+              {node.hostname}
+            </span>
+          )}
           {node && (
             <span className={`px-2 py-0.5 rounded text-xs font-medium ${statusColor(node.status)}`}>
               {node.status}
@@ -490,7 +498,7 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
                       <span className="inline-flex items-center gap-1 text-xs">
                         <input
                           type="number"
-                          min={1}
+                          min={5}
                           max={3600}
                           value={metricsInterval}
                           onChange={(e) => setMetricsInterval(e.target.value)}
@@ -528,6 +536,7 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
                   <InterfaceStatsDetail
                     nodeId={nodeId}
                     interfaceName={statsIface}
+                    refreshSecs={refreshSecs}
                     onClose={() => setStatsIface(null)}
                   />
                 )}
@@ -538,6 +547,7 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
             <NodeInterfaceStats
               nodeId={nodeId}
               interfaces={interfaces}
+              refreshSecs={refreshSecs}
               onShowStats={(name) => setStatsIface((prev) => (prev === name ? null : name))}
             />
           </>

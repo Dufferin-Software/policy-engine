@@ -35,6 +35,11 @@ use policy_controller_proto::controller::{
     config_confirm::Outcome as ConfirmOutcome, ConfigConfirm,
 };
 
+/// Mutual-exclusion handle shared between the controller-apply path and the
+/// change-detector poll so the poll can never observe a half-applied push
+/// (rule installed, baseline not yet refreshed) and report it as a local edit.
+type ApplyLock = Arc<tokio::sync::Mutex<()>>;
+
 // ── Stream abstraction (mockable) ────────────────────────────────────────────
 
 /// Abstract handle to an open bidirectional agent↔controller stream.
@@ -180,6 +185,14 @@ pub async fn run_stream_loop(
     // per entry reverts and emits ConfigConfirm{REVERTED} on timeout.
     let pending = Arc::new(PendingChangeRegistry::new());
 
+    // Serialises the change-detector poll against controller-initiated config
+    // applies. A gated/full-restore apply installs rules into the engine and
+    // only *afterwards* refreshes the detector baseline; without this lock a
+    // poll landing in that window classifies the controller's own rule as a
+    // *local* edit and echoes it back as a spurious `LocalChange`. Held across
+    // apply+refresh on the write side and across fetch+diff on the poll side.
+    let apply_lock: ApplyLock = Arc::new(tokio::sync::Mutex::new(()));
+
     // Send AgentHello as the first message.
     let node_id = identity.node_id();
     let hostname = gethostname::gethostname().to_string_lossy().into_owned();
@@ -302,12 +315,13 @@ pub async fn run_stream_loop(
             let det = Arc::clone(det);
             let url = graphql_url.clone();
             let tx = outbound_tx.clone();
+            let lock = Arc::clone(&apply_lock);
             _connection_tasks.push(AbortOnDrop(tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(CHANGE_DETECT_INTERVAL);
                 ticker.tick().await; // consume the immediate first tick
                 loop {
                     ticker.tick().await;
-                    if let Err(e) = change_detector_tick(det.as_ref(), &url, &tx).await {
+                    if let Err(e) = change_detector_tick(det.as_ref(), &url, &tx, &lock).await {
                         log::warn!("Change detector tick failed: {:#}", e);
                     }
                 }
@@ -329,6 +343,7 @@ pub async fn run_stream_loop(
         &metrics_trigger,
         &metrics_interval,
         change_detector.as_ref(),
+        &apply_lock,
     )
     .await;
 
@@ -357,6 +372,7 @@ async fn run_event_loop<S: AgentStreamHandle>(
     metrics_trigger: &Arc<Notify>,
     metrics_interval: &Arc<AtomicU64>,
     change_detector: Option<&Arc<dyn ChangeDetector>>,
+    apply_lock: &ApplyLock,
 ) -> Result<()> {
     loop {
         tokio::select! {
@@ -393,6 +409,7 @@ async fn run_event_loop<S: AgentStreamHandle>(
                             metrics_trigger,
                             metrics_interval,
                             change_detector,
+                            apply_lock,
                         )
                         .await?;
                     }
@@ -406,6 +423,7 @@ async fn run_event_loop<S: AgentStreamHandle>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_controller_message(
     msg: ControllerMessage,
     stream: &mut impl AgentStreamHandle,
@@ -416,6 +434,7 @@ async fn handle_controller_message(
     metrics_trigger: &Arc<Notify>,
     metrics_interval: &Arc<AtomicU64>,
     change_detector: Option<&Arc<dyn ChangeDetector>>,
+    apply_lock: &ApplyLock,
 ) -> Result<()> {
     match msg.payload {
         Some(CtrlPayload::Config(push)) => {
@@ -435,21 +454,31 @@ async fn handle_controller_message(
                 if gated {
                     // Gated push: capture inverse ops, apply inline, then confirm.
                     // These are typically small incremental diffs so should be fast.
-                    let inverse_ops = a.capture_inverse(&push).await;
-                    let (success, error_message) = a.apply(&push).await;
-                    if success {
-                        // Sync the change-detector baseline to post-apply state so
-                        // the next poll doesn't echo this controller-pushed delta
-                        // back as a "local change", causing a feedback loop.
-                        refresh_baseline(change_detector, local_graphql_url).await;
-                        pending.register(
-                            generation_id.clone(),
-                            inverse_ops,
-                            deadline_ms,
-                            Arc::clone(a),
-                            outbound_tx.clone(),
-                        );
-                    }
+                    //
+                    // Hold `apply_lock` across capture+apply+refresh so a
+                    // concurrent change-detector poll cannot observe the engine
+                    // after the rule is installed but before the baseline is
+                    // refreshed — that window is what made the controller's own
+                    // push echo back as a spurious local change.
+                    let (success, error_message) = {
+                        let _apply_guard = apply_lock.lock().await;
+                        let inverse_ops = a.capture_inverse(&push).await;
+                        let (success, error_message) = a.apply(&push).await;
+                        if success {
+                            // Sync the change-detector baseline to post-apply state
+                            // so the next poll doesn't echo this controller-pushed
+                            // delta back as a "local change".
+                            refresh_baseline(change_detector, local_graphql_url).await;
+                            pending.register(
+                                generation_id.clone(),
+                                inverse_ops,
+                                deadline_ms,
+                                Arc::clone(a),
+                                outbound_tx.clone(),
+                            );
+                        }
+                        (success, error_message)
+                    };
                     let outcome = if success {
                         ConfirmOutcome::Applied
                     } else {
@@ -486,11 +515,21 @@ async fn handle_controller_message(
                     let tx = outbound_tx.clone();
                     let detector_clone = change_detector.cloned();
                     let url_clone = local_graphql_url.map(|u| u.to_string());
+                    let lock = Arc::clone(apply_lock);
                     tokio::spawn(async move {
-                        let (ok, err) = applier_clone.apply(&push).await;
-                        if ok {
-                            refresh_baseline(detector_clone.as_ref(), url_clone.as_deref()).await;
-                        }
+                        let (ok, err) = {
+                            // Same apply↔poll exclusion as the gated path: a
+                            // full-restore rewrites the engine's rule set, so the
+                            // detector must not read between apply and baseline
+                            // refresh.
+                            let _apply_guard = lock.lock().await;
+                            let (ok, err) = applier_clone.apply(&push).await;
+                            if ok {
+                                refresh_baseline(detector_clone.as_ref(), url_clone.as_deref())
+                                    .await;
+                            }
+                            (ok, err)
+                        };
                         let _ = tx
                             .send(AgentMessage {
                                 payload: Some(AgentPayload::ConfigResult(
@@ -1064,7 +1103,14 @@ async fn change_detector_tick(
     detector: &dyn ChangeDetector,
     graphql_url: &str,
     outbound_tx: &mpsc::Sender<AgentMessage>,
+    apply_lock: &ApplyLock,
 ) -> Result<bool> {
+    // Exclude controller-initiated applies for the whole fetch+diff: an apply
+    // installs rules and only then refreshes the baseline, so reading the engine
+    // mid-apply would diff the controller's own push as a local edit. Holding the
+    // lock until after `process_snapshot` advances the baseline closes that race.
+    let _apply_guard = apply_lock.lock().await;
+
     // Single, fallible read of the local engine. The diff decision, the
     // reported payload, and the new baseline must all derive from *this one*
     // snapshot: splitting the read lets the detector report a rule as deleted
@@ -1718,5 +1764,41 @@ mod tests {
         detector.expect_update_baseline().times(0);
         let detector: Arc<dyn ChangeDetector> = Arc::new(detector);
         refresh_baseline(Some(&detector), None).await;
+    }
+
+    #[tokio::test]
+    async fn test_change_detector_tick_blocks_while_apply_lock_held() {
+        // The poll must not even read the engine while a controller apply holds
+        // the lock: that read-during-apply window is what made the controller's
+        // own push echo back as a spurious local change. Holding the lock here
+        // simulates an in-flight apply; the tick must stay pending until release.
+        let apply_lock: ApplyLock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = apply_lock.lock().await;
+
+        // No expectations: the detector must not be touched while the tick is
+        // blocked, and once unblocked the empty-URL fetch errors out before any
+        // diff happens — so update_baseline/diff are never called either way.
+        let detector = MockChangeDetector::new();
+        let (tx, _rx) = mpsc::channel::<AgentMessage>(8);
+        let lock = Arc::clone(&apply_lock);
+        let handle = tokio::spawn(async move {
+            // Empty URL → the fallible fetch errors immediately (no network).
+            change_detector_tick(&detector, "", &tx, &lock).await
+        });
+
+        // While the lock is held the tick cannot complete.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_finished(),
+            "change_detector_tick must block while the apply lock is held"
+        );
+
+        // Releasing the lock lets the tick proceed (and fail on the bogus fetch).
+        drop(guard);
+        let result = handle.await.expect("tick task panicked");
+        assert!(
+            result.is_err(),
+            "tick should surface the fetch error once unblocked"
+        );
     }
 }

@@ -105,6 +105,14 @@ export function shortId(id: string): string {
   return id.slice(0, 12) + '…'
 }
 
+// Primary display name for a node: prefer the hostname (distinctive per box)
+// over a user label (often the shared fleet name), falling back to the short id.
+export function nodeDisplayName(
+  node: { hostname: string | null; label: string | null; id: string },
+): string {
+  return node.hostname ?? node.label ?? shortId(node.id)
+}
+
 export function fmtBytes(n: number): string {
   if (n < 1024) return `${n}B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}K`

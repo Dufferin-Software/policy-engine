@@ -32,16 +32,18 @@ function StatRow({
   nodeId,
   interfaceName,
   direction,
+  refreshSecs,
   onShowStats,
 }: {
   nodeId: string
   interfaceName: string
   direction: 'ingress' | 'egress'
+  refreshSecs: number
   onShowStats?: (interfaceName: string) => void
 }) {
   const { data, loading } = useQuery<{ nodeInterfaceStats: StatsResult | null }>(
     GET_INTERFACE_STATS,
-    { variables: { nodeId, interfaceName, direction }, pollInterval: 5_000 },
+    { variables: { nodeId, interfaceName, direction }, pollInterval: refreshSecs * 1_000 },
   )
   const s = data?.nodeInterfaceStats
 
@@ -80,10 +82,11 @@ function StatRow({
 interface Props {
   nodeId: string
   interfaces: NodeInterfaceOutput[]
+  refreshSecs: number
   onShowStats?: (interfaceName: string) => void
 }
 
-export default function NodeInterfaceStats({ nodeId, interfaces, onShowStats }: Props) {
+export default function NodeInterfaceStats({ nodeId, interfaces, refreshSecs, onShowStats }: Props) {
   const [clearAllInterfaceStats, { loading: clearing }] = useMutation(CLEAR_ALL_INTERFACE_STATS, {
     refetchQueries: ['NodeInterfaceStats', 'NodeInterfaceStatsDetail', 'NodeEthertypeStats'],
   })
@@ -123,7 +126,7 @@ export default function NodeInterfaceStats({ nodeId, interfaces, onShowStats }: 
             <h3 className={`text-sm font-semibold ${dir === 'ingress' ? 'text-cyan-400' : 'text-orange-400'}`}>
               {dir === 'ingress' ? 'Ingress Traffic' : 'Egress Traffic'}
             </h3>
-            <span className="text-xs text-gray-600">5s refresh</span>
+            <span className="text-xs text-gray-600">{refreshSecs}s refresh</span>
           </div>
           <table className="w-full">
             <thead className="text-gray-500 uppercase bg-gray-900/50">
@@ -140,6 +143,7 @@ export default function NodeInterfaceStats({ nodeId, interfaces, onShowStats }: 
                   nodeId={nodeId}
                   interfaceName={iface.name}
                   direction={dir}
+                  refreshSecs={refreshSecs}
                   onShowStats={onShowStats}
                 />
               ))}

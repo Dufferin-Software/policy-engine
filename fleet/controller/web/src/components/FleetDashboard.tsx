@@ -3,7 +3,7 @@
 
 import { useState } from 'react'
 import { useQuery, useMutation, gql } from '@apollo/client'
-import { ControlledNode, relTime, shortId, statusColor } from './types.ts'
+import { ControlledNode, nodeDisplayName, relTime, shortId, statusColor } from './types.ts'
 import NodeDetail, { NodeTab } from './NodeDetail.tsx'
 import FleetRuleCreator from './FleetRuleCreator.tsx'
 
@@ -183,10 +183,14 @@ export default function FleetDashboard({ selectedNode, onSelectNode }: FleetDash
                       onClick={() => onSelectNode({ nodeId: node.id })}
                       className="text-blue-400 hover:text-blue-300 hover:underline text-left"
                     >
-                      {node.label ?? node.hostname ?? shortId(node.id)}
+                      {nodeDisplayName(node)}
                     </button>
                     <div className="text-gray-600 text-xs">
-                      {node.hostname && !node.label ? shortId(node.id) : node.hostname ? `${node.hostname} · ${shortId(node.id)}` : shortId(node.id)}
+                      {node.hostname
+                        ? [node.label, shortId(node.id)].filter(Boolean).join(' · ')
+                        : node.label
+                          ? shortId(node.id)
+                          : ''}
                     </div>
                     {node.tpmBacked && (
                       <span className="text-xs text-purple-400" title="TPM-backed key">TPM</span>

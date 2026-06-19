@@ -421,6 +421,12 @@ impl ControllerStore for SqliteControllerStore {
     // ── Rules ────────────────────────────────────────────────────────────────
 
     async fn create_rule(&self, rule: &Rule) -> Result<()> {
+        // Upsert on the rule id rather than a bare INSERT. A rule may legitimately
+        // arrive twice for the same id: the gated create commits it after the agent
+        // confirms, but a racing `apply_local_change` (driven by an agent state
+        // snapshot) can persist the same rule first. A plain INSERT would fail the
+        // commit on the resulting primary-key conflict; the upsert keeps the
+        // operation idempotent so identical re-creates are a no-op.
         sqlx::query(
             r#"
             INSERT INTO rules
@@ -430,6 +436,23 @@ impl ControllerStore for SqliteControllerStore {
                  actions_json, created_at, created_by,
                  expires_after_secs, schedule_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                tenant_id          = excluded.tenant_id,
+                node_id            = excluded.node_id,
+                interface_name     = excluded.interface_name,
+                direction          = excluded.direction,
+                src_cidr           = excluded.src_cidr,
+                dst_cidr           = excluded.dst_cidr,
+                src_port           = excluded.src_port,
+                dst_port           = excluded.dst_port,
+                protocol           = excluded.protocol,
+                sni_pattern        = excluded.sni_pattern,
+                quic_version       = excluded.quic_version,
+                src_mac            = excluded.src_mac,
+                dst_mac            = excluded.dst_mac,
+                actions_json       = excluded.actions_json,
+                expires_after_secs = excluded.expires_after_secs,
+                schedule_json      = excluded.schedule_json
             "#,
         )
         .bind(&rule.id)
@@ -1314,5 +1337,61 @@ mod tests {
             store.get_node("n1").await.unwrap().unwrap().metrics_interval_secs,
             None
         );
+    }
+
+    fn sample_rule(id: &str, node_id: &str) -> Rule {
+        Rule {
+            id: id.to_string(),
+            tenant_id: "default".to_string(),
+            node_id: node_id.to_string(),
+            interface_name: "enp1s0".to_string(),
+            direction: "ingress".to_string(),
+            src_cidr: None,
+            dst_cidr: Some("1.1.1.1/32".to_string()),
+            src_port: None,
+            dst_port: None,
+            protocol: "icmp".to_string(),
+            sni_pattern: None,
+            quic_version: None,
+            src_mac: None,
+            dst_mac: None,
+            actions_json: r#"[{"action":"log","priority":0}]"#.to_string(),
+            created_at: Utc::now(),
+            created_by: Some("operator:admin".to_string()),
+            expires_after_secs: None,
+            schedule_json: None,
+        }
+    }
+
+    // Regression: a rule may be persisted twice for the same id — the gated
+    // create commits after the agent confirms, but a racing `apply_local_change`
+    // can write the same id first. A bare INSERT would fail the commit on the
+    // primary-key conflict; create_rule must upsert idempotently and never
+    // duplicate the row.
+    #[tokio::test]
+    async fn create_rule_is_idempotent_upsert() {
+        let (store, _dir) = temp_store().await;
+        store.upsert_node(&sample_node("n1")).await.unwrap();
+
+        let rule = sample_rule("1718789620123456", "n1");
+        store.create_rule(&rule).await.unwrap();
+        // Second create with the same id must not error and must not duplicate.
+        store.create_rule(&rule).await.unwrap();
+
+        let rules = store.list_rules_for_node("n1").await.unwrap();
+        assert_eq!(rules.len(), 1, "duplicate id must collapse to one row");
+        assert_eq!(rules[0].dst_cidr.as_deref(), Some("1.1.1.1/32"));
+
+        // An updated payload for the same id overwrites in place (still one row).
+        let mut updated = rule.clone();
+        updated.protocol = "tcp".to_string();
+        updated.dst_port = Some(443);
+        store.create_rule(&updated).await.unwrap();
+        let rules = store.list_rules_for_node("n1").await.unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].protocol, "tcp");
+        assert_eq!(rules[0].dst_port, Some(443));
+        // Provenance (created_by) is preserved on conflict — first writer wins.
+        assert_eq!(rules[0].created_by.as_deref(), Some("operator:admin"));
     }
 }
