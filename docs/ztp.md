@@ -10,7 +10,11 @@ For the deeper security model see [enrollment-crypto.md](enrollment-crypto.md).
 ## TL;DR
 
 ```
-# On the controller operator's workstation:
+# On the controller host: mint an operator API token (printed once).
+policy-controller-mint-token --name ztp --role operator
+
+# On the operator's workstation: authenticate the client with that token.
+export POLICY_CONTROLLER_TOKEN=<token from the controller host>
 policy-controller-client enroll-token create \
     --controller-url https://controller.example.com:7777 \
     --ttl 1h \
@@ -49,7 +53,48 @@ distribution effort is identical to pushing any fleet-wide config file.
 
 ## Operator workflow
 
-### 1. Mint a token
+### 0. Authenticate the client
+
+Operators run `policy-controller-client` remotely against the controller's
+HTTP API; the token itself is minted on the controller host. These are two
+different machines:
+
+**On the controller host** — `policy-controller-mint-token` opens the
+controller's SQLite DB directly, so it must run where that file lives (the
+controller host, as the service user or root). Mint a token with the
+`enrollment:write` permission and hand the plaintext to the operator over a
+secure channel:
+
+```
+# On the controller host:
+policy-controller-mint-token --name ztp --role operator
+# prints the plaintext token on stdout — copy it now, it cannot be retrieved later
+```
+
+**On the operator workstation** — `policy-controller-client` talks only to the
+controller's REST + GraphQL surface over the network. On any controller with
+the `api_tokens` migration applied it must present that token: pass it with
+`--token <tok>` or set `POLICY_CONTROLLER_TOKEN` in the environment. Without it
+the enroll-token calls below are rejected before they reach the controller.
+
+```
+# On the operator workstation:
+export POLICY_CONTROLLER_TOKEN=<token from the controller host>
+```
+
+The token's roles gate which enroll-token operations are allowed:
+
+| Operation                  | Required permission  | Built-in roles that grant it       |
+|----------------------------|----------------------|------------------------------------|
+| `enroll-token create`      | `enrollment:write`   | `admin`, `operator`, `security-admin` |
+| `enroll-token list`        | `enrollment:read`    | any read role (`viewer`, `auditor`, …) |
+| `enroll-token revoke`      | `enrollment:delete`  | `admin`, `operator`, `security-admin` |
+
+The token is tenant-scoped, and the tenant it binds to (`--tenant-id` on
+`mint-token`, default `1`/`default`) is the tenant every node enrolled via the
+resulting bundle is re-bound to (see "Multi-tenant enrollment" below).
+
+### 1. Mint an enrollment token
 
 ```
 policy-controller-client enroll-token create \
