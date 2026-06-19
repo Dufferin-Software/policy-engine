@@ -6,6 +6,7 @@ import { useQuery, useMutation, gql } from '@apollo/client'
 import { ControlledNode, nodeDisplayName, relTime, shortId, statusColor } from './types.ts'
 import NodeDetail, { NodeTab } from './NodeDetail.tsx'
 import FleetRuleCreator from './FleetRuleCreator.tsx'
+import MonitoringSetup from './MonitoringSetup.tsx'
 
 const GET_FLEET = gql`
   query GetFleet {
@@ -63,6 +64,7 @@ export default function FleetDashboard({ selectedNode, onSelectNode }: FleetDash
   const [removeNode] = useMutation(REMOVE_NODE)
   const [labelNode] = useMutation(LABEL_NODE)
   const [showFleetRule, setShowFleetRule] = useState(false)
+  const [showMonitoring, setShowMonitoring] = useState(false)
   const [labelEdit, setLabelEdit] = useState<{ id: string; value: string } | null>(null)
   const [msg, setMsg] = useState<string | null>(null)
 
@@ -138,6 +140,13 @@ export default function FleetDashboard({ selectedNode, onSelectNode }: FleetDash
             className="bg-blue-800 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm"
           >
             Fleet Rule
+          </button>
+          <button
+            onClick={() => setShowMonitoring(true)}
+            className="bg-gray-700 hover:bg-gray-600 text-white px-3 py-1.5 rounded text-sm"
+            title="Generate a Prometheus scrape config for the fleet"
+          >
+            Prometheus
           </button>
           <button
             onClick={() => refetch()}
@@ -299,6 +308,8 @@ export default function FleetDashboard({ selectedNode, onSelectNode }: FleetDash
           }}
         />
       )}
+
+      {showMonitoring && <MonitoringSetup onClose={() => setShowMonitoring(false)} />}
     </div>
   )
 }

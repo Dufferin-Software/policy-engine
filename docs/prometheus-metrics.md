@@ -75,6 +75,12 @@ Each node is identified in Grafana by the `instance` label
 
 ### Fleet — scrape the controller
 
+> **Tip:** the controller web UI can generate this snippet for you. On the
+> **Fleet** page, click the **Prometheus** button (beside **Fleet Rule**). It
+> pre-fills the scrape target with the address you used to reach the UI (and
+> sets `scheme: https` when appropriate), then offers the ready-to-paste config
+> with a copy button.
+
 ```yaml
 scrape_configs:
   - job_name: policy_controller
