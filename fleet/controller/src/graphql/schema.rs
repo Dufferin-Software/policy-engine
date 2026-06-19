@@ -1097,6 +1097,49 @@ impl MutationRoot {
             ensure_node_in_tenant(store, node_id, &principal.tenant_slug).await?;
         }
 
+        // Reject the whole batch if the rule's match criteria duplicate an
+        // existing rule on ANY of the selected nodes — create nothing.
+        let dir_lower = input.direction.to_lowercase();
+        let candidate = Rule {
+            id: String::new(),
+            tenant_id: principal.tenant_slug.clone(),
+            node_id: String::new(),
+            interface_name: input.interface_name.clone(),
+            direction: dir_lower.clone(),
+            src_cidr: input.src_cidr.clone(),
+            dst_cidr: input.dst_cidr.clone(),
+            src_port: input.src_port,
+            dst_port: input.dst_port,
+            protocol: input.protocol.clone().unwrap_or_else(|| "any".to_string()),
+            sni_pattern: input.sni_pattern.clone(),
+            quic_version: input.quic_version.clone(),
+            src_mac: input.src_mac.clone(),
+            dst_mac: input.dst_mac.clone(),
+            actions_json: String::new(),
+            created_at: Utc::now(),
+            created_by: None,
+            expires_after_secs: None,
+            schedule_json: None,
+        };
+        let mut conflicts: Vec<String> = Vec::new();
+        for node_id in &input.node_ids {
+            let existing = store
+                .list_rules_for_interface(node_id, &input.interface_name, &dir_lower)
+                .await?;
+            if let Some(dup) = existing
+                .iter()
+                .find(|e| match_criteria_equal(e, &candidate))
+            {
+                conflicts.push(format!("{} (rule {})", node_id, dup.id));
+            }
+        }
+        if !conflicts.is_empty() {
+            return Err(async_graphql::Error::new(format!(
+                "A rule with identical match criteria already exists on: {}",
+                conflicts.join(", ")
+            )));
+        }
+
         let mut created = Vec::with_capacity(input.node_ids.len());
         for node_id in &input.node_ids {
             let rule = Rule {
@@ -1181,6 +1224,18 @@ impl MutationRoot {
             expires_after_secs: input.expires_after_secs,
             schedule_json: input.schedule_json,
         };
+
+        // Reject a rule whose match criteria duplicate an existing rule on the
+        // same (node, interface, direction).
+        let existing = store
+            .list_rules_for_interface(&rule.node_id, &rule.interface_name, &rule.direction)
+            .await?;
+        if let Some(dup) = existing.iter().find(|e| match_criteria_equal(e, &rule)) {
+            return Err(async_graphql::Error::new(format!(
+                "A rule with identical match criteria already exists (rule {}) on {} {}/{}",
+                dup.id, rule.node_id, rule.interface_name, rule.direction
+            )));
+        }
 
         drive_pending(
             PendingOp::CreateRule(Box::new(rule.clone())),
@@ -2175,6 +2230,64 @@ fn validate_direction(direction: &str) -> Result<()> {
     }
 }
 
+// ── Duplicate match-criteria detection ─────────────────────────────────────────
+//
+// Two rules on the same (node, interface, direction) must not share identical
+// match criteria — they would collide in the engine's data plane. The `id`,
+// `actions`, and lifecycle (TTL / schedule) fields are NOT part of the match
+// criteria and are excluded from the comparison. Normalization mirrors the
+// engine's semantics so that semantically-equal inputs compare equal.
+
+/// Canonicalize a CIDR for comparison: parse and re-emit `network/prefix` so
+/// `10.0.0.1/8` and `10.0.0.0/8` compare equal (matching the engine, which
+/// stores the network address). `None`/empty maps to the `*` ("any") sentinel.
+fn norm_cidr(c: &Option<String>) -> String {
+    match c {
+        Some(s) if !s.trim().is_empty() => match s.trim().parse::<ipnetwork::IpNetwork>() {
+            Ok(net) => format!("{}/{}", net.network(), net.prefix()),
+            Err(_) => s.trim().to_lowercase(),
+        },
+        _ => "*".to_string(),
+    }
+}
+
+/// A `None` or `Some(0)` port both mean "any".
+fn norm_port(p: Option<u32>) -> u32 {
+    p.unwrap_or(0)
+}
+
+/// Empty/whitespace protocol means "any"; comparison is case-insensitive.
+fn norm_proto(p: &str) -> String {
+    let t = p.trim().to_lowercase();
+    if t.is_empty() {
+        "any".to_string()
+    } else {
+        t
+    }
+}
+
+/// Trim + lowercase an optional string, treating empty as absent.
+fn norm_opt(s: &Option<String>) -> Option<String> {
+    s.as_ref()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+}
+
+/// True when two rules would match identical traffic (ignoring id, actions, and
+/// lifecycle). Callers compare rules already scoped to the same node, interface,
+/// and direction, so those fields are not re-checked here.
+fn match_criteria_equal(a: &Rule, b: &Rule) -> bool {
+    norm_cidr(&a.src_cidr) == norm_cidr(&b.src_cidr)
+        && norm_cidr(&a.dst_cidr) == norm_cidr(&b.dst_cidr)
+        && norm_port(a.src_port) == norm_port(b.src_port)
+        && norm_port(a.dst_port) == norm_port(b.dst_port)
+        && norm_proto(&a.protocol) == norm_proto(&b.protocol)
+        && norm_opt(&a.sni_pattern) == norm_opt(&b.sni_pattern)
+        && norm_opt(&a.quic_version) == norm_opt(&b.quic_version)
+        && norm_opt(&a.src_mac) == norm_opt(&b.src_mac)
+        && norm_opt(&a.dst_mac) == norm_opt(&b.dst_mac)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2777,6 +2890,152 @@ mod tests {
             )
             .await;
         assert!(!res.errors.is_empty(), "Should reject empty node_ids");
+    }
+
+    #[tokio::test]
+    async fn test_create_rule_duplicate_rejected() {
+        let h = make_harness().await;
+        register_auto_confirming_agent(&h, "node-1").await;
+        let schema = &h.schema;
+
+        let create = r#"mutation {
+            createRule(input: {
+                nodeId: "node-1"
+                interfaceName: "eth0"
+                direction: "ingress"
+                srcCidr: "10.0.0.0/8"
+                dstPort: 80
+                protocol: "tcp"
+                actionsJson: "[{\"action\":\"drop\",\"priority\":0}]"
+            }) { id }
+        }"#;
+
+        let res = schema.execute(create).await;
+        assert!(res.errors.is_empty(), "first create: {:?}", res.errors);
+
+        // Identical match criteria (different actions) must be rejected.
+        let dup = r#"mutation {
+            createRule(input: {
+                nodeId: "node-1"
+                interfaceName: "eth0"
+                direction: "ingress"
+                srcCidr: "10.0.0.0/8"
+                dstPort: 80
+                protocol: "tcp"
+                actionsJson: "[{\"action\":\"pass\",\"priority\":0}]"
+            }) { id }
+        }"#;
+        let res2 = schema.execute(dup).await;
+        assert!(!res2.errors.is_empty(), "duplicate should be rejected");
+        assert!(res2.errors[0].message.contains("identical match criteria"));
+
+        // Still only one rule installed.
+        let res3 = schema
+            .execute(r#"{ rules(nodeId: "node-1") { id } }"#)
+            .await;
+        let data3 = res3.data.into_json().unwrap();
+        assert_eq!(data3["rules"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_create_rule_different_criteria_allowed() {
+        let h = make_harness().await;
+        register_auto_confirming_agent(&h, "node-1").await;
+        let schema = &h.schema;
+
+        let res = schema
+            .execute(
+                r#"mutation {
+                    createRule(input: {
+                        nodeId: "node-1"
+                        interfaceName: "eth0"
+                        direction: "ingress"
+                        srcCidr: "10.0.0.0/8"
+                        dstPort: 80
+                        protocol: "tcp"
+                        actionsJson: "[{\"action\":\"drop\",\"priority\":0}]"
+                    }) { id }
+                }"#,
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+
+        // Different destination port → not a duplicate.
+        let res2 = schema
+            .execute(
+                r#"mutation {
+                    createRule(input: {
+                        nodeId: "node-1"
+                        interfaceName: "eth0"
+                        direction: "ingress"
+                        srcCidr: "10.0.0.0/8"
+                        dstPort: 443
+                        protocol: "tcp"
+                        actionsJson: "[{\"action\":\"drop\",\"priority\":0}]"
+                    }) { id }
+                }"#,
+            )
+            .await;
+        assert!(res2.errors.is_empty(), "{:?}", res2.errors);
+
+        let res3 = schema
+            .execute(r#"{ rules(nodeId: "node-1") { id } }"#)
+            .await;
+        let data3 = res3.data.into_json().unwrap();
+        assert_eq!(data3["rules"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_create_rules_multi_node_duplicate_fails_wholesale() {
+        let h = make_harness().await;
+        register_auto_confirming_agent(&h, "node-a").await;
+        register_auto_confirming_agent(&h, "node-b").await;
+        let schema = &h.schema;
+
+        // Pre-create the rule on node-b only.
+        let res = schema
+            .execute(
+                r#"mutation {
+                    createRule(input: {
+                        nodeId: "node-b"
+                        interfaceName: "eth0"
+                        direction: "ingress"
+                        srcCidr: "10.0.0.0/8"
+                        dstPort: 80
+                        protocol: "tcp"
+                        actionsJson: "[{\"action\":\"drop\",\"priority\":0}]"
+                    }) { id }
+                }"#,
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+
+        // Multi-node create over [node-a, node-b]: node-b conflicts, so the
+        // whole batch must fail and node-a must get nothing.
+        let res2 = schema
+            .execute(
+                r#"mutation {
+                    createRulesMultiNode(input: {
+                        nodeIds: ["node-a", "node-b"]
+                        interfaceName: "eth0"
+                        direction: "ingress"
+                        srcCidr: "10.0.0.0/8"
+                        dstPort: 80
+                        protocol: "tcp"
+                        actionsJson: "[{\"action\":\"pass\",\"priority\":0}]"
+                    }) { id }
+                }"#,
+            )
+            .await;
+        assert!(!res2.errors.is_empty(), "batch should be rejected");
+        assert!(res2.errors[0].message.contains("node-b"));
+
+        // node-a must have no rule (nothing created).
+        let res3 = schema
+            .execute(r#"{ rules(nodeId: "node-a") { id } }"#)
+            .await;
+        let data3 = res3.data.into_json().unwrap();
+        assert!(data3["rules"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

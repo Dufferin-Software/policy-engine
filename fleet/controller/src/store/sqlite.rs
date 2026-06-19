@@ -1322,9 +1322,17 @@ mod tests {
         let (store, _dir) = temp_store().await;
         store.upsert_node(&sample_node("n1")).await.unwrap();
 
-        store.update_node_metrics_interval("n1", Some(15)).await.unwrap();
+        store
+            .update_node_metrics_interval("n1", Some(15))
+            .await
+            .unwrap();
         assert_eq!(
-            store.get_node("n1").await.unwrap().unwrap().metrics_interval_secs,
+            store
+                .get_node("n1")
+                .await
+                .unwrap()
+                .unwrap()
+                .metrics_interval_secs,
             Some(15)
         );
         // …and via the list path (different SELECT).
@@ -1332,9 +1340,17 @@ mod tests {
         assert_eq!(listed[0].metrics_interval_secs, Some(15));
 
         // Clearing the override reads back as None.
-        store.update_node_metrics_interval("n1", None).await.unwrap();
+        store
+            .update_node_metrics_interval("n1", None)
+            .await
+            .unwrap();
         assert_eq!(
-            store.get_node("n1").await.unwrap().unwrap().metrics_interval_secs,
+            store
+                .get_node("n1")
+                .await
+                .unwrap()
+                .unwrap()
+                .metrics_interval_secs,
             None
         );
     }

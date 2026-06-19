@@ -239,6 +239,16 @@ pub struct PolicyService {
     pub(crate) timer_tx: Option<tokio::sync::mpsc::Sender<QueueCmd>>,
 }
 
+/// The candidate rule's match data that lives *outside* the `L4Rule` struct:
+/// the already-normalized SNI pattern (lowercased, `*.` stripped for suffix
+/// matches) and the raw MAC filters. Used by the duplicate-detection helpers to
+/// compare against installed rules' SNI / MAC sidecar entries.
+struct CandidateMatch<'a> {
+    sni: Option<&'a str>,
+    src_mac: Option<[u8; 6]>,
+    dst_mac: Option<[u8; 6]>,
+}
+
 impl PolicyService {
     /// Create a new policy service with the given BPF operations implementation.
     ///
@@ -1364,6 +1374,13 @@ impl PolicyService {
             .map(|(a, p, params)| (*a, *p, *params))
             .collect();
 
+        // Candidate sidecar data (SNI pattern + MAC filters) for duplicate detection.
+        let candidate = CandidateMatch {
+            sni: sni_config.as_ref().map(|(_, p)| p.as_str()),
+            src_mac: params.src_mac,
+            dst_mac: params.dst_mac,
+        };
+
         match (&src_net, &dst_net) {
             (ipnetwork::IpNetwork::V4(s), ipnetwork::IpNetwork::V4(d)) => {
                 let src_key = SrcLpmKeyV4::new(params.ifindex, s.network(), s.prefix());
@@ -1379,6 +1396,19 @@ impl PolicyService {
                 };
                 rule.set_actions(&lpm_actions);
                 rule.set_mac_filter(params.src_mac, params.dst_mac);
+
+                if let Some(existing_id) = self.find_duplicate_rule_v4(
+                    &src_key,
+                    &dst_key,
+                    &rule,
+                    &candidate,
+                    params.direction,
+                )? {
+                    return Err(anyhow!(
+                        "A rule with identical match criteria already exists (rule {}) on this interface/direction",
+                        existing_id
+                    ));
+                }
 
                 self.bpf_ops
                     .add_policy_rule_v4(&src_key, &dst_key, &rule, params.direction)
@@ -1398,6 +1428,19 @@ impl PolicyService {
                 };
                 rule.set_actions(&lpm_actions);
                 rule.set_mac_filter(params.src_mac, params.dst_mac);
+
+                if let Some(existing_id) = self.find_duplicate_rule_v6(
+                    &src_key,
+                    &dst_key,
+                    &rule,
+                    &candidate,
+                    params.direction,
+                )? {
+                    return Err(anyhow!(
+                        "A rule with identical match criteria already exists (rule {}) on this interface/direction",
+                        existing_id
+                    ));
+                }
 
                 self.bpf_ops
                     .add_policy_rule_v6(&src_key, &dst_key, &rule, params.direction)
@@ -1447,6 +1490,115 @@ impl PolicyService {
         }
 
         Ok(rule_id)
+    }
+
+    /// Compare the match-relevant fields of a candidate rule against an
+    /// already-installed `existing` L4 rule (ports, protocol, QUIC version, and
+    /// the SNI / MAC sidecar entries). The L3 keys (ifindex + src/dst prefixes)
+    /// are compared by the callers. Returns `true` when both rules would match
+    /// identical traffic — i.e. they are duplicates.
+    ///
+    /// `new` carries the candidate's SNI pattern and MAC filters; sidecar entries
+    /// for the existing rule are read back via `lookup_sni_rule` / `lookup_mac_rule`.
+    fn l4_match_equal(
+        &self,
+        new_rule: &L4Rule,
+        new: &CandidateMatch,
+        existing: &L4Rule,
+        direction: Direction,
+    ) -> bool {
+        if new_rule.sport != existing.sport
+            || new_rule.dport != existing.dport
+            || new_rule.protocol != existing.protocol
+            || new_rule.quic_version != existing.quic_version
+            || new_rule.sni_match_type != existing.sni_match_type
+            || new_rule.mac_match_flags != existing.mac_match_flags
+        {
+            return false;
+        }
+
+        // Same SNI match *kind* — compare the actual patterns from the sidecar map.
+        if existing.sni_match_type != SNI_MATCH_NONE {
+            let existing_entry = match self.bpf_ops.lookup_sni_rule(existing.rule_id, direction) {
+                Ok(Some(e)) => e,
+                _ => return false,
+            };
+            let new_entry = SniRuleEntry::new(existing.sni_match_type, new.sni.unwrap_or(""));
+            if new_entry.as_bytes() != existing_entry.as_bytes() {
+                return false;
+            }
+        }
+
+        // Same MAC match flags — compare the actual addresses from the sidecar map.
+        if existing.mac_match_flags != 0 {
+            let existing_mac = match self.bpf_ops.lookup_mac_rule(existing.rule_id, direction) {
+                Ok(Some(m)) => m,
+                _ => return false,
+            };
+            if new.src_mac.unwrap_or([0u8; 6]) != existing_mac.src_mac
+                || new.dst_mac.unwrap_or([0u8; 6]) != existing_mac.dst_mac
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Return the rule_id of an already-installed IPv4 rule whose full match
+    /// criteria (interface, src/dst prefix, ports, protocol, SNI, QUIC, MAC) are
+    /// identical to the candidate, or `None` if no such rule exists. Rules with
+    /// the same `rule_id` as the candidate are skipped so restore and scheduled
+    /// re-activation never collide with themselves.
+    fn find_duplicate_rule_v4(
+        &self,
+        src_key: &SrcLpmKeyV4,
+        dst_key: &LpmKeyV4,
+        rule: &L4Rule,
+        new: &CandidateMatch,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        for (e_src, e_dst, e_rule) in self.bpf_ops.list_policy_rules_v4(direction)? {
+            if e_rule.rule_id == rule.rule_id {
+                continue;
+            }
+            if e_src.ifindex == src_key.ifindex
+                && e_src.prefixlen == src_key.prefixlen
+                && e_src.addr == src_key.addr
+                && e_dst.prefixlen == dst_key.prefixlen
+                && e_dst.addr == dst_key.addr
+                && self.l4_match_equal(rule, new, &e_rule, direction)
+            {
+                return Ok(Some(e_rule.rule_id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// IPv6 counterpart of [`find_duplicate_rule_v4`].
+    fn find_duplicate_rule_v6(
+        &self,
+        src_key: &SrcLpmKeyV6,
+        dst_key: &LpmKeyV6,
+        rule: &L4Rule,
+        new: &CandidateMatch,
+        direction: Direction,
+    ) -> Result<Option<u64>> {
+        for (e_src, e_dst, e_rule) in self.bpf_ops.list_policy_rules_v6(direction)? {
+            if e_rule.rule_id == rule.rule_id {
+                continue;
+            }
+            if e_src.ifindex == src_key.ifindex
+                && e_src.prefixlen == src_key.prefixlen
+                && e_src.addr == src_key.addr
+                && e_dst.prefixlen == dst_key.prefixlen
+                && e_dst.addr == dst_key.addr
+                && self.l4_match_equal(rule, new, &e_rule, direction)
+            {
+                return Ok(Some(e_rule.rule_id));
+            }
+        }
+        Ok(None)
     }
 
     /// Delete a policy rule by ID or source CIDR
@@ -2549,6 +2701,9 @@ mod tests {
                 })
                 .returning(|_, _, _, _| Ok(()));
 
+            mock.expect_list_policy_rules_v4().returning(|_| Ok(vec![]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
+
             let mut service = PolicyService::new(Box::new(mock));
 
             let params = AddRuleParams {
@@ -2589,6 +2744,9 @@ mod tests {
                 .times(1)
                 .withf(|_src_key, _dst_key, _rule, dir| *dir == Direction::Egress)
                 .returning(|_, _, _, _| Ok(()));
+
+            mock.expect_list_policy_rules_v4().returning(|_| Ok(vec![]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
 
             let mut service = PolicyService::new(Box::new(mock));
 
@@ -2740,6 +2898,9 @@ mod tests {
                 .withf(|_, _, rule, dir| rule.num_actions == 1 && *dir == Direction::Egress)
                 .returning(|_, _, _, _| Ok(()));
 
+            mock.expect_list_policy_rules_v4().returning(|_| Ok(vec![]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
+
             let mut service = PolicyService::new(Box::new(mock));
 
             let params = AddRuleParams {
@@ -2777,6 +2938,9 @@ mod tests {
                 .times(1)
                 .withf(|_, _, rule, _| rule.num_actions == 2)
                 .returning(|_, _, _, _| Ok(()));
+
+            mock.expect_list_policy_rules_v4().returning(|_| Ok(vec![]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
 
             let mut service = PolicyService::new(Box::new(mock));
 
@@ -2826,6 +2990,9 @@ mod tests {
                         && rule.protocol == libc::IPPROTO_UDP as u8
                 })
                 .returning(|_, _, _, _| Ok(()));
+
+            mock.expect_list_policy_rules_v4().returning(|_| Ok(vec![]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
 
             mock.expect_add_sni_rule()
                 .times(1)
@@ -2950,6 +3117,9 @@ mod tests {
                 .withf(|_, _, rule, _| rule.sni_match_type == crate::types::SNI_MATCH_EXACT)
                 .returning(|_, _, _, _| Ok(()));
 
+            mock.expect_list_policy_rules_v4().returning(|_| Ok(vec![]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
+
             mock.expect_add_sni_rule()
                 .times(1)
                 .withf(|_, sni_entry, _direction| {
@@ -2995,6 +3165,9 @@ mod tests {
                 .times(1)
                 .withf(|_, _, rule, _| rule.sni_match_type == crate::types::SNI_MATCH_EXACT)
                 .returning(|_, _, _, _| Ok(()));
+
+            mock.expect_list_policy_rules_v4().returning(|_| Ok(vec![]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
 
             mock.expect_add_sni_rule()
                 .times(1)
@@ -3505,6 +3678,9 @@ mod tests {
                 .times(1)
                 .returning(|_, _, _, _| Ok(()));
 
+            mock.expect_list_policy_rules_v4().returning(|_| Ok(vec![]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
+
             let mut service = PolicyService::new(Box::new(mock));
 
             let params = AddRuleParams {
@@ -3544,6 +3720,9 @@ mod tests {
                 .times(1)
                 .withf(move |_, _, rule, _| rule.protocol == IPPROTO_ICMPV6 as u8)
                 .returning(|_, _, _, _| Ok(()));
+
+            mock.expect_list_policy_rules_v4().returning(|_| Ok(vec![]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
 
             let mut service = PolicyService::new(Box::new(mock));
 
@@ -3658,6 +3837,9 @@ mod tests {
                 .times(1)
                 .returning(|_, _, _, _| Err(anyhow::anyhow!("BPF map full")));
 
+            mock.expect_list_policy_rules_v4().returning(|_| Ok(vec![]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
+
             let mut service = PolicyService::new(Box::new(mock));
 
             let params = AddRuleParams {
@@ -3687,6 +3869,236 @@ mod tests {
                 "Expected error about BPF map or add rule, got: {}",
                 err_msg
             );
+        }
+
+        // ── duplicate match-criteria rejection ───────────────────────────────
+
+        /// Build params for a baseline IPv4 TCP rule used by the duplicate tests.
+        fn dup_test_params(id: u64) -> AddRuleParams {
+            AddRuleParams {
+                ifindex: 0,
+                direction: Direction::Ingress,
+                id: Some(id),
+                src: Some("192.168.1.0/24".to_string()),
+                dst: Some("10.0.0.0/8".to_string()),
+                sport: 0,
+                dport: 80,
+                protocol: "tcp".to_string(),
+                actions: vec![(PolicyAction::Drop, 0, ActionParams::None)],
+                sni: None,
+                quic_version: 0,
+                src_mac: None,
+                dst_mac: None,
+                expires_after_secs: None,
+                schedule: None,
+            }
+        }
+
+        /// An installed IPv4 rule whose keys match `dup_test_params`.
+        fn dup_existing_v4(rule: L4Rule) -> (SrcLpmKeyV4, LpmKeyV4, L4Rule) {
+            let src = SrcLpmKeyV4::new(0, "192.168.1.0".parse::<Ipv4Addr>().unwrap(), 24);
+            let dst = LpmKeyV4::new("10.0.0.0".parse::<Ipv4Addr>().unwrap(), 8);
+            (src, dst, rule)
+        }
+
+        #[test]
+        fn test_add_duplicate_rule_rejected() {
+            let mut mock = create_mock_with_loaded_programs();
+            mock.expect_get_attached_interfaces()
+                .returning(|| vec![iface_attachment("eth0", 2, "native", "ingress")]);
+
+            let existing = dup_existing_v4(L4Rule {
+                dport: 80,
+                protocol: libc::IPPROTO_TCP as u8,
+                rule_id: 111,
+                num_actions: 1,
+                ..L4Rule::default()
+            });
+            mock.expect_list_policy_rules_v4()
+                .returning(move |_| Ok(vec![existing]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
+            // The duplicate must never be installed.
+            mock.expect_add_policy_rule_v4().times(0);
+
+            let mut service = PolicyService::new(Box::new(mock));
+            let result = service.add_rule(dup_test_params(222));
+
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("identical match criteria"),
+                "expected duplicate error, got: {msg}"
+            );
+            assert!(
+                msg.contains("111"),
+                "should name existing rule id, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn test_add_rule_different_port_allowed() {
+            let mut mock = create_mock_with_loaded_programs();
+            mock.expect_get_attached_interfaces()
+                .returning(|| vec![iface_attachment("eth0", 2, "native", "ingress")]);
+
+            // Existing rule matches everything except the destination port.
+            let existing = dup_existing_v4(L4Rule {
+                dport: 80,
+                protocol: libc::IPPROTO_TCP as u8,
+                rule_id: 111,
+                num_actions: 1,
+                ..L4Rule::default()
+            });
+            mock.expect_list_policy_rules_v4()
+                .returning(move |_| Ok(vec![existing]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
+            mock.expect_add_policy_rule_v4()
+                .times(1)
+                .returning(|_, _, _, _| Ok(()));
+
+            let mut service = PolicyService::new(Box::new(mock));
+            let mut params = dup_test_params(222);
+            params.dport = 443; // different port → not a duplicate
+            assert!(service.add_rule(params).is_ok());
+        }
+
+        #[test]
+        fn test_add_rule_same_l4_different_sni_allowed() {
+            let mut mock = create_mock_with_loaded_programs();
+            mock.expect_get_attached_interfaces()
+                .returning(|| vec![iface_attachment("eth0", 2, "native", "ingress")]);
+
+            let existing = dup_existing_v4(L4Rule {
+                dport: 443,
+                protocol: libc::IPPROTO_TCP as u8,
+                sni_match_type: crate::types::SNI_MATCH_EXACT,
+                rule_id: 111,
+                num_actions: 1,
+                ..L4Rule::default()
+            });
+            mock.expect_list_policy_rules_v4()
+                .returning(move |_| Ok(vec![existing]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
+            // Existing rule's SNI pattern differs from the new one.
+            mock.expect_lookup_sni_rule().returning(|_, _| {
+                Ok(Some(SniRuleEntry::new(
+                    crate::types::SNI_MATCH_EXACT,
+                    "example.com",
+                )))
+            });
+            mock.expect_add_policy_rule_v4()
+                .times(1)
+                .returning(|_, _, _, _| Ok(()));
+            mock.expect_add_sni_rule()
+                .times(1)
+                .returning(|_, _, _| Ok(()));
+
+            let mut service = PolicyService::new(Box::new(mock));
+            let mut params = dup_test_params(222);
+            params.dport = 443;
+            params.sni = Some("other.com".to_string());
+            assert!(service.add_rule(params).is_ok());
+        }
+
+        #[test]
+        fn test_add_rule_same_sni_pattern_rejected() {
+            let mut mock = create_mock_with_loaded_programs();
+            mock.expect_get_attached_interfaces()
+                .returning(|| vec![iface_attachment("eth0", 2, "native", "ingress")]);
+
+            let existing = dup_existing_v4(L4Rule {
+                dport: 443,
+                protocol: libc::IPPROTO_TCP as u8,
+                sni_match_type: crate::types::SNI_MATCH_EXACT,
+                rule_id: 111,
+                num_actions: 1,
+                ..L4Rule::default()
+            });
+            mock.expect_list_policy_rules_v4()
+                .returning(move |_| Ok(vec![existing]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
+            mock.expect_lookup_sni_rule().returning(|_, _| {
+                Ok(Some(SniRuleEntry::new(
+                    crate::types::SNI_MATCH_EXACT,
+                    "example.com",
+                )))
+            });
+            mock.expect_add_policy_rule_v4().times(0);
+
+            let mut service = PolicyService::new(Box::new(mock));
+            let mut params = dup_test_params(222);
+            params.dport = 443;
+            params.sni = Some("example.com".to_string()); // identical SNI → duplicate
+            let result = service.add_rule(params);
+            assert!(result.is_err());
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("identical match criteria"));
+        }
+
+        #[test]
+        fn test_add_rule_same_l4_different_mac_allowed() {
+            let mut mock = create_mock_with_loaded_programs();
+            mock.expect_get_attached_interfaces()
+                .returning(|| vec![iface_attachment("eth0", 2, "native", "ingress")]);
+
+            let existing = dup_existing_v4(L4Rule {
+                dport: 80,
+                protocol: libc::IPPROTO_TCP as u8,
+                mac_match_flags: crate::types::MAC_MATCH_SRC,
+                rule_id: 111,
+                num_actions: 1,
+                ..L4Rule::default()
+            });
+            mock.expect_list_policy_rules_v4()
+                .returning(move |_| Ok(vec![existing]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
+            mock.expect_lookup_mac_rule().returning(|_, _| {
+                Ok(Some(MacRuleEntry {
+                    src_mac: [0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA],
+                    dst_mac: [0u8; 6],
+                }))
+            });
+            mock.expect_add_policy_rule_v4()
+                .times(1)
+                .returning(|_, _, _, _| Ok(()));
+            mock.expect_add_mac_rule()
+                .times(1)
+                .returning(|_, _, _| Ok(()));
+
+            let mut service = PolicyService::new(Box::new(mock));
+            let mut params = dup_test_params(222);
+            // Same L4 tuple, but a different source MAC → not a duplicate.
+            params.src_mac = Some([0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB]);
+            assert!(service.add_rule(params).is_ok());
+        }
+
+        #[test]
+        fn test_add_rule_same_id_not_self_duplicate() {
+            // Restore / scheduler re-activation re-adds a rule with the same id;
+            // the existing entry with that id must not count as a duplicate.
+            let mut mock = create_mock_with_loaded_programs();
+            mock.expect_get_attached_interfaces()
+                .returning(|| vec![iface_attachment("eth0", 2, "native", "ingress")]);
+
+            let existing = dup_existing_v4(L4Rule {
+                dport: 80,
+                protocol: libc::IPPROTO_TCP as u8,
+                rule_id: 222,
+                num_actions: 1,
+                ..L4Rule::default()
+            });
+            mock.expect_list_policy_rules_v4()
+                .returning(move |_| Ok(vec![existing]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
+            mock.expect_add_policy_rule_v4()
+                .times(1)
+                .returning(|_, _, _, _| Ok(()));
+
+            let mut service = PolicyService::new(Box::new(mock));
+            // Same id (222) as the installed rule → allowed.
+            assert!(service.add_rule(dup_test_params(222)).is_ok());
         }
 
         #[test]
@@ -3960,6 +4372,9 @@ mod tests {
                 .returning(|_, _, _, _| Ok(()));
             mock.expect_flush_sni_rules().returning(|_| Ok(()));
             mock.expect_flush_mac_rules().returning(|_| Ok(()));
+            // Duplicate-match check lists existing rules before each install.
+            mock.expect_list_policy_rules_v4().returning(|_| Ok(vec![]));
+            mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
             mock
         }
 
