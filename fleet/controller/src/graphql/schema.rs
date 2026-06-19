@@ -1116,7 +1116,7 @@ impl MutationRoot {
                 dst_mac: input.dst_mac.clone(),
                 actions_json: input.actions_json.clone(),
                 created_at: Utc::now(),
-                created_by: Some("operator".to_string()),
+                created_by: Some(principal.actor.clone()),
                 expires_after_secs: input.expires_after_secs,
                 schedule_json: input.schedule_json.clone(),
             };
@@ -1177,7 +1177,7 @@ impl MutationRoot {
             dst_mac: input.dst_mac,
             actions_json: input.actions_json,
             created_at: Utc::now(),
-            created_by: Some("operator".to_string()),
+            created_by: Some(principal.actor.clone()),
             expires_after_secs: input.expires_after_secs,
             schedule_json: input.schedule_json,
         };
@@ -1342,7 +1342,7 @@ impl MutationRoot {
             Ok(()) => {
                 store
                     .append_audit(NewAuditEntry {
-                        operator: Some("operator".to_string()),
+                        operator: Some(principal.actor.clone()),
                         action: "interface_tagged".to_string(),
                         node_id: Some(node_id.0.clone()),
                         detail: Some(format!("iface={} tag={}", interface_name, tag)),
@@ -1420,7 +1420,7 @@ impl MutationRoot {
         if sessions.push(&node_id.0, msg).await {
             store
                 .append_audit(NewAuditEntry {
-                    operator: Some("operator".to_string()),
+                    operator: Some(principal.actor.clone()),
                     action: "config_pushed".to_string(),
                     node_id: Some(node_id.0.clone()),
                     detail: Some(format!("{} rules", rules.len())),
@@ -1524,7 +1524,7 @@ impl MutationRoot {
         let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
         store
             .append_audit(NewAuditEntry {
-                operator: Some("operator".to_string()),
+                operator: Some(principal.actor.clone()),
                 action,
                 node_id: node_id.map(|id| id.0),
                 detail,
@@ -2359,7 +2359,7 @@ mod tests {
                         protocol: "tcp"
                         actionsJson: "[{\"action\":\"drop\",\"priority\":0}]"
                     }) {
-                        id nodeId interfaceName direction srcCidr dstPort protocol
+                        id nodeId interfaceName direction srcCidr dstPort protocol createdBy
                     }
                 }"#,
             )
@@ -2369,6 +2369,8 @@ mod tests {
         assert_eq!(data["createRule"]["nodeId"], "node-1");
         assert_eq!(data["createRule"]["interfaceName"], "eth0");
         assert_eq!(data["createRule"]["direction"], "ingress");
+        // created_by records the authenticated principal, not a placeholder.
+        assert_eq!(data["createRule"]["createdBy"], "operator:test-admin");
 
         // Query rules for node
         let res2 = schema

@@ -93,6 +93,12 @@ pub struct Principal {
     /// `audit_log.tenant_id`, `nodes.tenant_id` — store the slug instead of
     /// the FK. Populated by [`RbacStore::resolve`] from the `tenants` row.
     pub tenant_slug: String,
+    /// Human-readable identity of the caller, for audit attribution.
+    /// `operator:<username>` for a session token tied to an operator account,
+    /// `token:<name>` for a static API token, or `token:<id>` as a last
+    /// resort if the token row can't be named. Resolved once in
+    /// [`RbacStore::resolve`]; never the bare literal `"operator"`.
+    pub actor: String,
     permissions: HashSet<Permission>,
     pub scopes: Vec<TokenScope>,
 }
@@ -112,6 +118,7 @@ impl Principal {
             operator_id: None,
             tenant_id: 1,
             tenant_slug: "default".to_string(),
+            actor: "token:test".to_string(),
             permissions,
             scopes: Vec::new(),
         }
@@ -126,6 +133,7 @@ impl Principal {
             operator_id: None,
             tenant_id: 1,
             tenant_slug: "default".to_string(),
+            actor: "operator:test-admin".to_string(),
             permissions: perms,
             scopes: Vec::new(),
         }
@@ -219,11 +227,39 @@ impl RbacStore {
             .await
             .with_context(|| format!("load tenant slug for id {tenant_id}"))?;
 
+        // Human-readable identity for audit attribution. Prefer the operator
+        // account behind a session token; fall back to the static token's
+        // name, then its id.
+        let actor = if let Some(op_id) = operator_id {
+            let username: Option<String> =
+                sqlx::query_scalar("SELECT username FROM operators WHERE id = ?")
+                    .bind(op_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .context("load operator username")?;
+            match username {
+                Some(name) => format!("operator:{name}"),
+                None => format!("operator:{op_id}"),
+            }
+        } else {
+            let token_name: Option<String> =
+                sqlx::query_scalar("SELECT name FROM api_tokens WHERE id = ?")
+                    .bind(token_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .context("load api token name")?;
+            match token_name {
+                Some(name) => format!("token:{name}"),
+                None => format!("token:{token_id}"),
+            }
+        };
+
         Ok(Principal {
             token_id,
             operator_id,
             tenant_id,
             tenant_slug,
+            actor,
             permissions,
             scopes,
         })
@@ -930,6 +966,42 @@ mod tests {
             .unwrap();
         let principal = store.resolve(tok_id, Some(op_id), 1).await.unwrap();
         assert!(!principal.allows(&Permission::new("rule:write")));
+    }
+
+    #[tokio::test]
+    async fn actor_names_operator_and_static_token() {
+        let p = pool().await;
+        let store = RbacStore::new(p.clone());
+
+        // Static token resolves to `token:<name>`.
+        let static_id: i64 = sqlx::query_scalar(
+            "INSERT INTO api_tokens (name, token_hash, kind, created_at) \
+             VALUES ('grafana-prod', X'10', 'static', 0) RETURNING id",
+        )
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        let principal = store.resolve(static_id, None, 1).await.unwrap();
+        assert_eq!(principal.actor, "token:grafana-prod");
+
+        // Session token tied to an operator resolves to `operator:<username>`.
+        let op_id: i64 = sqlx::query_scalar(
+            "INSERT INTO operators (username, password_hash, created_at) \
+             VALUES ('alice', 'x', 0) RETURNING id",
+        )
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        let session_id: i64 = sqlx::query_scalar(
+            "INSERT INTO api_tokens (name, token_hash, kind, created_at, operator_id) \
+             VALUES ('session:alice', X'11', 'session', 0, ?) RETURNING id",
+        )
+        .bind(op_id)
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        let principal = store.resolve(session_id, Some(op_id), 1).await.unwrap();
+        assert_eq!(principal.actor, "operator:alice");
     }
 
     #[tokio::test]

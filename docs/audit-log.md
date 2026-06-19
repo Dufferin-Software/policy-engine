@@ -1,9 +1,28 @@
 # Audit Log
 
+The system keeps **two independent audit trails**, depending on which surface a
+change is made through:
+
+| Audit log | Where it lives | Records | Backing store |
+|---|---|---|---|
+| [policy-engine (standalone)](#policy-engine-standalone) | Each enforcement node | GraphQL **mutations** against the local engine API | NDJSON file + in-memory ring buffer |
+| [policy-controller (fleet)](#policy-controller-fleet) | The central controller | Operator API actions + fleet lifecycle events (enrollment, certs, config push, ZTP tokens) | SQLite `audit_log` table |
+
+They do not overlap: the engine log captures direct, node-local API changes;
+the controller log captures fleet-management actions. A node managed by a
+controller still writes its own engine-side audit log for any mutation that
+reaches its local API (including those pushed by the agent).
+
+Both satisfy the tamper-evidence requirements of PCI-DSS, SOC 2 Type II, and
+similar frameworks.
+
+---
+
+# policy-engine (standalone)
+
 policy-engine writes an append-only audit log that records every mutation
 executed against the GraphQL API — who called it, what they sent, and whether
-it succeeded.  This satisfies the tamper-evidence requirements of PCI-DSS,
-SOC 2 Type II, and similar frameworks.
+it succeeded.
 
 ## Log file location
 
@@ -116,27 +135,6 @@ real-time review in the GraphQL Playground or from a monitoring script, but is
 **not a substitute for the on-disk log** — the ring buffer is lost on daemon
 restart.
 
-### Tenant scoping (controller)
-
-Controller-side `audit_log` rows carry a `tenant_id` slug and the
-`auditLog` resolver filters by `principal.tenant_slug` — operators
-only see their own tenant's audit history.
-
-`NewAuditEntry.tenant_id: Option<String>` resolves at write time in
-this order:
-
-1. **Explicit slug** — passed by principal-aware resolvers (IAM, enrollment
-   mints, the few resolvers that have `principal.tenant_slug` in scope).
-2. **Derived from `node_id`** — when the audit entry is node-scoped and
-   no explicit slug was passed, the store reads `nodes.tenant_id` and
-   attaches it. Covers approve, decommission, reconciliation, and the
-   gRPC management surface without forcing every call site to thread
-   tenant context down.
-3. **Fallback to `'default'`** — when neither is available (token
-   reaper, retention sweep, other background tasks). Safe for
-   single-tenant installs; in multi-tenant deployments these rows are
-   visible only to the default tenant's auditors.
-
 ## Persistence
 
 > **Current status**: the audit log file at `/var/log/policy-engine/audit.log`
@@ -248,3 +246,159 @@ changes:
   | json
   | operation =~ "attach_ingress|detach_ingress|attach_tc|detach_tc|detach_all"
 ```
+
+---
+
+# policy-controller (fleet)
+
+The controller records fleet-management actions — operator API mutations and
+agent/system lifecycle events — to the `audit_log` table in its SQLite database
+(`/var/lib/policy-controller/controller.db`). Unlike the engine's NDJSON file,
+this log is queried through the controller's operator API and is **RBAC-gated
+and tenant-scoped**.
+
+## Storage and schema
+
+Schema lives in `fleet/controller/migrations/0001_initial.sql`:
+
+```sql
+CREATE TABLE audit_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        INTEGER NOT NULL,          -- unix epoch seconds (UTC)
+    operator  TEXT,                       -- who/what initiated; NULL = system/agent
+    action    TEXT NOT NULL,              -- action name (snake_case)
+    node_id   TEXT,                       -- target node, when node-scoped
+    detail    TEXT,                       -- free-form context string
+    tenant_id TEXT NOT NULL DEFAULT 'default'
+);
+
+CREATE INDEX idx_audit_log_ts   ON audit_log(ts);
+CREATE INDEX idx_audit_log_node ON audit_log(node_id);
+```
+
+In code the rows map to `store::AuditEntry`, written via
+`ControllerStore::append_audit(NewAuditEntry)` and read via
+`ControllerStore::list_audit(...)`. Both the SQLite and in-memory store
+implementations behave identically (the in-memory one is used by tests).
+
+### The `operator` field
+
+`operator` records who initiated the action:
+
+| Value | Meaning |
+|---|---|
+| `operator:<username>` | A session token tied to an operator account. Written by the GraphQL operator mutations (`interface_tagged`, `config_pushed`, client-logged entries), which now record the authenticated principal's identity via `principal.actor`. |
+| `token:<name>` | A static API token (e.g. `token:grafana-prod`); falls back to `token:<id>` if the token row can't be named. |
+| Operator username (bare) | Set by node-registry actions that thread the caller through directly (enrollment approve/reject, labelling, decommission, token mint/revoke). |
+| `"ztp-bootstrap"` | A node auto-redeeming a ZTP enrollment token. |
+| `NULL` | System- or agent-originated events (enrollment submission, cert renewal, config-apply results, watchdog reaps, revoked-cert rejections, local-change detection). |
+
+The `principal.actor` identity is resolved once in `RbacStore::resolve`:
+`operator:<username>` for a session token (looked up from `operators.username`),
+otherwise `token:<name>` from `api_tokens.name`.
+
+## What is logged
+
+Each row is one `action` with a free-form `detail` string. Actions by origin:
+
+### Operator API actions
+
+| `action` | Trigger | `detail` |
+|---|---|---|
+| `enrollment_approved` | Operator approves a pending enrollment | `label=<l>` (if set) |
+| `enrollment_rejected` | Operator rejects a pending enrollment | `reason=<r>` (if given) |
+| `node_labelled` | Operator sets a node's label | `label=<l>` |
+| `node_decommissioned` | Operator decommissions a node | _(none)_ |
+| `node_removed` | Operator deletes a node record | _(none)_ |
+| `interface_tagged` | Operator tags a node interface | `iface=<i> tag=<t>` |
+| `config_pushed` | Operator pushes a ruleset to a node | `<N> rules` |
+| `enrollment_token_created` | Operator mints a ZTP bootstrap token | `token_id=<id> max_uses=<n> expires_at=<ts>` |
+| `enrollment_token_revoked` | Operator revokes a ZTP token | `token_id=<id>` |
+
+### Agent / system lifecycle events
+
+| `action` | Trigger | `detail` |
+|---|---|---|
+| `enrollment_submitted` | A node submits an enrollment request | `enrollment_id=<id>` |
+| `enrollment_token_redeemed` | A node auto-redeems a valid ZTP token | `token_id=<id> tenant_id=<t>` |
+| `enrollment_token_rejected` | A token redemption fails (invalid/expired/exhausted) | `token_id=<id> outcome=<o>` |
+| `cert_renewed` | Agent renews its mTLS client cert on the management channel | `old_serial=<hex>` |
+| `revoked_cert_reject` | A revoked client cert was presented on the management channel and rejected | `serial=<hex>` |
+| `config_applied` / `config_apply_failed` | Agent reports the result of a `ConfigPush` | `error=<msg>` on failure |
+| `config_applied`, `config_commit_failed`, `config_rejected`, `config_reverted`, `config_abandoned` | Confirm-and-rollback lifecycle for a pushed config generation (see [config-confirm-and-rollback.md](config-confirm-and-rollback.md)) | `generation_id=<id>` |
+| `config_abandoned` | Watchdog reaps an unconfirmed config generation that timed out | `generation_id=<id>` |
+| `local_change_detected` | Agent reports an out-of-band local change on the node | `source=<s> added=<n> updated=<n> deleted=<n> …` |
+
+### Client-logged entries
+
+The `logAuditEntry` mutation (guarded by `audit:write`) lets a client record an
+arbitrary entry — e.g. the agent noting that events were exported. The caller
+supplies `action` and `detail` directly; `node_id` is optional.
+
+## Tenant scoping
+
+Every row carries a `tenant_id` slug, and the `auditLog` reader filters by the
+caller's `principal.tenant_slug` — operators only ever see their own tenant's
+audit history.
+
+`NewAuditEntry.tenant_id: Option<String>` resolves at write time, in this
+order (`append_audit` does the resolution as a single SQL `COALESCE`):
+
+1. **Explicit slug** — passed by principal-aware resolvers (IAM, enrollment
+   token mint/revoke, the operator GraphQL mutations). These should always
+   supply it so the row can't fall back to `'default'`.
+2. **Derived from `node_id`** — when the entry is node-scoped and no explicit
+   slug was passed, the store reads `nodes.tenant_id` and attaches it. Covers
+   approve, decommission, reconciliation, and the gRPC management surface
+   without forcing every call site to thread tenant context down. (If the node
+   row is missing — e.g. a race with decommission — the `COALESCE` picks the
+   literal default.)
+3. **Fallback to `'default'`** — when neither is available (token reaper, other
+   background tasks). Safe for single-tenant installs; in multi-tenant
+   deployments these rows are visible only to the default tenant's auditors.
+
+## Access control (RBAC)
+
+Reading and writing the controller audit log is gated by permissions:
+
+| Permission | Guards | Held by built-in roles |
+|---|---|---|
+| `audit:read` | the `auditLog` query | `operator`, `viewer`, `security-admin`, `auditor` (and `admin` via `*:*`) |
+| `audit:write` | the `logAuditEntry` mutation | only `admin` (`*:*`); grant explicitly to service tokens that need it |
+
+## Querying via GraphQL
+
+```graphql
+{
+  auditLog(limit: 50, offset: 0) {
+    id
+    ts
+    operator
+    action
+    nodeId
+    detail
+  }
+}
+```
+
+- Results are **newest-first** (`ORDER BY id DESC`).
+- `limit` defaults to 50 and is clamped to `[1, 500]`; `offset` defaults to 0
+  (use it to page back through history).
+- Results are automatically restricted to the caller's tenant. `tenant_id` is
+  stored on every row but not surfaced on the output type, since readers are
+  already tenant-scoped.
+
+The same query is available from the controller CLI:
+
+```bash
+policy-controller-client audit list --limit 50 --offset 0
+```
+
+## Persistence and retention
+
+Rows live in the controller's SQLite database and survive restarts. There is
+**no automatic pruning or rotation** — the table grows unbounded. For long-lived
+deployments, back up `controller.db` as part of normal database backups and, if
+needed, archive and trim old rows out of band (e.g. a scheduled
+`DELETE FROM audit_log WHERE ts < ?` against a maintenance copy). Automatic
+retention is planned for a future release.
