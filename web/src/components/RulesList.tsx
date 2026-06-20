@@ -373,10 +373,12 @@ export function RulesList() {
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
 
   // Interfaces attached in the active direction — used to populate the form dropdown.
+  // The backend reports direction as a lowercase string ("ingress"/"egress"),
+  // while activeDirection is uppercase, so compare case-insensitively.
   const availableInterfaces = Array.from(
     new Set(
       (interfacesData?.interfaces ?? [])
-        .filter((i) => i.direction === activeDirection)
+        .filter((i) => i.direction.toUpperCase() === activeDirection)
         .map((i) => i.interface),
     ),
   )
