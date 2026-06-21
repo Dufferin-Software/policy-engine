@@ -62,6 +62,41 @@ pub fn parse_counter(text: &str, metric_name: &str, labels: &[(&str, &str)]) -> 
     None
 }
 
+/// Sum every counter line matching `metric_name`, regardless of its label set.
+///
+/// Used for fleet-wide rollups where per-label breakdowns (interface,
+/// direction, …) are collapsed into a single total.  Lines whose value cannot
+/// be parsed as `u64` are skipped.  Returns `0` when nothing matches.
+pub fn sum_counter(text: &str, metric_name: &str) -> u64 {
+    let mut total: u64 = 0;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let (name, value_part) = if let Some(brace) = line.find('{') {
+            let Some(close) = line.find('}') else {
+                continue;
+            };
+            (&line[..brace], line[close + 1..].trim())
+        } else {
+            let mut parts = line.splitn(2, ' ');
+            (parts.next().unwrap_or(""), parts.next().unwrap_or(""))
+        };
+        if name != metric_name {
+            continue;
+        }
+        if let Some(v) = value_part
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            total = total.saturating_add(v);
+        }
+    }
+    total
+}
+
 /// Rewrite every Prometheus data line to include `node_id` and optionally
 /// `hostname` labels.
 ///
@@ -393,6 +428,32 @@ policy_engine_rule_bytes_total{rule_id="1745000000000001",direction="ingress"} 8
             out,
             "simple_counter{node_id=\"n1\",hostname=\"host1\"} 42\n"
         );
+    }
+
+    #[test]
+    fn test_sum_counter_across_labels() {
+        // Two interface/direction series for the same metric must be summed.
+        assert_eq!(
+            sum_counter(SAMPLE, "policy_engine_policy_drops_total"),
+            42 + 7
+        );
+    }
+
+    #[test]
+    fn test_sum_counter_label_less() {
+        let text = "simple_counter 5\nsimple_counter 7\n";
+        assert_eq!(sum_counter(text, "simple_counter"), 12);
+    }
+
+    #[test]
+    fn test_sum_counter_missing_is_zero() {
+        assert_eq!(sum_counter(SAMPLE, "no_such_metric"), 0);
+    }
+
+    #[test]
+    fn test_sum_counter_ignores_unparsable() {
+        let text = "m{a=\"1\"} 10\nm{a=\"2\"} notanumber\nm{a=\"3\"} 5\n";
+        assert_eq!(sum_counter(text, "m"), 15);
     }
 
     #[test]

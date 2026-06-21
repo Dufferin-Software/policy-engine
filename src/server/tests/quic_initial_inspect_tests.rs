@@ -155,11 +155,13 @@ fn match_sni_rules_finds_drop_action_via_mock_bpf() {
 
     // Build one UDP rule with SNI matching.  The pattern is "blocked.example"
     // (exact); action is DROP.
-    let mut rule = L4Rule::default();
-    rule.rule_id = 42;
-    rule.protocol = libc::IPPROTO_UDP as u8;
-    rule.sni_match_type = SNI_MATCH_EXACT;
-    rule.num_actions = 1;
+    let mut rule = L4Rule {
+        rule_id: 42,
+        protocol: libc::IPPROTO_UDP as u8,
+        sni_match_type: SNI_MATCH_EXACT,
+        num_actions: 1,
+        ..Default::default()
+    };
     rule.actions[0].action = PolicyAction::Drop as u32;
 
     mock.expect_list_policy_rules_v4()
@@ -207,11 +209,13 @@ fn match_sni_rules_finds_drop_action_via_mock_bpf() {
 fn match_sni_rules_returns_full_action_list_log_then_drop() {
     let mut mock = MockBpfOperations::new();
 
-    let mut rule = L4Rule::default();
-    rule.rule_id = 99;
-    rule.protocol = libc::IPPROTO_UDP as u8;
-    rule.sni_match_type = SNI_MATCH_EXACT;
-    rule.num_actions = 2;
+    let mut rule = L4Rule {
+        rule_id: 99,
+        protocol: libc::IPPROTO_UDP as u8,
+        sni_match_type: SNI_MATCH_EXACT,
+        num_actions: 2,
+        ..Default::default()
+    };
     rule.actions[0].action = PolicyAction::Log as u32;
     rule.actions[0].param = 0; // no rate-limit
     rule.actions[1].action = PolicyAction::Drop as u32;
@@ -257,11 +261,13 @@ fn match_sni_rules_returns_full_action_list_log_then_drop() {
 fn match_sni_rules_returns_none_on_miss() {
     let mut mock = MockBpfOperations::new();
 
-    let mut rule = L4Rule::default();
-    rule.rule_id = 7;
-    rule.protocol = libc::IPPROTO_UDP as u8;
-    rule.sni_match_type = SNI_MATCH_EXACT;
-    rule.num_actions = 1;
+    let mut rule = L4Rule {
+        rule_id: 7,
+        protocol: libc::IPPROTO_UDP as u8,
+        sni_match_type: SNI_MATCH_EXACT,
+        num_actions: 1,
+        ..Default::default()
+    };
     rule.actions[0].action = PolicyAction::Drop as u32;
 
     mock.expect_list_policy_rules_v4().returning(move |_| {
@@ -299,11 +305,13 @@ fn match_sni_rules_returns_none_on_miss() {
 fn match_sni_rules_ignores_non_udp_rules() {
     let mut mock = MockBpfOperations::new();
 
-    let mut tcp_rule = L4Rule::default();
-    tcp_rule.rule_id = 5;
-    tcp_rule.protocol = libc::IPPROTO_TCP as u8;
-    tcp_rule.sni_match_type = SNI_MATCH_EXACT;
-    tcp_rule.num_actions = 1;
+    let mut tcp_rule = L4Rule {
+        rule_id: 5,
+        protocol: libc::IPPROTO_TCP as u8,
+        sni_match_type: SNI_MATCH_EXACT,
+        num_actions: 1,
+        ..Default::default()
+    };
     tcp_rule.actions[0].action = PolicyAction::Drop as u32;
 
     mock.expect_list_policy_rules_v4().returning(move |_| {

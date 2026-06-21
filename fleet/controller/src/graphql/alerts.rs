@@ -464,7 +464,7 @@ pub async fn resolve_delete_silence(ctx: &Context<'_>, id: ID) -> Result<bool> {
 // wired into the GraphQL surface — operators never write history directly.
 #[allow(dead_code)]
 pub async fn append_history_internal(scope: &TenantScope, entry: NewAlertHistory) -> Result<i64> {
-    AlertStore::new(&scope)
+    AlertStore::new(scope)
         .append_history(entry)
         .await
         .map_err(|e| async_graphql::Error::new(format!("{e:#}")))

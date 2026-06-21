@@ -54,7 +54,7 @@ export default function MonitoringSetup({ onClose }: Props) {
     <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
       <div className="bg-gray-900 rounded-lg border border-gray-600 p-5 w-full max-w-2xl max-h-[90vh] overflow-y-auto space-y-4">
         <div className="flex items-center justify-between">
-          <h3 className="text-base font-bold text-white">Prometheus Setup</h3>
+          <h3 className="text-base font-bold text-gray-50">Prometheus Setup</h3>
           <button onClick={onClose} className="text-sm text-gray-500 hover:text-gray-300">
             Close
           </button>

@@ -365,6 +365,40 @@ pub struct NodeInterfaceStatsOutput {
     pub fib_fallback_packets: u64,
 }
 
+/// Fleet-wide rollup of dataplane counters, summed across the most-recent
+/// Prometheus snapshot of every node in the caller's tenant.
+///
+/// All values are monotonic counter totals (not rates).  Clients compute
+/// per-second rates by sampling this query over time and dividing the delta
+/// by the elapsed wall-clock interval.
+#[derive(SimpleObject, Clone, Default)]
+pub struct FleetMetricsOutput {
+    /// Number of nodes that have reported at least one metrics snapshot and
+    /// are included in these totals.
+    pub nodes_reporting: i32,
+    /// Total nodes in the tenant (denominator for coverage).
+    pub nodes_total: i32,
+    // Traffic
+    pub rx_packets: u64,
+    pub rx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_bytes: u64,
+    // Policy
+    pub policy_matches: u64,
+    pub policy_pass: u64,
+    pub policy_drops: u64,
+    pub policy_redirects: u64,
+    // Verdicts
+    pub verdict_pass_packets: u64,
+    pub verdict_pass_bytes: u64,
+    pub verdict_drop_packets: u64,
+    pub verdict_drop_bytes: u64,
+    // Processing health
+    pub parse_errors: u64,
+    pub fragments: u64,
+    pub inspect_redirects: u64,
+}
+
 /// Ethertype traffic breakdown from the node's most-recent Prometheus snapshot.
 #[derive(SimpleObject, Clone)]
 pub struct NodeEthertypeStatOutput {
@@ -724,6 +758,49 @@ impl QueryRoot {
         Ok(sessions.online_nodes(&principal.tenant_slug))
     }
 
+    /// Fleet-wide dataplane counter rollup, summed across the most-recent
+    /// metrics snapshot of every node in the caller's tenant. Counters are
+    /// totals; clients derive per-second rates by sampling over time.
+    #[graphql(guard = "Require::new(\"node:read\")")]
+    async fn fleet_metrics(&self, ctx: &Context<'_>) -> Result<FleetMetricsOutput> {
+        let registry = ctx.data::<Arc<NodeRegistry>>()?;
+        let metrics_store = ctx.data::<Arc<MetricsStore>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+
+        let nodes = registry
+            .list_nodes(Some(&principal.tenant_slug), None)
+            .await?;
+
+        let mut agg = FleetMetricsOutput {
+            nodes_total: nodes.len() as i32,
+            ..Default::default()
+        };
+        for node in &nodes {
+            let Some(bytes) = metrics_store.get(&node.id) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            let sum = |m: &str| metrics_parser::sum_counter(&text, m);
+            agg.nodes_reporting += 1;
+            agg.rx_packets += sum("policy_engine_rx_packets_total");
+            agg.rx_bytes += sum("policy_engine_rx_bytes_total");
+            agg.tx_packets += sum("policy_engine_tx_packets_total");
+            agg.tx_bytes += sum("policy_engine_tx_bytes_total");
+            agg.policy_matches += sum("policy_engine_policy_matches_total");
+            agg.policy_pass += sum("policy_engine_policy_pass_total");
+            agg.policy_drops += sum("policy_engine_policy_drops_total");
+            agg.policy_redirects += sum("policy_engine_policy_redirects_total");
+            agg.verdict_pass_packets += sum("policy_engine_verdict_pass_packets_total");
+            agg.verdict_pass_bytes += sum("policy_engine_verdict_pass_bytes_total");
+            agg.verdict_drop_packets += sum("policy_engine_verdict_drop_packets_total");
+            agg.verdict_drop_bytes += sum("policy_engine_verdict_drop_bytes_total");
+            agg.parse_errors += sum("policy_engine_parse_errors_total");
+            agg.fragments += sum("policy_engine_fragments_total");
+            agg.inspect_redirects += sum("policy_engine_inspect_redirects_total");
+        }
+        Ok(agg)
+    }
+
     /// The in-flight (unacknowledged) config generation for a node, if any.
     ///
     /// While non-null, further config mutations targeting this node will be
@@ -1005,6 +1082,9 @@ impl MutationRoot {
     ///
     /// `enrollmentUrl` and `controllerUrl` are embedded in the bundle so the
     /// agent does not need any pre-existing config beyond receiving the bundle.
+    // Each parameter is a distinct GraphQL field argument, so they cannot be
+    // bundled into a struct without changing the public schema.
+    #[allow(clippy::too_many_arguments)]
     #[graphql(guard = "Require::new(\"enrollment:write\")")]
     async fn create_enrollment_token(
         &self,
@@ -2367,6 +2447,7 @@ mod tests {
         store: Arc<dyn ControllerStore>,
         sessions: Arc<NodeSessionManager>,
         pending: Arc<PendingRegistry>,
+        metrics_store: Arc<MetricsStore>,
     }
 
     async fn make_harness() -> TestHarness {
@@ -2408,7 +2489,7 @@ mod tests {
             Arc::clone(&store),
             Arc::clone(&sessions),
             Arc::clone(&pending),
-            metrics_store,
+            Arc::clone(&metrics_store),
             Arc::new(crate::rule_lifecycle_bus::RuleLifecycleBus::new()),
             tenant_scope,
             Arc::new(AlertRuleBus::new()),
@@ -2425,6 +2506,7 @@ mod tests {
             store,
             sessions,
             pending,
+            metrics_store,
         }
     }
 
@@ -2517,6 +2599,65 @@ mod tests {
         assert!(res.errors.is_empty(), "{:?}", res.errors);
         let data = res.data.into_json().unwrap();
         assert_eq!(data["nodes"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_fleet_metrics_empty() {
+        let schema = make_schema().await;
+        let res = schema
+            .execute("{ fleetMetrics { nodesReporting nodesTotal policyDrops rxPackets } }")
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let data = res.data.into_json().unwrap();
+        assert_eq!(data["fleetMetrics"]["nodesReporting"], 0);
+        assert_eq!(data["fleetMetrics"]["nodesTotal"], 0);
+        assert_eq!(data["fleetMetrics"]["policyDrops"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_fleet_metrics_aggregates_across_nodes() {
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "node-a").await;
+        insert_default_tenant_node(&h.store, "node-b").await;
+        // node-c has a row but never reported metrics — counts toward total
+        // but not toward nodesReporting.
+        insert_default_tenant_node(&h.store, "node-c").await;
+
+        // Two interfaces on node-a; drops must sum across labels and nodes.
+        h.metrics_store.update(
+            "node-a",
+            1,
+            concat!(
+                "policy_engine_policy_drops_total{interface=\"eth0\",direction=\"ingress\"} 10\n",
+                "policy_engine_policy_drops_total{interface=\"eth1\",direction=\"egress\"} 5\n",
+                "policy_engine_rx_packets_total{interface=\"eth0\",direction=\"ingress\"} 1000\n",
+            )
+            .as_bytes()
+            .to_vec(),
+            None,
+        );
+        h.metrics_store.update(
+            "node-b",
+            1,
+            concat!(
+                "policy_engine_policy_drops_total{interface=\"eth0\",direction=\"ingress\"} 7\n",
+                "policy_engine_rx_packets_total{interface=\"eth0\",direction=\"ingress\"} 200\n",
+            )
+            .as_bytes()
+            .to_vec(),
+            None,
+        );
+
+        let res = h
+            .schema
+            .execute("{ fleetMetrics { nodesReporting nodesTotal policyDrops rxPackets } }")
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let fm = &res.data.into_json().unwrap()["fleetMetrics"];
+        assert_eq!(fm["nodesReporting"], 2);
+        assert_eq!(fm["nodesTotal"], 3);
+        assert_eq!(fm["policyDrops"], 10 + 5 + 7);
+        assert_eq!(fm["rxPackets"], 1000 + 200);
     }
 
     #[tokio::test]

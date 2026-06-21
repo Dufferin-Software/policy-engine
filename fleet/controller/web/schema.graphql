@@ -341,6 +341,41 @@ type EventOutput {
 }
 
 """
+Fleet-wide rollup of dataplane counters, summed across the most-recent
+Prometheus snapshot of every node in the caller's tenant.
+
+All values are monotonic counter totals (not rates).  Clients compute
+per-second rates by sampling this query over time and dividing the delta
+by the elapsed wall-clock interval.
+"""
+type FleetMetricsOutput {
+	"""
+	Number of nodes that have reported at least one metrics snapshot and
+	are included in these totals.
+	"""
+	nodesReporting: Int!
+	"""
+	Total nodes in the tenant (denominator for coverage).
+	"""
+	nodesTotal: Int!
+	rxPackets: Int!
+	rxBytes: Int!
+	txPackets: Int!
+	txBytes: Int!
+	policyMatches: Int!
+	policyPass: Int!
+	policyDrops: Int!
+	policyRedirects: Int!
+	verdictPassPackets: Int!
+	verdictPassBytes: Int!
+	verdictDropPackets: Int!
+	verdictDropBytes: Int!
+	parseErrors: Int!
+	fragments: Int!
+	inspectRedirects: Int!
+}
+
+"""
 Result of minting a new bootstrap token. `bundle` is shown to the operator
 exactly once and must be distributed to target hosts; the raw token secret
 cannot be retrieved afterwards.
@@ -733,6 +768,12 @@ type QueryRoot {
 	IDs of currently connected agent nodes (scoped to the caller's tenant).
 	"""
 	onlineNodes: [String!]!
+	"""
+	Fleet-wide dataplane counter rollup, summed across the most-recent
+	metrics snapshot of every node in the caller's tenant. Counters are
+	totals; clients derive per-second rates by sampling over time.
+	"""
+	fleetMetrics: FleetMetricsOutput!
 	"""
 	The in-flight (unacknowledged) config generation for a node, if any.
 	

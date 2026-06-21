@@ -4,6 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Policy Controller</title>
+    <!-- Apply the stored theme before first paint to avoid a flash of the
+         dark theme when the operator has chosen light. Mirrors the
+         localStorage key used by src/lib/theme.ts. -->
+    <script>
+      if (localStorage.getItem('dsw_theme') === 'light') {
+        document.documentElement.classList.add('light')
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

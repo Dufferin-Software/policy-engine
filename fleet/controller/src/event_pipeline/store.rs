@@ -90,7 +90,7 @@ impl GroupBy {
 }
 
 fn hex_to_ip_string(hex: &str) -> Option<String> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);

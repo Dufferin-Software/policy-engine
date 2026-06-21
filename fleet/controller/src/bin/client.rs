@@ -796,8 +796,8 @@ fn print_token_list(tokens: &[EnrollmentTokenInfo]) {
         return;
     }
     println!(
-        "{:<36}  {:>5}  {:<24}  {:<24}  {:<10}  {}",
-        "TOKEN-ID", "USES", "CREATED", "EXPIRES", "STATUS", "LABEL"
+        "{:<36}  {:>5}  {:<24}  {:<24}  {:<10}  LABEL",
+        "TOKEN-ID", "USES", "CREATED", "EXPIRES", "STATUS"
     );
     for t in tokens {
         let status = if t.revoked_at.is_some() {

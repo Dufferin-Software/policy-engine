@@ -392,7 +392,7 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
           >
             ← Fleet
           </button>
-          <h2 className="text-lg font-bold text-white">{nodeTitle}</h2>
+          <h2 className="text-lg font-bold text-gray-50">{nodeTitle}</h2>
           {node?.hostname && node.hostname !== nodeTitle && (
             <span className="text-sm text-gray-400 font-mono" title="Hostname">
               {node.hostname}
@@ -462,16 +462,16 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
                         ['Kernel', node.kernelVersion ?? '—'],
                         ['Last seen', relTime(node.lastSeen)],
                         ['Enrolled at', relTime(node.enrolledAt)],
-                        ['Cert expiry', node.certExpiry ? new Date(node.certExpiry).toLocaleDateString() : '—'],
-                      ] as [string, string][]).map(([k, v]) => (
+                        ['Cert expiry', node.certExpiry ? new Date(node.certExpiry).toLocaleDateString() : '—', "Expiry of the node's mTLS client certificate. The agent renews it automatically at around two-thirds of its lifetime, so it should not lapse under normal operation."],
+                      ] as [string, string, string?][]).map(([k, v, tip]) => (
                         <div key={k} className="contents">
-                          <dt className="text-gray-500">{k}</dt>
+                          <dt className="text-gray-500" title={tip}>{k}</dt>
                           <dd className="text-gray-200 break-all">{v}</dd>
                         </div>
                       ))}
                     </dl>
                     <div className="flex items-center justify-between">
-                      <span className="text-gray-500">Stop behavior</span>
+                      <span className="text-gray-500" title="What the engine does with its BPF programs and maps when the daemon stops — controls whether packet filtering keeps running across a restart. See each option for details.">Stop behavior</span>
                       <span className={`inline-flex rounded overflow-hidden text-xs border border-gray-600 ${stopBehaviorPending ? 'opacity-40 pointer-events-none' : ''}`}>
                         <button
                           onClick={() => handleStopBehaviorChange('clear-state')}

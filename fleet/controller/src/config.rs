@@ -187,8 +187,10 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_ttl_below_minimum() {
-        let mut cfg = ControllerConfig::default();
-        cfg.node_cert_ttl_secs = MIN_NODE_CERT_TTL_SECS - 1;
+        let cfg = ControllerConfig {
+            node_cert_ttl_secs: MIN_NODE_CERT_TTL_SECS - 1,
+            ..Default::default()
+        };
         assert!(
             cfg.validate().is_err(),
             "ttl below MIN_NODE_CERT_TTL_SECS must be rejected"
@@ -197,8 +199,10 @@ mod tests {
 
     #[test]
     fn test_validate_accepts_short_but_above_minimum() {
-        let mut cfg = ControllerConfig::default();
-        cfg.node_cert_ttl_secs = 60;
+        let cfg = ControllerConfig {
+            node_cert_ttl_secs: 60,
+            ..Default::default()
+        };
         cfg.validate()
             .expect("60s TTL is allowed (test mode), only WARN-logged");
     }

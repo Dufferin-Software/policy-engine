@@ -7,6 +7,7 @@ import { ControlledNode, nodeDisplayName, relTime, shortId, statusColor } from '
 import NodeDetail, { NodeTab } from './NodeDetail.tsx'
 import FleetRuleCreator from './FleetRuleCreator.tsx'
 import MonitoringSetup from './MonitoringSetup.tsx'
+import FleetMetricsBar from './FleetMetricsBar.tsx'
 
 const GET_FLEET = gql`
   query GetFleet {
@@ -113,6 +114,9 @@ export default function FleetDashboard({ selectedNode, onSelectNode }: FleetDash
 
   return (
     <div className="space-y-4">
+      {/* Fleet-wide dataplane metrics */}
+      <FleetMetricsBar />
+
       {/* Summary cards */}
       <div className="grid grid-cols-4 gap-4">
         {[
@@ -122,7 +126,7 @@ export default function FleetDashboard({ selectedNode, onSelectNode }: FleetDash
           { label: 'Pending', value: nodes.filter((n) => n.status === 'pending').length },
         ].map((c) => (
           <div key={c.label} className="bg-gray-800 rounded-lg p-4 border border-gray-700">
-            <div className="text-2xl font-bold text-white">{c.value}</div>
+            <div className="text-2xl font-bold text-gray-50">{c.value}</div>
             <div className="text-sm text-gray-400">{c.label}</div>
           </div>
         ))}

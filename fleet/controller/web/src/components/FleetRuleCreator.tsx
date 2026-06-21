@@ -283,7 +283,7 @@ export default function FleetRuleCreator({ nodes, onClose, onCreated }: Props) {
           className="bg-gray-900 rounded-lg border border-gray-600 p-5 w-full max-w-2xl max-h-[90vh] overflow-y-auto space-y-4"
         >
           <div className="flex items-center justify-between">
-            <h3 className="text-base font-bold text-white">Create Fleet Rule</h3>
+            <h3 className="text-base font-bold text-gray-50">Create Fleet Rule</h3>
             <button type="button" onClick={onClose} className="text-sm text-gray-500 hover:text-gray-300">Close</button>
           </div>
 

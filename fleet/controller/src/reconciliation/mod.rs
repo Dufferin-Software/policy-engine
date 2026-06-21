@@ -194,7 +194,7 @@ const OPTIONAL_STRING_KEYS: &[&str] = &["src", "dst", "sni", "quicVersion", "src
 pub fn canonicalize_add_rule_json(bytes: &[u8]) -> Result<Vec<u8>, serde_json::Error> {
     let mut value: Value = serde_json::from_slice(bytes)?;
     canonicalize_value(&mut value);
-    Ok(serde_json::to_vec(&value)?)
+    serde_json::to_vec(&value)
 }
 
 fn canonicalize_value(value: &mut Value) {
@@ -463,7 +463,7 @@ pub fn compute_drift(db_rules: &[Rule], snapshot: &StateSnapshot) -> RuleDrift {
             }
         }
     }
-    for (id, _) in &agent_by_id {
+    for id in agent_by_id.keys() {
         if !db_by_id.contains_key(id) {
             only_in_agent.push(id.to_string());
         }
@@ -991,7 +991,7 @@ mod tests {
         agent_map.insert("eth0:egress".to_string(), "pass".to_string());
         let mut snap = snapshot_with(vec![]);
         snap.per_interface_default_actions = agent_map.clone();
-        assert!(compute_default_action_drift(&[iface.clone()], &snap).is_clean());
+        assert!(compute_default_action_drift(std::slice::from_ref(&iface), &snap).is_clean());
 
         // Agent disagrees on egress + has an extra interface.
         let mut bad = agent_map;

@@ -22,7 +22,7 @@ export default function ConfirmDropDialog({ criteria, onConfirm, onCancel }: Pro
       <div className="bg-gray-800 border border-red-700 rounded-lg p-6 max-w-md w-full space-y-4">
         <h3 className="text-lg font-bold text-red-400">Confirm DROP Rule</h3>
         <p className="text-sm text-gray-400">
-          Traffic matching <span className="text-white font-semibold">all</span> of the following criteria will be dropped:
+          Traffic matching <span className="text-gray-50 font-semibold">all</span> of the following criteria will be dropped:
         </p>
         <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm bg-gray-900 rounded p-3 border border-gray-700">
           {criteria.map(({ label, value }) => (

@@ -552,17 +552,11 @@ struct ReassemblyState {
 /// Per-process table holding partial ClientHellos across multiple Initial
 /// packets, keyed by `(5-tuple, DCID)`.  Not thread-safe — intended to be
 /// owned by a single consumer task.
+#[derive(Default)]
 pub struct ReassemblyTable {
     entries: HashMap<ReassemblyKey, ReassemblyState>,
 }
 
-impl Default for ReassemblyTable {
-    fn default() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
-    }
-}
 
 impl ReassemblyTable {
     pub fn new() -> Self {

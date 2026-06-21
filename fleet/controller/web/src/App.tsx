@@ -6,6 +6,7 @@ import FleetDashboard from './components/FleetDashboard.tsx'
 import EnrollmentQueue from './components/EnrollmentQueue.tsx'
 import AuditLog from './components/AuditLog.tsx'
 import EventsView from './components/EventsView.tsx'
+import ThemeToggle from './components/ThemeToggle.tsx'
 import { getUsername, logout } from './lib/auth'
 
 type Tab = 'fleet' | 'enrollment' | 'events' | 'audit'
@@ -45,13 +46,22 @@ export default function App() {
     setTab('fleet')
   }
 
+  function goHome() {
+    setSelectedNode(null)
+    setTab('fleet')
+  }
+
   return (
     <div className="min-h-screen flex flex-col">
       {/* Header */}
       <header className="bg-gray-900 border-b border-gray-700 px-6 py-3 flex items-center gap-6">
-        <span className="text-lg font-bold text-blue-400 tracking-wide">
+        <button
+          onClick={goHome}
+          className="text-lg font-bold text-blue-400 tracking-wide hover:text-blue-300 transition-colors"
+          title="Return to the fleet dashboard"
+        >
           Policy Controller
-        </span>
+        </button>
         <nav className="flex gap-1">
           {TABS.map((t) => (
             <button
@@ -80,6 +90,7 @@ export default function App() {
         >
           Sign out
         </button>
+        <ThemeToggle />
       </header>
 
       {/* Page content */}
