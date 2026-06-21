@@ -557,7 +557,6 @@ pub struct ReassemblyTable {
     entries: HashMap<ReassemblyKey, ReassemblyState>,
 }
 
-
 impl ReassemblyTable {
     pub fn new() -> Self {
         Self::default()
