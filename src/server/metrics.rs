@@ -138,10 +138,21 @@ impl MetricsFormatter for PrometheusFormatter {
                 };
             }
 
-            counter!("policy_engine_rx_packets_total", s.rx_packets);
-            counter!("policy_engine_rx_bytes_total", s.rx_bytes);
-            counter!("policy_engine_tx_packets_total", s.tx_packets);
-            counter!("policy_engine_tx_bytes_total", s.tx_bytes);
+            // Direction-exclusive packet/byte counters. The XDP ingress program
+            // only ever populates `rx_*`; the TC egress program only `tx_*`.
+            // Emitting the opposite direction's fields would publish a
+            // permanently-zero shadow series (e.g. `rx_bytes` for an egress
+            // interface), which a label-blind consumer — such as the fleet
+            // controller summing `policy_engine_rx_bytes_total` across all
+            // label sets — would fold in as if it were real traffic. Emit only
+            // the fields the direction actually owns.
+            if dir == dir_label(Direction::Ingress) {
+                counter!("policy_engine_rx_packets_total", s.rx_packets);
+                counter!("policy_engine_rx_bytes_total", s.rx_bytes);
+            } else {
+                counter!("policy_engine_tx_packets_total", s.tx_packets);
+                counter!("policy_engine_tx_bytes_total", s.tx_bytes);
+            }
             counter!("policy_engine_policy_matches_total", s.policy_matches);
             counter!("policy_engine_policy_drops_total", s.policy_drops);
             counter!("policy_engine_policy_pass_total", s.policy_pass);
@@ -352,6 +363,25 @@ fn dir_label(d: Direction) -> &'static str {
     }
 }
 
+/// Order-preserving de-duplication of attachment records by interface name.
+///
+/// `PolicyService::get_interfaces` returns one record per attached direction
+/// (XDP ingress and TC egress are separate attachments), so an interface
+/// attached in both directions appears more than once. The snapshot collector
+/// already emits both directions for every interface it visits, so it must
+/// visit each interface name exactly once; otherwise it produces duplicate
+/// `{interface,direction}` series and any label-blind consumer (the fleet
+/// controller sums `policy_engine_rx_bytes_total` across all label sets) will
+/// double-count the traffic.
+fn unique_interfaces(attachments: &[crate::shared_types::InterfaceAttachment]) -> Vec<&str> {
+    let mut seen = std::collections::HashSet::new();
+    attachments
+        .iter()
+        .filter(|att| seen.insert(att.interface.as_str()))
+        .map(|att| att.interface.as_str())
+        .collect()
+}
+
 fn proto_name(proto: u8) -> &'static str {
     match proto {
         1 => "icmp",
@@ -397,10 +427,16 @@ async fn collect_snapshot(state: &AppState) -> MetricsSnapshot {
     let mut quic = Vec::new();
     let mut ethertype_stats = Vec::new();
 
-    // Per-interface stats
+    // Per-interface stats.
+    //
+    // `get_interfaces()` returns one attachment record per direction, so an
+    // interface attached both XDP-ingress and TC-egress appears twice. The
+    // inner loop below already emits both directions per interface, so we must
+    // visit each interface name only once — otherwise we emit duplicate
+    // `{interface,direction}` series, which downstream label-blind summing
+    // (e.g. fleet rx/tx bandwidth) double-counts.
     let attachments = service.get_interfaces();
-    for att in &attachments {
-        let iface = &att.interface;
+    for iface in unique_interfaces(&attachments) {
         let ifindex = ifindex_for(iface);
         if ifindex == 0 {
             continue;
@@ -411,7 +447,7 @@ async fn collect_snapshot(state: &AppState) -> MetricsSnapshot {
             }
             if let Ok(stats) = service.get_global_stats(ifindex, dir) {
                 interfaces.push(InterfaceMetrics {
-                    interface: iface.clone(),
+                    interface: iface.to_string(),
                     direction: dir_label(dir),
                     stats,
                 });
@@ -421,7 +457,7 @@ async fn collect_snapshot(state: &AppState) -> MetricsSnapshot {
                 for et in et_vec {
                     if et.packets > 0 {
                         ethertype_stats.push(EthertypeMetrics {
-                            interface: iface.clone(),
+                            interface: iface.to_string(),
                             direction: dir_str,
                             ethertype: et.ethertype,
                             ethertype_name: et.name(),
@@ -566,6 +602,44 @@ pub async fn metrics_handler(
 mod tests {
     use super::*;
 
+    fn attachment(interface: &str, direction: &str) -> crate::shared_types::InterfaceAttachment {
+        crate::shared_types::InterfaceAttachment {
+            interface: interface.to_string(),
+            ifindex: 0,
+            mode: String::new(),
+            direction: direction.to_string(),
+        }
+    }
+
+    #[test]
+    fn unique_interfaces_collapses_per_direction_records() {
+        // An interface attached both XDP-ingress and TC-egress shows up once
+        // per direction. The snapshot collector must visit it only once, or it
+        // emits duplicate `{interface,direction}` series that the fleet
+        // controller's label-blind counter sum double-counts.
+        let attachments = vec![
+            attachment("enp1s0", "ingress"),
+            attachment("enp1s0", "egress"),
+        ];
+        assert_eq!(unique_interfaces(&attachments), vec!["enp1s0"]);
+    }
+
+    #[test]
+    fn unique_interfaces_preserves_order_across_distinct_ifaces() {
+        let attachments = vec![
+            attachment("enp1s0", "ingress"),
+            attachment("enp2s0", "ingress"),
+            attachment("enp1s0", "egress"),
+            attachment("enp2s0", "egress"),
+        ];
+        assert_eq!(unique_interfaces(&attachments), vec!["enp1s0", "enp2s0"]);
+    }
+
+    #[test]
+    fn unique_interfaces_empty() {
+        assert!(unique_interfaces(&[]).is_empty());
+    }
+
     #[test]
     fn prometheus_formatter_empty_snapshot() {
         let formatter = PrometheusFormatter;
@@ -613,6 +687,43 @@ mod tests {
         assert!(output.contains(
             "policy_engine_policy_drops_total{interface=\"eth0\",direction=\"ingress\"} 5"
         ));
+        // An ingress interface must not publish tx_* shadow series — the XDP
+        // path never populates them, so they would be a permanently-zero
+        // counter that label-blind consumers would double-count.
+        assert!(!output.contains("policy_engine_tx_packets_total"));
+        assert!(!output.contains("policy_engine_tx_bytes_total"));
+    }
+
+    #[test]
+    fn prometheus_formatter_egress_interface_emits_only_tx() {
+        let formatter = PrometheusFormatter;
+        let snap = MetricsSnapshot {
+            interfaces: vec![InterfaceMetrics {
+                interface: "eth0".to_string(),
+                direction: "egress",
+                stats: GlobalStats {
+                    tx_packets: 2000,
+                    tx_bytes: 200000,
+                    ..GlobalStats::default()
+                },
+            }],
+            rules: vec![],
+            protos: vec![],
+            l3_protos: vec![],
+            latencies: vec![],
+            quic: vec![],
+            ethertype_stats: vec![],
+            uptime_secs: 0,
+        };
+        let output = String::from_utf8(formatter.format(&snap)).unwrap();
+        assert!(output.contains(
+            "policy_engine_tx_bytes_total{interface=\"eth0\",direction=\"egress\"} 200000"
+        ));
+        // An egress interface must not publish rx_* shadow series — the TC path
+        // never populates them. This is the zero-valued counter that, when the
+        // interface was enumerated twice, summed into the bogus 2x bandwidth.
+        assert!(!output.contains("policy_engine_rx_packets_total"));
+        assert!(!output.contains("policy_engine_rx_bytes_total"));
     }
 
     #[test]
