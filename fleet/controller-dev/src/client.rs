@@ -404,7 +404,7 @@ impl ControllerClient {
             query NodeInterfaces($nodeId: ID!) {
                 nodeInterfaces(nodeId: $nodeId) {
                     nodeId name macAddress linkState tag
-                    xdpAttached tcAttached fibForwarding
+                    xdpAttached tcAttached fibForwarding urpfMode
                     ingressDefaultAction egressDefaultAction lastReported
                 }
             }
@@ -424,7 +424,7 @@ impl ControllerClient {
             query {
                 allNodeInterfaces {
                     nodeId name macAddress linkState tag
-                    xdpAttached tcAttached fibForwarding
+                    xdpAttached tcAttached fibForwarding urpfMode
                     ingressDefaultAction egressDefaultAction lastReported
                 }
             }

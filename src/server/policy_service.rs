@@ -26,6 +26,7 @@ pub enum QueueCmd {
     Remove { rule_id: u64 },
 }
 
+use crate::server::ip_forwarding::ForwardingControl;
 use crate::shared_types::InterfaceAttachment;
 use crate::traits::BpfOperations;
 use crate::types::{StopBehavior, *};
@@ -237,6 +238,19 @@ pub struct PolicyService {
     /// Sender half of the timer background task command channel.
     /// `None` in tests that don't need timers.
     pub(crate) timer_tx: Option<tokio::sync::mpsc::Sender<QueueCmd>>,
+    /// Enables kernel IP forwarding before uRPF / FIB-forward are turned on
+    /// (both rely on the forwarding-gated `bpf_fib_lookup`). Mockable; defaults
+    /// to a no-op in test builds so unit tests never write the host's sysctls.
+    forwarding: Box<dyn ForwardingControl>,
+}
+
+/// Default IP-forwarding control: the real sysctl writer in production, a no-op
+/// in unit-test builds so no test can write the host's forwarding sysctls.
+fn default_forwarding_control() -> Box<dyn ForwardingControl> {
+    #[cfg(test)]
+    return Box::new(crate::server::ip_forwarding::NoopForwardingControl);
+    #[cfg(not(test))]
+    return Box::new(crate::server::ip_forwarding::DefaultForwardingControl);
 }
 
 /// The candidate rule's match data that lives *outside* the `L4Rule` struct:
@@ -286,6 +300,7 @@ impl PolicyService {
             clock: Box::new(SystemClock),
             stop_behavior,
             timer_tx: None,
+            forwarding: default_forwarding_control(),
         }
     }
 
@@ -419,6 +434,13 @@ impl PolicyService {
     #[cfg(test)]
     pub fn with_clock(mut self, clock: Box<dyn ClockSource>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Replace the IP-forwarding control (for testing).
+    #[cfg(test)]
+    pub fn with_forwarding(mut self, forwarding: Box<dyn ForwardingControl>) -> Self {
+        self.forwarding = forwarding;
         self
     }
 
@@ -2017,6 +2039,13 @@ impl PolicyService {
         enabled: bool,
     ) -> Result<OperationResult> {
         self.ensure_programs_loaded()?;
+        // FIB-redirect uses bpf_fib_lookup, which only returns a route when the
+        // kernel is forwarding; enable it first so the feature actually works.
+        if enabled {
+            self.forwarding
+                .enable_ip_forwarding(interface)
+                .context("enabling IP forwarding for FIB forwarding")?;
+        }
         let mut config = self.bpf_ops.get_fib_config(interface)?;
         config.mode = if enabled {
             FIB_FORWARD_ENABLED
@@ -2058,6 +2087,14 @@ impl PolicyService {
                     interface
                 )));
             }
+
+            // The uRPF reverse-path check uses bpf_fib_lookup, which only
+            // returns a route when the kernel is forwarding on the interface;
+            // without this uRPF would silently fail open. (A future per-iface
+            // source-prefix LPM trie would remove this dependency.)
+            self.forwarding
+                .enable_ip_forwarding(interface)
+                .context("enabling IP forwarding for uRPF")?;
         }
 
         let mut config = self.bpf_ops.get_fib_config(interface)?;
@@ -2296,6 +2333,90 @@ mod tests {
         mock.expect_get_inspect_config()
             .returning(|_| Ok(InspectConfig::default()));
         mock
+    }
+
+    fn ingress_attachment(iface: &str) -> InterfaceAttachment {
+        InterfaceAttachment {
+            interface: iface.to_string(),
+            ifindex: 1,
+            mode: "xdp".to_string(),
+            direction: "ingress".to_string(),
+        }
+    }
+
+    // ── IP-forwarding enablement (uRPF / FIB-forward depend on it) ──────────
+
+    #[test]
+    fn set_urpf_enable_turns_on_ip_forwarding() {
+        use crate::server::ip_forwarding::MockForwardingControl;
+        let mut mock = create_mock_with_loaded_programs();
+        mock.expect_get_attached_interfaces()
+            .returning(|| vec![ingress_attachment("eth0")]);
+        mock.expect_get_fib_config()
+            .returning(|_| Ok(FibConfig::default()));
+        mock.expect_set_fib_config().returning(|_, _| Ok(()));
+
+        let mut fwd = MockForwardingControl::new();
+        fwd.expect_enable_ip_forwarding()
+            .withf(|iface| iface == "eth0")
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let mut service = PolicyService::new(Box::new(mock)).with_forwarding(Box::new(fwd));
+        let r = service.set_urpf("eth0", URPF_LOOSE).unwrap();
+        assert!(r.success, "set_urpf should succeed: {}", r.message);
+    }
+
+    #[test]
+    fn set_urpf_off_does_not_touch_ip_forwarding() {
+        use crate::server::ip_forwarding::MockForwardingControl;
+        let mut mock = create_mock_with_loaded_programs();
+        mock.expect_get_fib_config()
+            .returning(|_| Ok(FibConfig::default()));
+        mock.expect_set_fib_config().returning(|_, _| Ok(()));
+
+        let mut fwd = MockForwardingControl::new();
+        // Disabling uRPF must not enable forwarding.
+        fwd.expect_enable_ip_forwarding().times(0);
+
+        let mut service = PolicyService::new(Box::new(mock)).with_forwarding(Box::new(fwd));
+        let r = service.set_urpf("eth0", URPF_DISABLED).unwrap();
+        assert!(r.success);
+    }
+
+    #[test]
+    fn set_fib_forwarding_enable_turns_on_ip_forwarding() {
+        use crate::server::ip_forwarding::MockForwardingControl;
+        let mut mock = create_mock_with_loaded_programs();
+        mock.expect_get_fib_config()
+            .returning(|_| Ok(FibConfig::default()));
+        mock.expect_set_fib_config().returning(|_, _| Ok(()));
+
+        let mut fwd = MockForwardingControl::new();
+        fwd.expect_enable_ip_forwarding()
+            .withf(|iface| iface == "eth0")
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let mut service = PolicyService::new(Box::new(mock)).with_forwarding(Box::new(fwd));
+        let r = service.set_fib_forwarding("eth0", true).unwrap();
+        assert!(r.success);
+    }
+
+    #[test]
+    fn set_fib_forwarding_disable_does_not_touch_ip_forwarding() {
+        use crate::server::ip_forwarding::MockForwardingControl;
+        let mut mock = create_mock_with_loaded_programs();
+        mock.expect_get_fib_config()
+            .returning(|_| Ok(FibConfig::default()));
+        mock.expect_set_fib_config().returning(|_, _| Ok(()));
+
+        let mut fwd = MockForwardingControl::new();
+        fwd.expect_enable_ip_forwarding().times(0);
+
+        let mut service = PolicyService::new(Box::new(mock)).with_forwarding(Box::new(fwd));
+        let r = service.set_fib_forwarding("eth0", false).unwrap();
+        assert!(r.success);
     }
 
     /// Helper to create a default L4Rule for testing

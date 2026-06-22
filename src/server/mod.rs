@@ -23,6 +23,7 @@ pub mod event_stream;
 pub mod flow_verdict_manager;
 pub mod graphql;
 mod http;
+pub mod ip_forwarding;
 #[cfg(feature = "ipfix")]
 pub mod ipfix_exporter;
 pub mod metrics;

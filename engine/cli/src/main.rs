@@ -8,6 +8,7 @@
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 use prettytable::{format, row, Table};
 use serde::Serialize;
 use serde_json::json;
@@ -421,6 +422,30 @@ enum ConfigCommands {
         /// Traffic direction: ingress or egress
         #[arg(long)]
         direction: String,
+    },
+
+    /// Enable or disable FIB forwarding ("XDP forward mode") on an interface.
+    /// Ingress-only (XDP) feature.
+    FibForwarding {
+        /// Interface name
+        #[arg(long)]
+        interface: String,
+
+        /// Enable (true) or disable (false) FIB forwarding
+        #[arg(long, action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
+
+    /// Set the uRPF (unicast Reverse Path Forwarding) mode on an interface.
+    /// Ingress-only (XDP) feature.
+    Urpf {
+        /// Interface name
+        #[arg(long)]
+        interface: String,
+
+        /// uRPF mode: off, loose, or strict
+        #[arg(long)]
+        mode: String,
     },
 }
 
@@ -1113,8 +1138,42 @@ fn handle_show(client: &PolicyClient, cmd: ShowCommands, json_output: bool) -> R
                 Some(i) => i,
                 None => return Ok(()),
             };
+            // uRPF and FIB forwarding ("XDP forward mode") are ingress-only (XDP)
+            // features. Fetch their per-interface state so it can be shown alongside
+            // the attachment info.
+            let urpf: HashMap<String, String> =
+                match try_operation_json(|| client.list_urpf(), json_output)? {
+                    Some(u) => u.into_iter().collect(),
+                    None => return Ok(()),
+                };
+            let fib: HashMap<String, bool> =
+                match try_operation_json(|| client.list_fib_forwarding(), json_output)? {
+                    Some(f) => f.into_iter().collect(),
+                    None => return Ok(()),
+                };
+            let is_ingress = |iface: &InterfaceAttachment| iface.direction.eq_ignore_ascii_case("ingress");
+            let urpf_mode = |iface: &InterfaceAttachment| {
+                urpf.get(&iface.interface)
+                    .cloned()
+                    .unwrap_or_else(|| "OFF".to_string())
+            };
+            let fib_enabled =
+                |iface: &InterfaceAttachment| fib.get(&iface.interface).copied().unwrap_or(false);
+
             if json_output {
-                print_json(&interfaces)?;
+                // Fold uRPF/FIB state into each ingress interface object.
+                let enriched: Vec<serde_json::Value> = interfaces
+                    .iter()
+                    .map(|iface| {
+                        let mut v = serde_json::to_value(iface).unwrap_or_default();
+                        if let (true, Some(obj)) = (is_ingress(iface), v.as_object_mut()) {
+                            obj.insert("urpfMode".to_string(), json!(urpf_mode(iface)));
+                            obj.insert("fibForwarding".to_string(), json!(fib_enabled(iface)));
+                        }
+                        v
+                    })
+                    .collect();
+                print_json(&enriched)?;
             } else if interfaces.is_empty() {
                 println!("No programs attached to any interfaces.");
             } else {
@@ -1127,6 +1186,17 @@ fn handle_show(client: &PolicyClient, cmd: ShowCommands, json_output: bool) -> R
                     );
                     println!("    Direction: {}", iface.direction);
                     println!("    Mode: {}", iface.mode);
+                    if is_ingress(&iface) {
+                        println!("    uRPF: {}", urpf_mode(&iface));
+                        println!(
+                            "    FIB Forwarding: {}",
+                            if fib_enabled(&iface) {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        );
+                    }
                     println!();
                 }
             }
@@ -1595,6 +1665,28 @@ fn handle_config(client: &PolicyClient, cmd: ConfigCommands, json_output: bool) 
                 || client.register_tail_call(slot, &program, dir),
                 json_output,
             )?;
+        }
+
+        ConfigCommands::FibForwarding { interface, enabled } => {
+            handle_operation(
+                || client.set_fib_forwarding(&interface, enabled),
+                json_output,
+            )?;
+        }
+
+        ConfigCommands::Urpf { interface, mode } => {
+            let normalized = match mode.to_lowercase().as_str() {
+                "off" | "none" | "disable" | "disabled" => "OFF",
+                "loose" => "LOOSE",
+                "strict" => "STRICT",
+                _ => {
+                    return Err(anyhow!(
+                        "Invalid uRPF mode: {}. Valid modes: off, loose, strict",
+                        mode
+                    ))
+                }
+            };
+            handle_operation(|| client.set_urpf(&interface, normalized), json_output)?;
         }
     }
     Ok(())

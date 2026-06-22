@@ -335,6 +335,18 @@ enum InterfacesCmd {
         #[arg(long)]
         enabled: bool,
     },
+    /// Set the uRPF mode on an interface (ingress only).
+    SetUrpf {
+        /// Node ID.
+        #[arg(long)]
+        node_id: String,
+        /// Interface name.
+        #[arg(long)]
+        name: String,
+        /// uRPF mode: off, loose, or strict.
+        #[arg(long)]
+        mode: String,
+    },
     /// Set the default action for unmatched packets on an interface+direction.
     SetDefaultAction {
         /// Node ID.
@@ -635,6 +647,15 @@ fn handle_interfaces(client: &ControllerClient, cmd: InterfacesCmd, json: bool) 
             enabled,
         } => {
             let result = client.set_fib_forwarding(&node_id, &name, enabled)?;
+            print_result(&result, json);
+        }
+
+        InterfacesCmd::SetUrpf {
+            node_id,
+            name,
+            mode,
+        } => {
+            let result = client.set_urpf(&node_id, &name, &mode)?;
             print_result(&result, json);
         }
 
@@ -947,8 +968,8 @@ fn print_table_interfaces(ifaces: &[NodeInterface]) {
     }
 
     println!(
-        "{:<20} {:<14} {:<6} {:<5} {:<5} {:<5} {:<8} {:<8} TAG",
-        "NODE-ID", "NAME", "STATE", "XDP", "TC", "FIB", "INGRESS", "EGRESS"
+        "{:<20} {:<14} {:<6} {:<5} {:<5} {:<5} {:<7} {:<8} {:<8} TAG",
+        "NODE-ID", "NAME", "STATE", "XDP", "TC", "FIB", "URPF", "INGRESS", "EGRESS"
     );
     println!("{}", &"-".repeat(120));
 
@@ -958,11 +979,12 @@ fn print_table_interfaces(ifaces: &[NodeInterface]) {
         let xdp = bool_str(i.xdp_attached.unwrap_or(false));
         let tc = bool_str(i.tc_attached.unwrap_or(false));
         let fib = bool_str(i.fib_forwarding.unwrap_or(false));
+        let urpf = i.urpf_mode.as_deref().unwrap_or("off");
         let ingress = i.ingress_default_action.as_deref().unwrap_or("—");
         let egress = i.egress_default_action.as_deref().unwrap_or("—");
         let tag = i.tag.as_deref().unwrap_or("—");
         println!(
-            "{short_id:<20} {:<14} {state:<6} {xdp:<5} {tc:<5} {fib:<5} {ingress:<8} {egress:<8} {tag}",
+            "{short_id:<20} {:<14} {state:<6} {xdp:<5} {tc:<5} {fib:<5} {urpf:<7} {ingress:<8} {egress:<8} {tag}",
             i.name
         );
     }
