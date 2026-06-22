@@ -56,6 +56,8 @@ export interface NodeInterfaceOutput {
   xdpAttached: boolean
   tcAttached: boolean
   fibForwarding: boolean
+  /** uRPF mode (ingress only): "off", "loose", or "strict". */
+  urpfMode: string
   ingressDefaultAction: string | null
   egressDefaultAction: string | null
 }

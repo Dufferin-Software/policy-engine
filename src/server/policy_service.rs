@@ -2009,19 +2009,19 @@ impl PolicyService {
     }
 
     /// Enable or disable XDP FIB forwarding for a single ingress interface.
+    /// The per-interface config entry is shared with uRPF, so the current uRPF
+    /// mode is read first and preserved.
     pub fn set_fib_forwarding(
         &mut self,
         interface: &str,
         enabled: bool,
     ) -> Result<OperationResult> {
         self.ensure_programs_loaded()?;
-        let config = FibConfig {
-            mode: if enabled {
-                FIB_FORWARD_ENABLED
-            } else {
-                FIB_FORWARD_DISABLED
-            },
-            ..Default::default()
+        let mut config = self.bpf_ops.get_fib_config(interface)?;
+        config.mode = if enabled {
+            FIB_FORWARD_ENABLED
+        } else {
+            FIB_FORWARD_DISABLED
         };
         self.bpf_ops.set_fib_config(interface, &config)?;
         let state = if enabled { "enabled" } else { "disabled" };
@@ -2029,6 +2029,67 @@ impl PolicyService {
             "FIB forwarding {} on {}",
             state, interface
         )))
+    }
+
+    /// Set the uRPF (unicast Reverse Path Forwarding) mode for a single ingress
+    /// interface.  `mode` is one of URPF_DISABLED / URPF_LOOSE / URPF_STRICT.
+    ///
+    /// uRPF is an ingress-only (XDP) feature: it is rejected on interfaces that
+    /// do not have an XDP program attached, since enabling it there (e.g. on a
+    /// TC egress-only interface) could never take effect.  The per-interface
+    /// config entry is shared with FIB forwarding, so the current FIB mode is
+    /// read first and preserved.
+    pub fn set_urpf(&mut self, interface: &str, mode: u32) -> Result<OperationResult> {
+        self.ensure_programs_loaded()?;
+
+        // Reject egress / non-XDP interfaces: uRPF is never supported there.
+        // XDP attachments are reported with direction "ingress"; TC egress
+        // attachments are "egress" and must never carry a uRPF config.
+        if mode != URPF_DISABLED {
+            let xdp_attached = self
+                .bpf_ops
+                .get_attached_interfaces()
+                .iter()
+                .any(|a| a.interface == interface && a.direction == "ingress");
+            if !xdp_attached {
+                return Ok(OperationResult::failure(format!(
+                    "uRPF can only be enabled on an interface with XDP attached \
+                     (ingress); '{}' has no XDP program. uRPF is never supported on egress.",
+                    interface
+                )));
+            }
+        }
+
+        let mut config = self.bpf_ops.get_fib_config(interface)?;
+        config.urpf_mode = mode;
+        self.bpf_ops.set_fib_config(interface, &config)?;
+        let desc = match mode {
+            URPF_LOOSE => "loose",
+            URPF_STRICT => "strict",
+            _ => "disabled",
+        };
+        Ok(OperationResult::success(format!(
+            "uRPF {} on {}",
+            desc, interface
+        )))
+    }
+
+    /// Get the current uRPF mode for a single interface
+    /// (URPF_DISABLED / URPF_LOOSE / URPF_STRICT).
+    pub fn get_urpf(&self, interface: &str) -> Result<u32> {
+        let config = self.bpf_ops.get_fib_config(interface)?;
+        Ok(config.urpf_mode)
+    }
+
+    /// List all interfaces with uRPF enabled, as (interface, mode) pairs.
+    /// Interfaces with uRPF disabled are omitted.
+    pub fn list_urpf(&self) -> Result<Vec<(String, u32)>> {
+        let entries = self.bpf_ops.list_fib_configs()?;
+        Ok(entries
+            .into_iter()
+            .filter(|(_, cfg)| cfg.urpf_mode != URPF_DISABLED)
+            .map(|(name, cfg)| (name, cfg.urpf_mode))
+            .collect())
     }
 
     /// Get current FIB forwarding state for a single interface (true = enabled).
@@ -3528,6 +3589,8 @@ mod tests {
                         fib_forwarded_packets: 0,
                         fib_forwarded_bytes: 0,
                         fib_fallback_packets: 0,
+                        urpf_drop_packets: 0,
+                        urpf_drop_bytes: 0,
                     })
                 });
 

@@ -342,6 +342,32 @@ type FibForwardingEntry {
 }
 
 """
+uRPF (unicast Reverse Path Forwarding) mode for an interface. uRPF is
+ingress-only (XDP); it can never be enabled on egress.
+"""
+enum UrpfMode {
+	OFF
+	LOOSE
+	STRICT
+}
+
+"""
+Input for setting the uRPF mode on a single ingress interface.
+"""
+input SetUrpfInput {
+	interface: String!
+	mode: UrpfMode!
+}
+
+"""
+uRPF mode for a single interface (only interfaces with uRPF enabled).
+"""
+type UrpfEntry {
+	interface: String!
+	mode: UrpfMode!
+}
+
+"""
 Individual flow verdict entry
 """
 type FlowVerdictOutput {
@@ -413,6 +439,11 @@ type GlobalStatsOutput {
 	XDP FIB forwarding: packets where FIB lookup was attempted but fell back to XDP_PASS
 	"""
 	fibFallbackPackets: Int!
+	"""
+	uRPF: packets/bytes dropped by the reverse-path check (source spoofing)
+	"""
+	urpfDropPackets: Int!
+	urpfDropBytes: Int!
 }
 
 """
@@ -585,6 +616,7 @@ type MutationRoot {
 	Enable or disable XDP FIB forwarding (line-rate packet forwarding via bpf_fib_lookup)
 	"""
 	setFibForwarding(input: SetFibForwardingInput!): OperationResult!
+	setUrpf(input: SetUrpfInput!): OperationResult!
 	"""
 	Set the stop behavior for the policy engine daemon.
 	
@@ -696,6 +728,7 @@ type QueryRoot {
 	List per-interface XDP FIB forwarding state.
 	"""
 	fibForwarding: [FibForwardingEntry!]!
+	urpf: [UrpfEntry!]!
 	"""
 	List all attached interfaces
 	"""

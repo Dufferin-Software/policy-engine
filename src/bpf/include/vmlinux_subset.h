@@ -282,6 +282,10 @@ struct bpf_fib_lookup {
 #define BPF_FIB_LKUP_RET_NO_NEIGH     7 /* Neighbor not resolved (ARP/NDP pending) */
 #define BPF_FIB_LKUP_RET_FRAG_NEEDED  8 /* Packet too large (MTU exceeded) */
 
+/* bpf_fib_lookup() flags (subset) */
+#define BPF_FIB_LOOKUP_DIRECT     (1U << 0) /* Do a direct table lookup, skip FIB rules */
+#define BPF_FIB_LOOKUP_OUTPUT     (1U << 1) /* Treat ifindex as egress (output route) */
+
 /* BPF map flags */
 #define BPF_F_NO_PREALLOC (1U << 0)
 

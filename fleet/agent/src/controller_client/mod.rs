@@ -24,10 +24,11 @@ use policy_controller_proto::PROTOCOL_VERSION;
 
 use crate::{
     change_detector::ChangeDetector,
-    config_applier::ConfigApplier,
+    config_applier::{ConfigApplier, InverseOp},
     identity::NodeIdentity,
     metrics_forwarder::base_url_from_graphql,
     network_info::{InterfaceInfo, NetworkInfo},
+    pending_change::watchdog_deadline_ms,
     pending_change::PendingChangeRegistry,
     system_info::SystemInfo,
 };
@@ -42,15 +43,34 @@ type ApplyLock = Arc<tokio::sync::Mutex<()>>;
 
 // ── Stream abstraction (mockable) ────────────────────────────────────────────
 
+/// Write half of an open bidirectional agent↔controller stream.
+#[async_trait]
+pub trait AgentStreamTx: Send + 'static {
+    async fn send(&mut self, msg: AgentMessage) -> Result<()>;
+}
+
+/// Read half of an open bidirectional agent↔controller stream.
+#[async_trait]
+pub trait AgentStreamRx: Send {
+    /// Returns `None` when the stream is closed by the controller.
+    async fn recv(&mut self) -> Result<Option<ControllerMessage>>;
+}
+
 /// Abstract handle to an open bidirectional agent↔controller stream.
 ///
 /// Abstracting over tonic enables unit tests to exercise the message loop
 /// with in-memory channels instead of a real gRPC connection.
-#[async_trait]
+///
+/// The handle splits into independent read/write halves so the connection's
+/// reader is never parked behind a back-pressured send (and vice-versa). A
+/// single task doing both `recv` and `send` deadlocks the bidirectional stream
+/// under mutual back-pressure: while it is awaiting a send it stops reading, so
+/// the peer's send window never reopens. The write half is therefore driven by a
+/// dedicated task and the read half by the event loop.
 pub trait AgentStreamHandle: Send {
-    async fn send(&mut self, msg: AgentMessage) -> Result<()>;
-    /// Returns `None` when the stream is closed by the controller.
-    async fn recv(&mut self) -> Result<Option<ControllerMessage>>;
+    type Tx: AgentStreamTx;
+    type Rx: AgentStreamRx;
+    fn split(self) -> (Self::Tx, Self::Rx);
 }
 
 // ── Real tonic implementation ────────────────────────────────────────────────
@@ -61,20 +81,44 @@ pub struct TonicStreamHandle {
     rx: tonic::codec::Streaming<ControllerMessage>,
 }
 
+/// Write half of [`TonicStreamHandle`]. `tx` already feeds an internal mpsc that
+/// tonic's own task drains onto the socket, so `send` blocks only when the
+/// HTTP/2 send window is exhausted — which is precisely why it must live off the
+/// read path.
+pub struct TonicStreamTx {
+    tx: mpsc::Sender<AgentMessage>,
+}
+
+/// Read half of [`TonicStreamHandle`].
+pub struct TonicStreamRx {
+    rx: tonic::codec::Streaming<ControllerMessage>,
+}
+
 #[async_trait]
-impl AgentStreamHandle for TonicStreamHandle {
+impl AgentStreamTx for TonicStreamTx {
     async fn send(&mut self, msg: AgentMessage) -> Result<()> {
         self.tx
             .send(msg)
             .await
             .context("Failed to send message to controller")
     }
+}
 
+#[async_trait]
+impl AgentStreamRx for TonicStreamRx {
     async fn recv(&mut self) -> Result<Option<ControllerMessage>> {
         self.rx
             .message()
             .await
             .context("Failed to receive message from controller")
+    }
+}
+
+impl AgentStreamHandle for TonicStreamHandle {
+    type Tx = TonicStreamTx;
+    type Rx = TonicStreamRx;
+    fn split(self) -> (TonicStreamTx, TonicStreamRx) {
+        (TonicStreamTx { tx: self.tx }, TonicStreamRx { rx: self.rx })
     }
 }
 
@@ -129,6 +173,10 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// controller's view promptly.
 const CHANGE_DETECT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long the teardown path waits for the writer task to flush queued
+/// outbound messages (e.g. revert confirms) before aborting it.
+const WRITER_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Convert local interface info to proto InterfaceReport, filtering out blocklisted names.
 fn interfaces_to_proto(interfaces: &[InterfaceInfo], blocklist: &[String]) -> Vec<InterfaceReport> {
     interfaces
@@ -167,7 +215,7 @@ fn interfaces_to_proto(interfaces: &[InterfaceInfo], blocklist: &[String]) -> Ve
 ///   local policy-engine server derived from this GraphQL URL
 #[allow(clippy::too_many_arguments)]
 pub async fn run_stream_loop(
-    mut stream: impl AgentStreamHandle,
+    stream: impl AgentStreamHandle,
     identity: &dyn NodeIdentity,
     agent_version: &str,
     applier: Option<Arc<ConfigApplier>>,
@@ -178,8 +226,13 @@ pub async fn run_stream_loop(
     metrics_interval: Arc<AtomicU64>,
     change_detector: Option<Arc<dyn ChangeDetector>>,
 ) -> Result<()> {
-    // Outbound channel: forwarders push messages here; the loop drains it.
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<AgentMessage>(256);
+    // Split the stream so reads and writes run on independent tasks: a
+    // back-pressured send must never park the reader (see `AgentStreamHandle`).
+    let (mut writer, mut reader) = stream.split();
+
+    // Outbound channel: forwarders and the event loop push messages here; a
+    // dedicated writer task (spawned below) drains it onto the stream.
+    let (outbound_tx, outbound_rx) = mpsc::channel::<AgentMessage>(256);
 
     // Tracks locally-applied but unacknowledged config generations. A watchdog
     // per entry reverts and emits ConfigConfirm{REVERTED} on timeout.
@@ -243,7 +296,10 @@ pub async fn run_stream_loop(
             }),
         })),
     };
-    stream
+    // Hello and the initial snapshot are sent directly on the writer half,
+    // before the writer task is spawned, so they are guaranteed to reach the
+    // wire ahead of any forwarder/heartbeat traffic queued on `outbound_tx`.
+    writer
         .send(hello)
         .await
         .context("Failed to send AgentHello")?;
@@ -258,7 +314,7 @@ pub async fn run_stream_loop(
         if let Some(ref det) = change_detector {
             det.update_baseline(&snapshot);
         }
-        if let Err(send_err) = stream
+        if let Err(send_err) = writer
             .send(AgentMessage {
                 payload: Some(AgentPayload::State(snapshot)),
             })
@@ -269,7 +325,7 @@ pub async fn run_stream_loop(
             // protocol mismatch, …). Peek for the Disconnect payload
             // so the agent log surfaces *why* instead of just
             // "channel closed".
-            if let Ok(Some(msg)) = stream.recv().await {
+            if let Ok(Some(msg)) = reader.recv().await {
                 if let Some(CtrlPayload::Disconnect(d)) = msg.payload {
                     bail!("Disconnected by controller: {}", d.reason);
                 }
@@ -287,6 +343,23 @@ pub async fn run_stream_loop(
     // baseline across generations, so an orphan there silently swallows
     // out-of-band edits — but all of them leak without this. See [`AbortOnDrop`].
     let mut _connection_tasks: Vec<AbortOnDrop> = Vec::new();
+
+    // Dedicated writer task: the sole owner of the write half, draining
+    // `outbound_rx` onto the stream. Keeping all sends here means the event
+    // loop's reader is never parked behind a back-pressured send. Held as a bare
+    // handle (not `AbortOnDrop`) so the teardown path below can drain queued
+    // messages — e.g. the final REVERTED confirms from `drain_and_revert` —
+    // before the connection closes, falling back to abort if it can't flush.
+    let mut writer_task = tokio::spawn(async move {
+        let mut outbound_rx = outbound_rx;
+        while let Some(msg) = outbound_rx.recv().await {
+            if let Err(e) = writer.send(msg).await {
+                log::warn!("Outbound writer stopping: {:#}", e);
+                break;
+            }
+        }
+    });
+
     if let Some(ref graphql_url) = local_server_graphql_url {
         let base = base_url_from_graphql(graphql_url);
 
@@ -333,12 +406,11 @@ pub async fn run_stream_loop(
     heartbeat_interval.tick().await; // consume the immediate first tick
 
     let result = run_event_loop(
-        &mut stream,
+        &mut reader,
         applier.as_ref(),
         local_server_graphql_url.as_deref(),
         &pending,
         &outbound_tx,
-        &mut outbound_rx,
         &mut heartbeat_interval,
         &metrics_trigger,
         &metrics_interval,
@@ -357,17 +429,29 @@ pub async fn run_stream_loop(
         pending.drain_and_revert(a).await;
     }
 
+    // Graceful writer shutdown: stop the forwarders so they release their
+    // outbound senders, drop our own, then let the writer drain whatever is
+    // still queued (notably the revert confirms above) and exit when the
+    // channel closes. Bounded so a wedged stream can't stall reconnect.
+    drop(_connection_tasks);
+    drop(outbound_tx);
+    if tokio::time::timeout(WRITER_FLUSH_TIMEOUT, &mut writer_task)
+        .await
+        .is_err()
+    {
+        writer_task.abort();
+    }
+
     result
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_event_loop<S: AgentStreamHandle>(
-    stream: &mut S,
+async fn run_event_loop<R: AgentStreamRx>(
+    reader: &mut R,
     applier: Option<&Arc<ConfigApplier>>,
     local_graphql_url: Option<&str>,
     pending: &Arc<PendingChangeRegistry>,
     outbound_tx: &mpsc::Sender<AgentMessage>,
-    outbound_rx: &mut mpsc::Receiver<AgentMessage>,
     heartbeat_interval: &mut tokio::time::Interval,
     metrics_trigger: &Arc<Notify>,
     metrics_interval: &Arc<AtomicU64>,
@@ -382,17 +466,21 @@ async fn run_event_loop<S: AgentStreamHandle>(
                     .unwrap_or_default()
                     .as_nanos() as u64;
 
-                stream.send(AgentMessage {
+                // Drop the heartbeat if the outbound queue is full or closed
+                // rather than parking the reader on it — a missed heartbeat is
+                // harmless and the next tick retries.
+                if let Err(e) = outbound_tx.try_send(AgentMessage {
                     payload: Some(AgentPayload::Heartbeat(Heartbeat {
                         timestamp_ns: ts,
                     })),
-                })
-                .await
-                .context("Failed to send heartbeat")?;
-                log::debug!("Sent heartbeat");
+                }) {
+                    log::debug!("Skipped heartbeat (outbound unavailable): {e}");
+                } else {
+                    log::debug!("Sent heartbeat");
+                }
             }
 
-            msg = stream.recv() => {
+            msg = reader.recv() => {
                 match msg? {
                     None => {
                         log::info!("Controller closed the stream");
@@ -401,7 +489,6 @@ async fn run_event_loop<S: AgentStreamHandle>(
                     Some(ctrl_msg) => {
                         handle_controller_message(
                             ctrl_msg,
-                            stream,
                             applier,
                             local_graphql_url,
                             pending,
@@ -415,10 +502,6 @@ async fn run_event_loop<S: AgentStreamHandle>(
                     }
                 }
             }
-
-            Some(outbound_msg) = outbound_rx.recv() => {
-                stream.send(outbound_msg).await.context("Failed to send forwarder message")?;
-            }
         }
     }
 }
@@ -426,7 +509,6 @@ async fn run_event_loop<S: AgentStreamHandle>(
 #[allow(clippy::too_many_arguments)]
 async fn handle_controller_message(
     msg: ControllerMessage,
-    stream: &mut impl AgentStreamHandle,
     applier: Option<&Arc<ConfigApplier>>,
     local_graphql_url: Option<&str>,
     pending: &Arc<PendingChangeRegistry>,
@@ -472,7 +554,7 @@ async fn handle_controller_message(
                             pending.register(
                                 generation_id.clone(),
                                 inverse_ops,
-                                deadline_ms,
+                                watchdog_deadline_ms(deadline_ms),
                                 Arc::clone(a),
                                 outbound_tx.clone(),
                             );
@@ -484,7 +566,7 @@ async fn handle_controller_message(
                     } else {
                         ConfirmOutcome::Rejected
                     };
-                    stream
+                    outbound_tx
                         .send(AgentMessage {
                             payload: Some(AgentPayload::ConfigResult(
                                 policy_controller_proto::controller::ConfigApplyResult {
@@ -497,7 +579,7 @@ async fn handle_controller_message(
                         })
                         .await
                         .context("Failed to send ConfigApplyResult")?;
-                    stream
+                    outbound_tx
                         .send(AgentMessage {
                             payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
                                 generation_id,
@@ -546,7 +628,7 @@ async fn handle_controller_message(
                 }
             } else {
                 log::debug!("No ConfigApplier configured — acknowledging without applying");
-                stream
+                outbound_tx
                     .send(AgentMessage {
                         payload: Some(AgentPayload::ConfigResult(
                             policy_controller_proto::controller::ConfigApplyResult {
@@ -560,7 +642,7 @@ async fn handle_controller_message(
                     .await
                     .context("Failed to send ConfigApplyResult")?;
                 if gated {
-                    stream
+                    outbound_tx
                         .send(AgentMessage {
                             payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
                                 generation_id,
@@ -609,7 +691,7 @@ async fn handle_controller_message(
                     StateSnapshot::default()
                 }
             };
-            stream
+            outbound_tx
                 .send(AgentMessage {
                     payload: Some(AgentPayload::State(snapshot)),
                 })
@@ -650,86 +732,96 @@ async fn handle_controller_message(
                 mode_str,
                 generation_id,
             );
-            if let Some(url) = local_graphql_url {
-                let url_for_sb = url.to_string();
-                let url_for_snapshot = url.to_string();
+            let gated = !generation_id.is_empty();
+            let deadline_ms = attach.confirm_deadline_ms;
+
+            if let Some(a) = applier {
+                let a = Arc::clone(a);
+                let pending = Arc::clone(pending);
+                let tx = outbound_tx.clone();
+                let url_for_snapshot = local_graphql_url.map(|u| u.to_string());
                 let direction = direction_str.to_string();
                 let mode = mode_str.to_string();
                 let iface = interface_name.clone();
-                let tx = outbound_tx.clone();
                 // BPF first-load triggers the verifier + JIT and can take 10–25 s.
                 // Spawn in the background so the message loop can continue receiving
                 // other messages (including the next gated mutation) without blocking.
                 tokio::spawn(async move {
-                    let join_result = tokio::task::spawn_blocking(move || {
-                        use policy_engine_dev::{ClientConfig, PolicyClient};
-                        let client = PolicyClient::with_config(ClientConfig {
-                            server_url: url_for_sb,
-                            ..Default::default()
-                        });
-                        match direction.as_str() {
-                            "ingress" => client.attach_ingress(&iface, &mode),
-                            "egress" => client.attach_tc(&iface),
-                            _ => Err(anyhow::anyhow!("Invalid direction: {}", direction)),
-                        }
-                    })
-                    .await;
+                    // Capture prior attach state: if the program is already
+                    // attached, the apply is a no-op and there is nothing to
+                    // revert; otherwise the inverse is a detach.
+                    let already_attached = a
+                        .list_attachments()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .any(|(i, d, _)| i == iface && d == direction);
 
-                    let (confirm_outcome, confirm_error) = match join_result {
-                        Err(e) => {
-                            log::error!("Attach spawn_blocking panicked: {:#}", e);
-                            (
-                                ConfirmOutcome::Rejected,
-                                format!("spawn_blocking panicked: {:#}", e),
-                            )
-                        }
-                        Ok(Ok(r)) if r.success => {
-                            log::info!(
-                                "Successfully attached program to {} {}",
-                                direction_str,
-                                interface_name
-                            );
+                    let apply_res = a.attach(&iface, &direction, &mode).await;
+
+                    let (outcome, error_message) = match &apply_res {
+                        Ok(()) => {
+                            log::info!("Successfully attached program to {} {}", direction, iface);
+                            if gated {
+                                let inverse = if already_attached {
+                                    Vec::new()
+                                } else {
+                                    vec![InverseOp::Detach {
+                                        interface: iface.clone(),
+                                        direction: direction.clone(),
+                                    }]
+                                };
+                                // Register before sending Applied so the controller's
+                                // CommitAck (sent only in response to Applied) cannot
+                                // race ahead of the watchdog arming.
+                                pending.register(
+                                    generation_id.clone(),
+                                    inverse,
+                                    watchdog_deadline_ms(deadline_ms),
+                                    Arc::clone(&a),
+                                    tx.clone(),
+                                );
+                            }
                             (ConfirmOutcome::Applied, String::new())
                         }
-                        Ok(Ok(r)) => {
-                            log::warn!("Failed to attach program: {}", r.message);
-                            (ConfirmOutcome::Rejected, r.message.clone())
-                        }
-                        Ok(Err(e)) => {
-                            log::error!("Error attaching program: {:#}", e);
+                        Err(e) => {
+                            log::warn!("Failed to attach program: {:#}", e);
                             (ConfirmOutcome::Rejected, format!("{:#}", e))
                         }
                     };
 
-                    if !generation_id.is_empty() {
+                    if gated {
                         let _ = tx
                             .send(AgentMessage {
                                 payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
                                     generation_id,
-                                    outcome: confirm_outcome as i32,
-                                    error_message: confirm_error,
+                                    outcome: outcome as i32,
+                                    error_message,
                                 })),
                             })
                             .await;
                     }
 
-                    // Snapshot after attach so controller sees updated attachment state.
-                    let snapshot = fetch_state_snapshot(&url_for_snapshot).await;
-                    let _ = tx
-                        .send(AgentMessage {
-                            payload: Some(AgentPayload::State(snapshot)),
-                        })
-                        .await;
+                    // Snapshot after attach so the controller sees updated
+                    // attachment state.
+                    if let Some(url) = url_for_snapshot {
+                        let snapshot = fetch_state_snapshot(&url).await;
+                        let _ = tx
+                            .send(AgentMessage {
+                                payload: Some(AgentPayload::State(snapshot)),
+                            })
+                            .await;
+                    }
                 });
             } else {
-                log::warn!("No local GraphQL URL configured — cannot attach program");
-                if !generation_id.is_empty() {
-                    stream
+                log::warn!("No local applier configured — cannot attach program");
+                if gated {
+                    outbound_tx
                         .send(AgentMessage {
                             payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
                                 generation_id,
                                 outcome: ConfirmOutcome::Rejected as i32,
-                                error_message: "No local GraphQL URL configured".to_string(),
+                                error_message: "No local applier configured".to_string(),
                             })),
                         })
                         .await
@@ -739,76 +831,181 @@ async fn handle_controller_message(
         }
         Some(CtrlPayload::SetFib(fib)) => {
             let generation_id = fib.generation_id.clone();
+            let gated = !generation_id.is_empty();
+            let deadline_ms = fib.confirm_deadline_ms;
+            let enabled = fib.enabled;
+            let interface = fib.interface_name.clone();
             log::info!(
                 "Received SetFibForwarding (interface={}, enabled={}, generation={})",
-                fib.interface_name,
-                fib.enabled,
+                interface,
+                enabled,
                 generation_id,
             );
-            if let Some(url) = local_graphql_url {
-                let url = url.to_string();
-                let url_for_push = url.clone();
-                let enabled = fib.enabled;
-                let interface = fib.interface_name.clone();
-                let op_result = tokio::task::spawn_blocking(move || {
-                    use policy_engine_dev::{ClientConfig, PolicyClient};
-                    let client = PolicyClient::with_config(ClientConfig {
-                        server_url: url,
-                        ..Default::default()
-                    });
-                    client.set_fib_forwarding(&interface, enabled)
-                })
-                .await
-                .context("spawn_blocking panicked")?;
 
-                let (confirm_outcome, confirm_error) = match &op_result {
-                    Ok(r) if r.success => {
+            if let Some(a) = applier {
+                // Capture the prior enable state so the change can be rolled back
+                // by the watchdog if the controller's CommitAck is not received
+                // in time. Fall back to "false" if it can't be read.
+                let prior = a.get_fib_forwarding(&interface).await.unwrap_or_else(|e| {
+                    log::warn!(
+                        "SetFib: could not read prior FIB state for {} ({:#}); \
+                         will revert to disabled if needed",
+                        interface,
+                        e
+                    );
+                    false
+                });
+
+                let apply_res = a.set_fib_forwarding(&interface, enabled).await;
+                let (outcome, error_message) = match &apply_res {
+                    Ok(()) => {
                         log::info!(
                             "FIB forwarding {} on {}",
-                            if fib.enabled { "enabled" } else { "disabled" },
-                            fib.interface_name
+                            if enabled { "enabled" } else { "disabled" },
+                            interface
                         );
+                        if gated {
+                            pending.register(
+                                generation_id.clone(),
+                                vec![InverseOp::SetFibForwarding {
+                                    interface: interface.clone(),
+                                    enabled: prior,
+                                }],
+                                watchdog_deadline_ms(deadline_ms),
+                                Arc::clone(a),
+                                outbound_tx.clone(),
+                            );
+                        }
                         (ConfirmOutcome::Applied, String::new())
                     }
-                    Ok(r) => {
-                        log::warn!("Failed to set FIB forwarding: {}", r.message);
-                        (ConfirmOutcome::Rejected, r.message.clone())
-                    }
                     Err(e) => {
-                        log::error!("Error setting FIB forwarding: {:#}", e);
+                        log::warn!("Failed to set FIB forwarding on {}: {:#}", interface, e);
                         (ConfirmOutcome::Rejected, format!("{:#}", e))
                     }
                 };
 
-                if !generation_id.is_empty() {
-                    stream
+                if gated {
+                    outbound_tx
                         .send(AgentMessage {
                             payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
                                 generation_id: generation_id.clone(),
-                                outcome: confirm_outcome as i32,
-                                error_message: confirm_error,
+                                outcome: outcome as i32,
+                                error_message,
                             })),
                         })
                         .await
                         .context("Failed to send ConfigConfirm for set_fib")?;
-                }
-
-                if matches!(op_result, Ok(ref r) if r.success) {
-                    spawn_push_state_snapshot(url_for_push, outbound_tx.clone());
+                } else if apply_res.is_ok() {
+                    if let Some(url) = local_graphql_url {
+                        spawn_push_state_snapshot(url.to_string(), outbound_tx.clone());
+                    }
                 }
             } else {
-                log::warn!("No local GraphQL URL configured — cannot set FIB forwarding");
-                if !generation_id.is_empty() {
-                    stream
+                log::warn!("No local applier configured — cannot set FIB forwarding");
+                if gated {
+                    outbound_tx
                         .send(AgentMessage {
                             payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
                                 generation_id,
                                 outcome: ConfirmOutcome::Rejected as i32,
-                                error_message: "No local GraphQL URL configured".to_string(),
+                                error_message: "No local applier configured".to_string(),
                             })),
                         })
                         .await
                         .context("Failed to send ConfigConfirm for set_fib")?;
+                }
+            }
+        }
+        Some(CtrlPayload::SetUrpf(urpf)) => {
+            let generation_id = urpf.generation_id.clone();
+            let gated = !generation_id.is_empty();
+            let deadline_ms = urpf.confirm_deadline_ms;
+            let mode_str = match urpf.mode {
+                1 => "LOOSE",
+                2 => "STRICT",
+                _ => "OFF",
+            };
+            let interface = urpf.interface_name.clone();
+            log::info!(
+                "Received SetUrpf (interface={}, mode={}, generation={})",
+                interface,
+                mode_str,
+                generation_id,
+            );
+
+            if let Some(a) = applier {
+                // Capture the prior mode *before* applying so the change can be
+                // rolled back. uRPF filters ingress on this interface and can
+                // sever the agent's own control channel, so a gated change arms
+                // a watchdog that reverts to the prior mode if the controller's
+                // CommitAck is not received within the deadline. If the prior
+                // mode can't be read, fall back to "off" — reverting to off
+                // always restores connectivity.
+                let prior_mode = a.get_urpf(&interface).await.unwrap_or_else(|e| {
+                    log::warn!(
+                        "SetUrpf: could not read prior uRPF mode for {} ({:#}); \
+                         will revert to off if needed",
+                        interface,
+                        e
+                    );
+                    "off".to_string()
+                });
+
+                let apply_res = a.set_urpf(&interface, mode_str).await;
+                let (outcome, error_message) = match &apply_res {
+                    Ok(()) => {
+                        log::info!("uRPF {} on {}", mode_str, interface);
+                        if gated {
+                            pending.register(
+                                generation_id.clone(),
+                                vec![InverseOp::SetUrpf {
+                                    interface: interface.clone(),
+                                    mode: prior_mode,
+                                }],
+                                watchdog_deadline_ms(deadline_ms),
+                                Arc::clone(a),
+                                outbound_tx.clone(),
+                            );
+                        }
+                        (ConfirmOutcome::Applied, String::new())
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to set uRPF on {}: {:#}", interface, e);
+                        (ConfirmOutcome::Rejected, format!("{:#}", e))
+                    }
+                };
+
+                if gated {
+                    outbound_tx
+                        .send(AgentMessage {
+                            payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
+                                generation_id: generation_id.clone(),
+                                outcome: outcome as i32,
+                                error_message,
+                            })),
+                        })
+                        .await
+                        .context("Failed to send ConfigConfirm for set_urpf")?;
+                } else if apply_res.is_ok() {
+                    // Legacy (non-gated) push has no confirm handshake, so report
+                    // the new state to the controller via a fresh snapshot.
+                    if let Some(url) = local_graphql_url {
+                        spawn_push_state_snapshot(url.to_string(), outbound_tx.clone());
+                    }
+                }
+            } else {
+                log::warn!("No local applier configured — cannot set uRPF");
+                if gated {
+                    outbound_tx
+                        .send(AgentMessage {
+                            payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
+                                generation_id,
+                                outcome: ConfirmOutcome::Rejected as i32,
+                                error_message: "No local applier configured".to_string(),
+                            })),
+                        })
+                        .await
+                        .context("Failed to send ConfigConfirm for set_urpf")?;
                 }
             }
         }
@@ -833,70 +1030,79 @@ async fn handle_controller_message(
                 direction_str,
                 generation_id,
             );
-            if let Some(url) = local_graphql_url {
-                let url_owned = url.to_string();
-                let url = url_owned.clone();
-                let direction = direction_str.to_string();
-                let iface = interface_name.clone();
-                let op_result = tokio::task::spawn_blocking(move || {
-                    use policy_engine_dev::{ClientConfig, PolicyClient};
-                    let client = PolicyClient::with_config(ClientConfig {
-                        server_url: url_owned,
-                        ..Default::default()
-                    });
-                    match direction.as_str() {
-                        "ingress" => client.detach_ingress(&iface),
-                        "egress" => client.detach_tc(&iface),
-                        _ => Err(anyhow::anyhow!("Invalid direction: {}", direction)),
-                    }
-                })
-                .await
-                .context("spawn_blocking panicked")?;
+            let gated = !generation_id.is_empty();
+            let deadline_ms = detach.confirm_deadline_ms;
 
-                let (confirm_outcome, confirm_error) = match &op_result {
-                    Ok(r) if r.success => {
+            if let Some(a) = applier {
+                // Capture the prior attach mode so the inverse can re-attach the
+                // program if the change is not confirmed. If it wasn't attached,
+                // detach is a no-op and the inverse is empty.
+                let prior_mode = a
+                    .list_attachments()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|(i, d, _)| i == &interface_name && d == direction_str)
+                    .map(|(_, _, m)| m);
+
+                let apply_res = a.detach(&interface_name, direction_str).await;
+                let (outcome, error_message) = match &apply_res {
+                    Ok(()) => {
                         log::info!(
                             "Successfully detached program from {} {}",
                             direction_str,
                             interface_name
                         );
+                        if gated {
+                            let inverse = match prior_mode {
+                                Some(mode) => vec![InverseOp::Attach {
+                                    interface: interface_name.clone(),
+                                    direction: direction_str.to_string(),
+                                    mode,
+                                }],
+                                None => Vec::new(),
+                            };
+                            pending.register(
+                                generation_id.clone(),
+                                inverse,
+                                watchdog_deadline_ms(deadline_ms),
+                                Arc::clone(a),
+                                outbound_tx.clone(),
+                            );
+                        }
                         (ConfirmOutcome::Applied, String::new())
                     }
-                    Ok(r) => {
-                        log::warn!("Failed to detach program: {}", r.message);
-                        (ConfirmOutcome::Rejected, r.message.clone())
-                    }
                     Err(e) => {
-                        log::error!("Error detaching program: {:#}", e);
+                        log::warn!("Failed to detach program: {:#}", e);
                         (ConfirmOutcome::Rejected, format!("{:#}", e))
                     }
                 };
 
-                if !generation_id.is_empty() {
-                    stream
+                if gated {
+                    outbound_tx
                         .send(AgentMessage {
                             payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
                                 generation_id: generation_id.clone(),
-                                outcome: confirm_outcome as i32,
-                                error_message: confirm_error,
+                                outcome: outcome as i32,
+                                error_message,
                             })),
                         })
                         .await
                         .context("Failed to send ConfigConfirm for detach")?;
+                } else if apply_res.is_ok() {
+                    if let Some(url) = local_graphql_url {
+                        spawn_push_state_snapshot(url.to_string(), outbound_tx.clone());
+                    }
                 }
-
-                // Push a fresh snapshot non-blocking so the message loop can
-                // continue receiving messages while the snapshot is fetched.
-                spawn_push_state_snapshot(url, outbound_tx.clone());
             } else {
-                log::warn!("No local GraphQL URL configured — cannot detach program");
-                if !generation_id.is_empty() {
-                    stream
+                log::warn!("No local applier configured — cannot detach program");
+                if gated {
+                    outbound_tx
                         .send(AgentMessage {
                             payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
                                 generation_id,
                                 outcome: ConfirmOutcome::Rejected as i32,
-                                error_message: "No local GraphQL URL configured".to_string(),
+                                error_message: "No local applier configured".to_string(),
                             })),
                         })
                         .await
@@ -1188,7 +1394,7 @@ async fn do_fetch_state_snapshot(graphql_url: &str) -> Result<StateSnapshot> {
     use policy_engine_dev::{ClientConfig, GqlDirection, PolicyClient};
 
     let url = graphql_url.to_string();
-    let (ingress_rules, egress_rules, interfaces, fib_entries, stop_behavior) =
+    let (ingress_rules, egress_rules, interfaces, fib_entries, urpf_entries, stop_behavior) =
         tokio::task::spawn_blocking(move || {
             let client = PolicyClient::with_config(ClientConfig {
                 server_url: url,
@@ -1198,8 +1404,9 @@ async fn do_fetch_state_snapshot(graphql_url: &str) -> Result<StateSnapshot> {
             let egress = client.list_rules(GqlDirection::Egress)?;
             let ifaces = client.list_interfaces()?;
             let fib = client.list_fib_forwarding().unwrap_or_default();
+            let urpf = client.list_urpf().unwrap_or_default();
             let sb = client.get_stop_behavior().unwrap_or_default();
-            Ok::<_, anyhow::Error>((ingress, egress, ifaces, fib, sb))
+            Ok::<_, anyhow::Error>((ingress, egress, ifaces, fib, urpf, sb))
         })
         .await
         .context("spawn_blocking panicked")??;
@@ -1275,6 +1482,22 @@ async fn do_fetch_state_snapshot(graphql_url: &str) -> Result<StateSnapshot> {
         .filter_map(|(iface, enabled)| if enabled { Some(iface) } else { None })
         .collect();
 
+    let urpf_interfaces = urpf_entries
+        .into_iter()
+        .filter_map(|(iface, mode)| {
+            let m = match mode.to_uppercase().as_str() {
+                "LOOSE" => 1u32,
+                "STRICT" => 2u32,
+                _ => 0u32,
+            };
+            if m != 0 {
+                Some((iface, m))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     Ok(StateSnapshot {
         rules,
         attachments,
@@ -1282,6 +1505,7 @@ async fn do_fetch_state_snapshot(graphql_url: &str) -> Result<StateSnapshot> {
         fib_forwarding_interfaces,
         per_interface_default_actions: std::collections::HashMap::new(),
         stop_behavior,
+        urpf_interfaces,
     })
 }
 
@@ -1356,6 +1580,16 @@ mod tests {
         inbound: VecDeque<ControllerMessage>,
     }
 
+    /// Write half of [`MockStreamHandle`]; records every sent message.
+    struct MockStreamTx {
+        sent: Arc<Mutex<Vec<AgentMessage>>>,
+    }
+
+    /// Read half of [`MockStreamHandle`]; replays pre-loaded inbound messages.
+    struct MockStreamRx {
+        inbound: VecDeque<ControllerMessage>,
+    }
+
     impl MockStreamHandle {
         fn new(inbound: Vec<ControllerMessage>) -> (Self, Arc<Mutex<Vec<AgentMessage>>>) {
             let sent = Arc::new(Mutex::new(Vec::new()));
@@ -1368,14 +1602,30 @@ mod tests {
     }
 
     #[async_trait]
-    impl AgentStreamHandle for MockStreamHandle {
+    impl AgentStreamTx for MockStreamTx {
         async fn send(&mut self, msg: AgentMessage) -> Result<()> {
             self.sent.lock().await.push(msg);
             Ok(())
         }
+    }
 
+    #[async_trait]
+    impl AgentStreamRx for MockStreamRx {
         async fn recv(&mut self) -> Result<Option<ControllerMessage>> {
             Ok(self.inbound.pop_front())
+        }
+    }
+
+    impl AgentStreamHandle for MockStreamHandle {
+        type Tx = MockStreamTx;
+        type Rx = MockStreamRx;
+        fn split(self) -> (MockStreamTx, MockStreamRx) {
+            (
+                MockStreamTx { sent: self.sent },
+                MockStreamRx {
+                    inbound: self.inbound,
+                },
+            )
         }
     }
 
@@ -1551,6 +1801,102 @@ mod tests {
         assert!(
             snapshot.is_some(),
             "StateSnapshot must be sent after StateQuery"
+        );
+    }
+
+    /// Stream handle whose write half stalls forever after the first send,
+    /// modelling a back-pressured (full HTTP/2 window) connection.
+    struct StallTxStreamHandle {
+        inbound: VecDeque<ControllerMessage>,
+    }
+    struct StallTx {
+        remaining_ok: usize,
+    }
+    struct StallRx {
+        inbound: VecDeque<ControllerMessage>,
+    }
+
+    #[async_trait]
+    impl AgentStreamTx for StallTx {
+        async fn send(&mut self, _msg: AgentMessage) -> Result<()> {
+            if self.remaining_ok > 0 {
+                self.remaining_ok -= 1;
+                return Ok(());
+            }
+            // Never completes — the connection's send window is wedged.
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    #[async_trait]
+    impl AgentStreamRx for StallRx {
+        async fn recv(&mut self) -> Result<Option<ControllerMessage>> {
+            Ok(self.inbound.pop_front())
+        }
+    }
+
+    impl AgentStreamHandle for StallTxStreamHandle {
+        type Tx = StallTx;
+        type Rx = StallRx;
+        fn split(self) -> (StallTx, StallRx) {
+            // Let only AgentHello through; every subsequent send blocks forever.
+            (
+                StallTx { remaining_ok: 1 },
+                StallRx {
+                    inbound: self.inbound,
+                },
+            )
+        }
+    }
+
+    /// Regression guard for the bidirectional-stream deadlock: a wedged write
+    /// half must not park the reader. The first inbound message (`StateQuery`)
+    /// queues an outbound send the writer stalls on; if the reader were coupled
+    /// to the writer it would never reach the second message and the metrics
+    /// interval would stay at its initial value.
+    #[tokio::test]
+    async fn stalled_writer_does_not_block_reader() {
+        use policy_controller_proto::controller::{SetMetricsInterval, StateQuery};
+        let inbound = vec![
+            ControllerMessage {
+                payload: Some(CtrlPayload::StateQuery(StateQuery {})),
+            },
+            ControllerMessage {
+                payload: Some(CtrlPayload::SetMetricsInterval(SetMetricsInterval {
+                    interval_secs: 7,
+                })),
+            },
+        ];
+        let stream = StallTxStreamHandle {
+            inbound: inbound.into(),
+        };
+        let id = mock_identity();
+        let interval = Arc::new(AtomicU64::new(30));
+        // The reader runs to completion in microseconds; teardown then waits on
+        // the stalled writer (WRITER_FLUSH_TIMEOUT), so cap the whole call well
+        // under that — we only care that the reader made progress.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(500),
+            run_stream_loop(
+                stream,
+                &id,
+                "0.1.0",
+                None,
+                None,
+                None,
+                None,
+                &[],
+                Arc::clone(&interval),
+                None,
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            interval.load(Ordering::Relaxed),
+            7,
+            "reader must process inbound past a message whose response the writer stalled on"
         );
     }
 

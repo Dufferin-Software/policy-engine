@@ -172,6 +172,8 @@ pub struct InterfaceStats {
     pub fib_forwarded_packets: u64,
     pub fib_forwarded_bytes: u64,
     pub fib_fallback_packets: u64,
+    pub urpf_drop_packets: u64,
+    pub urpf_drop_bytes: u64,
 }
 
 /// Parse all global stats for the given interface + direction from Prometheus text.
@@ -211,6 +213,8 @@ pub fn parse_interface_stats(text: &str, interface: &str, direction: &str) -> In
         fib_forwarded_packets: c("policy_engine_fib_forwarded_packets_total"),
         fib_forwarded_bytes: c("policy_engine_fib_forwarded_bytes_total"),
         fib_fallback_packets: c("policy_engine_fib_fallback_packets_total"),
+        urpf_drop_packets: c("policy_engine_urpf_drop_packets_total"),
+        urpf_drop_bytes: c("policy_engine_urpf_drop_bytes_total"),
     }
 }
 

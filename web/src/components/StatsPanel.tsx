@@ -27,6 +27,8 @@ const GET_STATS = gql`
       fibForwardedPackets
       fibForwardedBytes
       fibFallbackPackets
+      urpfDropPackets
+      urpfDropBytes
     }
   }
 `
@@ -101,6 +103,8 @@ interface GlobalStats {
   fibForwardedPackets: number
   fibForwardedBytes: number
   fibFallbackPackets: number
+  urpfDropPackets: number
+  urpfDropBytes: number
 }
 
 interface EthertypeStat {
@@ -380,6 +384,27 @@ function DirectionStatsPane({
                 </div>
               </div>
             )}
+
+          {/* uRPF — ingress only, only shown when non-zero */}
+          {!isEgress && data.stats.urpfDropPackets > 0 && (
+            <div>
+              <p className="text-xs uppercase tracking-wider text-gray-500 mb-2">
+                uRPF (Reverse Path Filtering)
+              </p>
+              <div className="grid grid-cols-2 gap-2">
+                <StatCard
+                  label="uRPF Drop Pkts"
+                  value={formatNumber(data.stats.urpfDropPackets)}
+                  color="red"
+                />
+                <StatCard
+                  label="uRPF Drop Bytes"
+                  value={formatBytes(data.stats.urpfDropBytes)}
+                  color="red"
+                />
+              </div>
+            </div>
+          )}
 
           {/* Diagnostics */}
           <div>

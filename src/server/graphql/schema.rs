@@ -222,6 +222,28 @@ impl QueryRoot {
             .collect())
     }
 
+    /// List per-interface uRPF (unicast Reverse Path Forwarding) mode.
+    /// Only interfaces with uRPF enabled are returned.
+    async fn urpf<'ctx>(
+        &self,
+        ctx: &Context<'ctx>,
+    ) -> Result<Vec<crate::server::graphql::types::UrpfEntry>> {
+        let state = ctx.data::<Arc<AppState>>()?;
+        let service = state.service.lock().await;
+        let entries = service
+            .list_urpf()
+            .map_err(|e| async_graphql::Error::new(format!("{:#}", e)))?;
+        Ok(entries
+            .into_iter()
+            .map(
+                |(interface, mode)| crate::server::graphql::types::UrpfEntry {
+                    interface,
+                    mode: mode.into(),
+                },
+            )
+            .collect())
+    }
+
     /// IPFIX flow export status and configuration
     #[cfg(feature = "ipfix")]
     async fn flow_export_status<'ctx>(
@@ -1461,6 +1483,36 @@ impl MutationRoot {
 
         state.audit_logger.log_event(
             "set_fib_forwarding",
+            serde_json::to_value(&input).unwrap_or(serde_json::Value::Null),
+            if op.success { "ok" } else { "error" },
+            &op.message,
+            &source_ip,
+        );
+        Ok(OperationResult {
+            success: op.success,
+            message: op.message,
+        })
+    }
+
+    /// Set the uRPF (unicast Reverse Path Forwarding) mode on a single ingress
+    /// interface. uRPF is ingress-only (XDP); enabling it on an interface
+    /// without XDP attached (e.g. a TC egress interface) is rejected.
+    async fn set_urpf<'ctx>(
+        &self,
+        ctx: &Context<'ctx>,
+        input: crate::server::graphql::types::SetUrpfInput,
+    ) -> Result<OperationResult> {
+        let state = ctx.data::<Arc<AppState>>()?;
+        let source_ip = get_source_ip(ctx);
+        let mut service = state.service.lock().await;
+
+        let mode: u32 = input.mode.into();
+        let op = service
+            .set_urpf(&input.interface, mode)
+            .map_err(|e| async_graphql::Error::new(format!("{:#}", e)))?;
+
+        state.audit_logger.log_event(
+            "set_urpf",
             serde_json::to_value(&input).unwrap_or(serde_json::Value::Null),
             if op.success { "ok" } else { "error" },
             &op.message,
@@ -3343,6 +3395,8 @@ mod tests {
     async fn set_fib_forwarding_enabled() {
         let mut mock = make_mock_bpf();
         mock.expect_load_programs().times(1).returning(|| Ok(()));
+        mock.expect_get_fib_config()
+            .returning(|_| Ok(crate::types::FibConfig::default()));
         mock.expect_set_fib_config()
             .times(1)
             .withf(|iface, cfg| iface == "eth0" && cfg.mode == crate::types::FIB_FORWARD_ENABLED)
@@ -3363,6 +3417,8 @@ mod tests {
     async fn set_fib_forwarding_disabled() {
         let mut mock = make_mock_bpf();
         mock.expect_load_programs().times(1).returning(|| Ok(()));
+        mock.expect_get_fib_config()
+            .returning(|_| Ok(crate::types::FibConfig::default()));
         mock.expect_set_fib_config()
             .times(1)
             .withf(|iface, cfg| iface == "eth0" && cfg.mode == crate::types::FIB_FORWARD_DISABLED)
@@ -3416,6 +3472,126 @@ mod tests {
         let data = resp.data.into_json().unwrap();
         assert_eq!(data["fibForwarding"][0]["interface"], "eth0");
         assert_eq!(data["fibForwarding"][0]["enabled"], true);
+    }
+
+    // -------------------------------------------------------------------------
+    // uRPF tests
+    // -------------------------------------------------------------------------
+
+    fn ingress_attachment(iface: &str) -> crate::shared_types::InterfaceAttachment {
+        crate::shared_types::InterfaceAttachment {
+            interface: iface.to_string(),
+            ifindex: 2,
+            mode: "xdp".to_string(),
+            direction: "ingress".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_urpf_strict_on_xdp_interface() {
+        let mut mock = make_mock_bpf();
+        mock.expect_load_programs().times(1).returning(|| Ok(()));
+        mock.expect_get_attached_interfaces()
+            .returning(|| vec![ingress_attachment("eth0")]);
+        mock.expect_get_fib_config()
+            .returning(|_| Ok(crate::types::FibConfig::default()));
+        mock.expect_set_fib_config()
+            .times(1)
+            .withf(|iface, cfg| iface == "eth0" && cfg.urpf_mode == crate::types::URPF_STRICT)
+            .returning(|_, _| Ok(()));
+
+        let schema = make_schema(mock);
+        let resp = schema
+            .execute(
+                "mutation { setUrpf(input: { interface: \"eth0\", mode: STRICT }) { success message } }",
+            )
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.into_json().unwrap();
+        assert_eq!(data["setUrpf"]["success"], true);
+    }
+
+    #[tokio::test]
+    async fn set_urpf_rejected_on_non_xdp_interface() {
+        let mut mock = make_mock_bpf();
+        mock.expect_load_programs().times(1).returning(|| Ok(()));
+        // Only a TC egress attachment exists — uRPF must be rejected.
+        mock.expect_get_attached_interfaces().returning(|| {
+            vec![crate::shared_types::InterfaceAttachment {
+                interface: "eth0".to_string(),
+                ifindex: 2,
+                mode: "tc".to_string(),
+                direction: "egress".to_string(),
+            }]
+        });
+        // set_fib_config must NOT be called when the interface is rejected.
+        mock.expect_set_fib_config().never();
+
+        let schema = make_schema(mock);
+        let resp = schema
+            .execute(
+                "mutation { setUrpf(input: { interface: \"eth0\", mode: LOOSE }) { success message } }",
+            )
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.into_json().unwrap();
+        assert_eq!(data["setUrpf"]["success"], false);
+    }
+
+    #[tokio::test]
+    async fn set_urpf_off_does_not_require_xdp() {
+        let mut mock = make_mock_bpf();
+        mock.expect_load_programs().times(1).returning(|| Ok(()));
+        // Disabling uRPF skips the XDP-attached check entirely.
+        mock.expect_get_fib_config()
+            .returning(|_| Ok(crate::types::FibConfig::default()));
+        mock.expect_set_fib_config()
+            .times(1)
+            .withf(|iface, cfg| iface == "eth0" && cfg.urpf_mode == crate::types::URPF_DISABLED)
+            .returning(|_, _| Ok(()));
+
+        let schema = make_schema(mock);
+        let resp = schema
+            .execute(
+                "mutation { setUrpf(input: { interface: \"eth0\", mode: OFF }) { success message } }",
+            )
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.into_json().unwrap();
+        assert_eq!(data["setUrpf"]["success"], true);
+    }
+
+    #[tokio::test]
+    async fn urpf_query_returns_enabled_entries() {
+        let mut mock = make_mock_bpf();
+        mock.expect_list_fib_configs().times(1).returning(|| {
+            Ok(vec![
+                (
+                    "eth0".to_string(),
+                    crate::types::FibConfig {
+                        urpf_mode: crate::types::URPF_STRICT,
+                        ..Default::default()
+                    },
+                ),
+                // fib-only entry (uRPF disabled) must be filtered out.
+                (
+                    "eth1".to_string(),
+                    crate::types::FibConfig {
+                        mode: crate::types::FIB_FORWARD_ENABLED,
+                        ..Default::default()
+                    },
+                ),
+            ])
+        });
+
+        let schema = make_schema(mock);
+        let resp = schema.execute("{ urpf { interface mode } }").await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.into_json().unwrap();
+        let arr = data["urpf"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(data["urpf"][0]["interface"], "eth0");
+        assert_eq!(data["urpf"][0]["mode"], "STRICT");
     }
 
     // ── Schedule/TTL input validation ────────────────────────────────────────

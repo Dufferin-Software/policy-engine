@@ -732,7 +732,7 @@ impl ControllerStore for SqliteControllerStore {
         let rows = if let Some(t) = tenant_id {
             sqlx::query(
                 "SELECT ni.node_id, ni.interface_name, ni.ifindex, ni.mac_address, ni.link_state, ni.addresses_json, \
-                 ni.tag, ni.last_reported, ni.xdp_attached, ni.tc_attached, ni.fib_forwarding, \
+                 ni.tag, ni.last_reported, ni.xdp_attached, ni.tc_attached, ni.fib_forwarding, ni.urpf_mode, \
                  ni.ingress_default_action, ni.egress_default_action \
                  FROM node_interfaces ni \
                  JOIN nodes n ON n.id = ni.node_id \
@@ -745,7 +745,7 @@ impl ControllerStore for SqliteControllerStore {
         } else {
             sqlx::query(
                 "SELECT node_id, interface_name, ifindex, mac_address, link_state, addresses_json, \
-                 tag, last_reported, xdp_attached, tc_attached, fib_forwarding, \
+                 tag, last_reported, xdp_attached, tc_attached, fib_forwarding, urpf_mode, \
                  ingress_default_action, egress_default_action \
                  FROM node_interfaces ORDER BY node_id, interface_name",
             )
@@ -759,7 +759,7 @@ impl ControllerStore for SqliteControllerStore {
     async fn list_node_interfaces(&self, node_id: &str) -> Result<Vec<NodeInterface>> {
         let rows = sqlx::query(
             "SELECT node_id, interface_name, ifindex, mac_address, link_state, addresses_json, \
-             tag, last_reported, xdp_attached, tc_attached, fib_forwarding, \
+             tag, last_reported, xdp_attached, tc_attached, fib_forwarding, urpf_mode, \
              ingress_default_action, egress_default_action \
              FROM node_interfaces WHERE node_id = ? ORDER BY interface_name",
         )
@@ -851,6 +851,38 @@ impl ControllerStore for SqliteControllerStore {
             .execute(&mut *tx)
             .await
             .context("Failed to set interface fib_forwarding")?;
+        }
+        tx.commit().await.context("Failed to commit")?;
+        Ok(())
+    }
+
+    async fn update_interface_urpf(
+        &self,
+        node_id: &str,
+        interface_modes: &[(String, u32)],
+    ) -> Result<()> {
+        // Reset uRPF on all interfaces for this node, then apply the listed modes.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("Failed to begin transaction")?;
+        sqlx::query("UPDATE node_interfaces SET urpf_mode = 0 WHERE node_id = ?")
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to clear node urpf_mode")?;
+        for (iface, mode) in interface_modes {
+            sqlx::query(
+                "UPDATE node_interfaces SET urpf_mode = ? \
+                 WHERE node_id = ? AND interface_name = ?",
+            )
+            .bind(*mode as i64)
+            .bind(node_id)
+            .bind(iface)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to set interface urpf_mode")?;
         }
         tx.commit().await.context("Failed to commit")?;
         Ok(())
@@ -1308,6 +1340,7 @@ fn row_to_node_interface(row: sqlx::sqlite::SqliteRow) -> Result<NodeInterface> 
         xdp_attached: row.try_get::<bool, _>("xdp_attached").unwrap_or(false),
         tc_attached: row.try_get::<bool, _>("tc_attached").unwrap_or(false),
         fib_forwarding: row.try_get::<bool, _>("fib_forwarding").unwrap_or(false),
+        urpf_mode: row.try_get::<i64, _>("urpf_mode").unwrap_or(0) as u32,
         ingress_default_action: row.try_get("ingress_default_action").unwrap_or(None),
         egress_default_action: row.try_get("egress_default_action").unwrap_or(None),
     })
@@ -1393,6 +1426,60 @@ mod tests {
                 .metrics_interval_secs,
             None
         );
+    }
+
+    // uRPF mode persists per interface and clears interfaces not listed, via
+    // both the per-node and list-all SELECT paths.
+    #[tokio::test]
+    async fn urpf_mode_round_trips_through_sqlite() {
+        let (store, _dir) = temp_store().await;
+        store.upsert_node(&sample_node("n1")).await.unwrap();
+        store
+            .upsert_node_interfaces(
+                "n1",
+                &[
+                    InterfaceReport {
+                        name: "eth0".to_string(),
+                        addresses: vec![],
+                        mac_address: String::new(),
+                        link_state: "up".to_string(),
+                        ifindex: 2,
+                    },
+                    InterfaceReport {
+                        name: "eth1".to_string(),
+                        addresses: vec![],
+                        mac_address: String::new(),
+                        link_state: "up".to_string(),
+                        ifindex: 3,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Default is off (0) for every interface.
+        let ifaces = store.list_node_interfaces("n1").await.unwrap();
+        assert!(ifaces.iter().all(|i| i.urpf_mode == 0));
+
+        // Set eth0 = strict (2), eth1 = loose (1).
+        store
+            .update_interface_urpf("n1", &[("eth0".to_string(), 2), ("eth1".to_string(), 1)])
+            .await
+            .unwrap();
+        let ifaces = store.list_node_interfaces("n1").await.unwrap();
+        let mode = |name: &str| ifaces.iter().find(|i| i.name == name).unwrap().urpf_mode;
+        assert_eq!(mode("eth0"), 2);
+        assert_eq!(mode("eth1"), 1);
+
+        // Re-applying with only eth0 listed clears eth1 back to off.
+        store
+            .update_interface_urpf("n1", &[("eth0".to_string(), 1)])
+            .await
+            .unwrap();
+        let all = store.list_all_node_interfaces(None).await.unwrap();
+        let mode = |name: &str| all.iter().find(|i| i.name == name).unwrap().urpf_mode;
+        assert_eq!(mode("eth0"), 1);
+        assert_eq!(mode("eth1"), 0);
     }
 
     fn sample_rule(id: &str, node_id: &str) -> Rule {

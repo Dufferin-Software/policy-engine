@@ -97,6 +97,9 @@ message StateSnapshot {
     map<string, string>          per_interface_default_actions = 5;
     // Current stop behavior: "clear-state" or "preserve-state". Empty means not yet reported.
     string stop_behavior = 6;
+    // Per-interface uRPF mode (ingress only). Key = interface name, value = mode
+    // (1 = loose, 2 = strict). Interfaces with uRPF off are omitted.
+    map<string, uint32> urpf_interfaces = 7;
 }
 
 message PersistedRule {
@@ -197,6 +200,7 @@ message ControllerMessage {
         MetricsQuery       metrics_query  = 8;
         ClearStats         clear_stats    = 9;
         SetMetricsInterval set_metrics_interval = 10;
+        SetUrpf            set_urpf       = 11;
     }
 }
 
@@ -221,6 +225,17 @@ message ConfigCommitAck {
 message SetFibForwarding {
     string interface_name      = 1;
     bool   enabled             = 2;
+    string generation_id       = 10;  // ULID; empty means legacy push with no gating
+    uint32 confirm_deadline_ms = 11;  // Agent must confirm within this window
+}
+
+// Set the uRPF (unicast Reverse Path Forwarding) mode on a single ingress
+// interface. uRPF is ingress-only (XDP); the interface must already have XDP
+// attached or the agent returns an error. It is never supported on egress.
+//   mode: 0 = off, 1 = loose, 2 = strict (matches URPF_* in policy_common.h)
+message SetUrpf {
+    string interface_name      = 1;
+    uint32 mode                = 2;
     string generation_id       = 10;  // ULID; empty means legacy push with no gating
     uint32 confirm_deadline_ms = 11;  // Agent must confirm within this window
 }

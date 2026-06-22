@@ -2143,6 +2143,8 @@ impl BpfManager {
                     total_stats.fib_forwarded_packets += stats.fib_forwarded_packets;
                     total_stats.fib_forwarded_bytes += stats.fib_forwarded_bytes;
                     total_stats.fib_fallback_packets += stats.fib_fallback_packets;
+                    total_stats.urpf_drop_packets += stats.urpf_drop_packets;
+                    total_stats.urpf_drop_bytes += stats.urpf_drop_bytes;
                 }
             }
         }
@@ -2979,7 +2981,12 @@ impl BpfManager {
         let ifindex = Self::get_ifindex(interface)? as u32;
         let key = ifindex.to_ne_bytes();
         if let Some(skel) = &mut self.xdp_skel {
-            if config.mode == crate::types::FIB_FORWARD_DISABLED {
+            // The entry is shared between FIB forwarding and uRPF.  Only delete
+            // it when BOTH features are disabled; otherwise persist the struct
+            // so disabling one feature does not wipe the other's config.
+            if config.mode == crate::types::FIB_FORWARD_DISABLED
+                && config.urpf_mode == crate::types::URPF_DISABLED
+            {
                 let _ = skel.maps.fib_config_map.delete(&key);
             } else {
                 skel.maps
@@ -2989,9 +2996,10 @@ impl BpfManager {
             }
         }
         let mode = config.mode;
+        let urpf_mode = config.urpf_mode;
         info!(
-            "Set FIB forwarding config: interface={} ifindex={} mode={}",
-            interface, ifindex, mode
+            "Set per-interface XDP config: interface={} ifindex={} fib_mode={} urpf_mode={}",
+            interface, ifindex, mode, urpf_mode
         );
         Ok(())
     }

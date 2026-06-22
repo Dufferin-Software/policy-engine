@@ -12,8 +12,8 @@ use policy_controller_proto::{
         agent_message::Payload as AgentPayload, config_confirm::Outcome as ConfigConfirmOutcome,
         controller_message::Payload as CtrlPayload,
         node_management_service_server::NodeManagementService, AgentMessage, ConfigCommitAck,
-        ControllerMessage, DeltaConfigPush, Disconnect, RenewClientCertRequest,
-        RenewClientCertResponse,
+        ConfigConfirm, ControllerMessage, DeltaConfigPush, Disconnect, RenewClientCertRequest,
+        RenewClientCertResponse, StateQuery,
     },
     PROTOCOL_VERSION,
 };
@@ -231,6 +231,36 @@ fn csr_subject_cn(csr_pem: &str) -> Result<String, String> {
 
 // ── Stream handler ────────────────────────────────────────────────────────────
 
+/// Capacity of the buffered outbound channel that sits between the inbound
+/// reader / session pushes and the tonic response channel. Larger than the
+/// tonic channel so transient bursts are absorbed; if it fills, the agent has
+/// genuinely stopped draining and the stream is torn down (see [`enqueue`]).
+const OUTBOUND_BUFFER: usize = 256;
+
+/// How long the teardown path waits for the writer task to flush a final queued
+/// message (e.g. a `Disconnect`) before aborting it.
+const WRITER_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Enqueue an outbound message on the buffered writer channel **without
+/// blocking**. A full buffer means the agent has stopped draining the stream;
+/// returning an error tears the connection down so the agent reconnects and
+/// re-syncs, rather than parking the inbound reader on a back-pressured send —
+/// which deadlocks the bidirectional stream (both ends blocked on `send`, so
+/// neither reads and neither send window reopens).
+fn enqueue(
+    tx: &mpsc::Sender<Result<ControllerMessage, Status>>,
+    msg: ControllerMessage,
+) -> anyhow::Result<()> {
+    use mpsc::error::TrySendError;
+    match tx.try_send(Ok(msg)) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => {
+            anyhow::bail!("outbound buffer full — agent not draining; closing stream")
+        }
+        Err(TrySendError::Closed(_)) => anyhow::bail!("outbound channel closed"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_agent_stream(
     mut inbound: impl futures_util::Stream<Item = anyhow::Result<AgentMessage>> + Send + Unpin + 'static,
@@ -242,9 +272,23 @@ async fn handle_agent_stream(
     pending: Arc<PendingRegistry>,
     rule_lifecycle_bus: Arc<RuleLifecycleBus>,
 ) {
+    // Buffered outbound + dedicated writer task. The inbound reader and session
+    // pushes enqueue onto `out_tx` (never blocking); the writer drains onto the
+    // tonic response channel `tx`, absorbing HTTP/2 back-pressure off the read
+    // path. `out_tx` is what gets registered with the session manager, so all
+    // controller→agent traffic funnels through this one buffer.
+    let (out_tx, mut out_rx) = mpsc::channel::<Result<ControllerMessage, Status>>(OUTBOUND_BUFFER);
+    let mut writer = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
     match drive_stream(
         &mut inbound,
-        &tx,
+        &out_tx,
         &sessions,
         &store,
         &event_bus,
@@ -256,11 +300,22 @@ async fn handle_agent_stream(
     {
         Ok(node_id) => {
             log::info!("Agent stream closed for node {}", node_id);
-            sessions.unregister_if_sender(&node_id, &tx);
+            sessions.unregister_if_sender(&node_id, &out_tx);
         }
         Err(e) => {
             log::warn!("Agent stream error: {:#}", e);
         }
+    }
+
+    // Let the writer flush any final queued message (e.g. a Disconnect emitted
+    // just before bailing) before the response stream closes, bounded so a
+    // wedged socket can't hang the task.
+    drop(out_tx);
+    if tokio::time::timeout(WRITER_FLUSH_TIMEOUT, &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
     }
 }
 
@@ -291,13 +346,13 @@ async fn drive_stream(
             hello.protocol_version, PROTOCOL_VERSION
         );
         log::warn!("{}", reason);
-        let _ = tx
-            .send(Ok(ControllerMessage {
-                payload: Some(CtrlPayload::Disconnect(Disconnect {
-                    reason: reason.clone(),
-                })),
-            }))
-            .await;
+        // Best-effort: we bail immediately after, and the writer task flushes
+        // this on teardown.
+        let _ = tx.try_send(Ok(ControllerMessage {
+            payload: Some(CtrlPayload::Disconnect(Disconnect {
+                reason: reason.clone(),
+            })),
+        }));
         anyhow::bail!("{}", reason);
     }
 
@@ -322,26 +377,26 @@ async fn drive_stream(
                 node_id
             );
             log::warn!("{}", reason);
-            let _ = tx
-                .send(Ok(ControllerMessage {
-                    payload: Some(CtrlPayload::Disconnect(Disconnect {
-                        reason: reason.clone(),
-                    })),
-                }))
-                .await;
+            // Best-effort: we bail immediately after, and the writer task
+            // flushes this on teardown.
+            let _ = tx.try_send(Ok(ControllerMessage {
+                payload: Some(CtrlPayload::Disconnect(Disconnect {
+                    reason: reason.clone(),
+                })),
+            }));
             anyhow::bail!("{}", reason);
         }
     };
 
     if node.status != NodeStatus::Active {
         let reason = format!("Node {} is not active (status={})", node_id, node.status);
-        let _ = tx
-            .send(Ok(ControllerMessage {
-                payload: Some(CtrlPayload::Disconnect(Disconnect {
-                    reason: reason.clone(),
-                })),
-            }))
-            .await;
+        // Best-effort: we bail immediately after, and the writer task flushes
+        // this on teardown.
+        let _ = tx.try_send(Ok(ControllerMessage {
+            payload: Some(CtrlPayload::Disconnect(Disconnect {
+                reason: reason.clone(),
+            })),
+        }));
         anyhow::bail!("{}", reason);
     }
 
@@ -362,13 +417,13 @@ async fn drive_stream(
                     tenant_id: None,
                 })
                 .await;
-            let _ = tx
-                .send(Ok(ControllerMessage {
-                    payload: Some(CtrlPayload::Disconnect(Disconnect {
-                        reason: reason.clone(),
-                    })),
-                }))
-                .await;
+            // Best-effort: we bail immediately after, and the writer task
+            // flushes this on teardown.
+            let _ = tx.try_send(Ok(ControllerMessage {
+                payload: Some(CtrlPayload::Disconnect(Disconnect {
+                    reason: reason.clone(),
+                })),
+            }));
             anyhow::bail!("{}", reason);
         }
     }
@@ -481,11 +536,12 @@ async fn drive_stream(
                     node_id,
                     push.rules_to_add.len()
                 );
-                let _ = tx
-                    .send(Ok(ControllerMessage {
+                enqueue(
+                    tx,
+                    ControllerMessage {
                         payload: Some(CtrlPayload::Config(push)),
-                    }))
-                    .await;
+                    },
+                )?;
             } else {
                 log::debug!(
                     "No stored rules for node {}, skipping reconciliation",
@@ -504,15 +560,16 @@ async fn drive_stream(
             secs,
             node_id
         );
-        let _ = tx
-            .send(Ok(ControllerMessage {
+        enqueue(
+            tx,
+            ControllerMessage {
                 payload: Some(CtrlPayload::SetMetricsInterval(
                     policy_controller_proto::controller::SetMetricsInterval {
                         interval_secs: secs,
                     },
                 )),
-            }))
-            .await;
+            },
+        )?;
     }
 
     // ── Step 6: message loop ──────────────────────────────────────────────────
@@ -562,6 +619,14 @@ async fn drive_stream(
                     {
                         log::warn!("Failed to update fib_forwarding for {}: {:#}", node_id, e);
                     }
+                    let urpf_modes: Vec<(String, u32)> = snap
+                        .urpf_interfaces
+                        .iter()
+                        .map(|(name, mode)| (name.clone(), *mode))
+                        .collect();
+                    if let Err(e) = store.update_interface_urpf(&node_id, &urpf_modes).await {
+                        log::warn!("Failed to update urpf for {}: {:#}", node_id, e);
+                    }
                 }
                 // Diff snapshot against desired state and send delta if needed.
                 // Exclude TTL-expired rules from desired so they are not pushed back —
@@ -583,11 +648,12 @@ async fn drive_stream(
                                 delta.rules_to_add.len(),
                                 delta.rule_ids_to_delete.len()
                             );
-                            let _ = tx
-                                .send(Ok(ControllerMessage {
+                            enqueue(
+                                tx,
+                                ControllerMessage {
                                     payload: Some(CtrlPayload::Config(delta)),
-                                }))
-                                .await;
+                                },
+                            )?;
                         }
                     }
                     Err(e) => log::warn!("Failed to load rules for diff: {:#}", e),
@@ -753,17 +819,18 @@ async fn drive_stream(
                             .flatten()
                             .and_then(|n| n.stop_behavior);
                         let push = build_full_restore_push(rule_adds, defaults, stop_behavior);
-                        let _ = tx
-                            .send(Ok(ControllerMessage {
+                        enqueue(
+                            tx,
+                            ControllerMessage {
                                 payload: Some(CtrlPayload::Config(push)),
-                            }))
-                            .await;
+                            },
+                        )?;
                     }
                     Err(e) => log::warn!("Failed to load rules for restore: {:#}", e),
                 }
             }
             Some(AgentPayload::ConfigConfirm(confirm)) => {
-                handle_config_confirm(&node_id, confirm, pending, store, tx).await;
+                handle_config_confirm(&node_id, confirm, pending, store, tx).await?;
             }
             Some(AgentPayload::Hello(_)) => {
                 log::warn!("Unexpected second AgentHello from {}", node_id);
@@ -882,11 +949,11 @@ async fn build_per_interface_defaults_map(
 /// can clear its local inverse-delta.
 async fn handle_config_confirm(
     node_id: &str,
-    confirm: policy_controller_proto::controller::ConfigConfirm,
+    confirm: ConfigConfirm,
     pending: &Arc<PendingRegistry>,
     store: &Arc<dyn ControllerStore>,
     tx: &mpsc::Sender<Result<ControllerMessage, Status>>,
-) {
+) -> anyhow::Result<()> {
     let gen_id = confirm.generation_id.clone();
     let outcome = ConfigConfirmOutcome::try_from(confirm.outcome)
         .unwrap_or(ConfigConfirmOutcome::Unspecified);
@@ -899,19 +966,58 @@ async fn handle_config_confirm(
     );
 
     let Some(pending_gen) = pending.take(&gen_id) else {
-        log::warn!(
-            "ConfigConfirm for unknown or already-resolved generation {} from {}",
-            gen_id,
-            node_id
-        );
-        return;
+        // The generation was already resolved (e.g. the Applied confirm landed
+        // first and was committed) or is unknown (controller restart). A late
+        // *Reverted* outcome here is a genuine divergence: the agent applied the
+        // change then rolled it back via its watchdog, so the controller's
+        // committed/stored state — and the UI — no longer matches the agent.
+        // Don't silently drop it: record the divergence and ask the agent to
+        // re-report so the stored interface columns (urpf_mode, attachments, …)
+        // converge to reality instead of showing the reverted value as live.
+        if outcome == ConfigConfirmOutcome::Reverted {
+            log::warn!(
+                "Reverted confirm for already-resolved generation {} from {} — state \
+                 divergence; auditing and requesting a fresh snapshot",
+                gen_id,
+                node_id
+            );
+            let _ = store
+                .append_audit(NewAuditEntry {
+                    operator: None,
+                    action: "config_reverted_after_resolve".to_string(),
+                    node_id: Some(node_id.to_string()),
+                    detail: Some(format!(
+                        "generation={} err={}",
+                        gen_id, confirm.error_message
+                    )),
+                    tenant_id: None,
+                })
+                .await;
+            // Best-effort: a full buffer means the stream is tearing down anyway.
+            let _ = enqueue(
+                tx,
+                ControllerMessage {
+                    payload: Some(CtrlPayload::StateQuery(StateQuery {})),
+                },
+            );
+        } else {
+            log::warn!(
+                "ConfigConfirm for unknown or already-resolved generation {} from {}",
+                gen_id,
+                node_id
+            );
+        }
+        return Ok(());
     };
 
     match outcome {
         ConfigConfirmOutcome::Applied => {
             match pending_gen.op.commit(store).await {
                 Ok(()) => {
-                    // Tell the agent it may clear its inverse-delta.
+                    // Tell the agent it may clear its inverse-delta. The local
+                    // waiter is notified regardless of whether the ack made it
+                    // onto the wire; a full buffer tears the stream down (via
+                    // `?`) so the agent reconnects and re-syncs.
                     let ack = ControllerMessage {
                         payload: Some(CtrlPayload::CommitAck(ConfigCommitAck {
                             generation_id: gen_id.clone(),
@@ -919,8 +1025,9 @@ async fn handle_config_confirm(
                             reason: String::new(),
                         })),
                     };
-                    let _ = tx.send(Ok(ack)).await;
+                    let send_res = enqueue(tx, ack);
                     pending_gen.notify(ConfirmOutcome::Applied);
+                    send_res?;
                 }
                 Err(e) => {
                     log::error!(
@@ -937,8 +1044,9 @@ async fn handle_config_confirm(
                             reason: reason.clone(),
                         })),
                     };
-                    let _ = tx.send(Ok(ack)).await;
+                    let send_res = enqueue(tx, ack);
                     pending_gen.notify(ConfirmOutcome::CommitFailed(reason));
+                    send_res?;
                 }
             }
         }
@@ -954,6 +1062,8 @@ async fn handle_config_confirm(
             ));
         }
     }
+
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -972,6 +1082,95 @@ mod tests {
 
     fn make_store() -> Arc<InMemoryControllerStore> {
         Arc::new(InMemoryControllerStore::new())
+    }
+
+    /// `enqueue` must never block: on a full buffer it returns an error (so the
+    /// caller tears the stream down) rather than awaiting capacity, which would
+    /// park the inbound reader and deadlock the bidirectional stream.
+    #[tokio::test]
+    async fn enqueue_errs_on_full_buffer_instead_of_blocking() {
+        let (tx, _rx) = mpsc::channel::<Result<ControllerMessage, Status>>(1);
+        let msg = || ControllerMessage {
+            payload: Some(CtrlPayload::Disconnect(Disconnect {
+                reason: "x".to_string(),
+            })),
+        };
+        // First fits the single slot; second has nowhere to go.
+        assert!(enqueue(&tx, msg()).is_ok());
+        let err = enqueue(&tx, msg()).unwrap_err().to_string();
+        assert!(err.contains("buffer full"), "unexpected error: {err}");
+
+        // A closed channel (reader gone) is also a non-blocking error.
+        let (tx2, rx2) = mpsc::channel::<Result<ControllerMessage, Status>>(1);
+        drop(rx2);
+        assert!(enqueue(&tx2, msg()).is_err());
+    }
+
+    fn config_confirm(gen: &str, outcome: ConfigConfirmOutcome) -> ConfigConfirm {
+        ConfigConfirm {
+            generation_id: gen.to_string(),
+            outcome: outcome as i32,
+            error_message: "watchdog".to_string(),
+        }
+    }
+
+    /// A late REVERTED confirm for a generation the controller already resolved
+    /// (took) must not vanish: it signals the agent rolled back a change the
+    /// controller may have committed. We record the divergence and pull a fresh
+    /// snapshot so stored/UI state converges to the agent's reality.
+    #[tokio::test]
+    async fn reverted_confirm_for_resolved_gen_audits_and_requests_snapshot() {
+        let store: Arc<dyn ControllerStore> = make_store();
+        let pending = make_pending(); // empty → take() returns None
+        let (tx, mut rx) = mpsc::channel::<Result<ControllerMessage, Status>>(8);
+
+        handle_config_confirm(
+            "node-1",
+            config_confirm("gen-x", ConfigConfirmOutcome::Reverted),
+            &pending,
+            &store,
+            &tx,
+        )
+        .await
+        .unwrap();
+
+        let audits = store.list_audit(None, 10, 0).await.unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|a| a.action == "config_reverted_after_resolve"),
+            "expected divergence audit, got {:?}",
+            audits.iter().map(|a| &a.action).collect::<Vec<_>>()
+        );
+
+        match rx.try_recv() {
+            Ok(Ok(ControllerMessage {
+                payload: Some(CtrlPayload::StateQuery(_)),
+            })) => {}
+            other => panic!("expected a StateQuery to be enqueued, got {other:?}"),
+        }
+    }
+
+    /// A non-reverted confirm (e.g. a duplicate APPLIED) for an unknown
+    /// generation is benign: no divergence audit, no snapshot request.
+    #[tokio::test]
+    async fn applied_confirm_for_unknown_gen_is_silent() {
+        let store: Arc<dyn ControllerStore> = make_store();
+        let pending = make_pending();
+        let (tx, mut rx) = mpsc::channel::<Result<ControllerMessage, Status>>(8);
+
+        handle_config_confirm(
+            "node-1",
+            config_confirm("gen-y", ConfigConfirmOutcome::Applied),
+            &pending,
+            &store,
+            &tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(store.list_audit(None, 10, 0).await.unwrap().is_empty());
+        assert!(rx.try_recv().is_err(), "no message should be enqueued");
     }
 
     fn make_bus() -> Arc<EventBus> {

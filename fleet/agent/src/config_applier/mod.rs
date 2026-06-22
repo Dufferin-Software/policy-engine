@@ -28,6 +28,24 @@ pub enum InverseOp {
         direction: String,
         action: String,
     },
+    /// Restore the uRPF mode of an interface to its prior value
+    /// ("off" / "loose" / "strict").
+    SetUrpf { interface: String, mode: String },
+    /// Re-attach a program the push detached (inverse of detach). `direction`
+    /// is "ingress" or "egress"; `mode` is the XDP attach mode for ingress.
+    Attach {
+        interface: String,
+        direction: String,
+        mode: String,
+    },
+    /// Detach a program the push attached (inverse of attach). Only emitted when
+    /// the program was not already attached before the push.
+    Detach {
+        interface: String,
+        direction: String,
+    },
+    /// Restore the FIB-forwarding enable state of an interface.
+    SetFibForwarding { interface: String, enabled: bool },
 }
 
 // ── Local policy-engine client abstraction (mockable) ────────────────────────
@@ -56,6 +74,14 @@ pub trait LocalPolicyClient: Send + Sync {
     async fn attach_ingress(&self, interface: &str, mode: &str) -> Result<()>;
     /// Attach TC egress program to an interface. Returns Ok(true) if already attached.
     async fn attach_tc(&self, interface: &str) -> Result<()>;
+    /// Detach the XDP ingress program from an interface.
+    async fn detach_ingress(&self, interface: &str) -> Result<()>;
+    /// Detach the TC egress program from an interface.
+    async fn detach_tc(&self, interface: &str) -> Result<()>;
+    /// Enable or disable XDP FIB forwarding on an interface.
+    async fn set_fib_forwarding(&self, interface: &str, enabled: bool) -> Result<()>;
+    /// Query whether XDP FIB forwarding is enabled on an interface.
+    async fn get_fib_forwarding(&self, interface: &str) -> Result<bool>;
     /// List currently attached interfaces as (interface_name, direction, mode) tuples.
     async fn list_attachments(&self) -> Result<Vec<(String, String, String)>>;
     /// List all rules in a direction as (rule_id, AddRuleInput JSON) pairs.
@@ -67,6 +93,11 @@ pub trait LocalPolicyClient: Send + Sync {
     async fn configure_stop_behavior(&self, behavior: &str) -> Result<()>;
     /// Query the current stop behavior from the local engine.
     async fn get_stop_behavior(&self) -> Result<String>;
+    /// Set the uRPF mode ("off" / "loose" / "strict") on an ingress interface.
+    async fn set_urpf(&self, interface: &str, mode: &str) -> Result<()>;
+    /// Query the current uRPF mode for an interface ("off" / "loose" / "strict").
+    /// Used to capture the prior value so a change can be rolled back.
+    async fn get_urpf(&self, interface: &str) -> Result<String>;
 }
 
 // ── Real implementation using policy-engine-dev (blocking → async) ────────────
@@ -165,6 +196,28 @@ impl LocalPolicyClient for SpawnBlockingLocalClient {
             .ok_or_else(|| anyhow::anyhow!("set_default_action returned success=false"))
     }
 
+    async fn set_urpf(&self, interface: &str, mode: &str) -> Result<()> {
+        let client = self.make_client();
+        let iface = interface.to_string();
+        let m = mode.to_string();
+        let result = tokio::task::spawn_blocking(move || client.set_urpf(&iface, &m))
+            .await
+            .context("spawn_blocking panicked")??;
+        if result.success {
+            Ok(())
+        } else {
+            anyhow::bail!("set_urpf failed: {}", result.message)
+        }
+    }
+
+    async fn get_urpf(&self, interface: &str) -> Result<String> {
+        let client = self.make_client();
+        let iface = interface.to_string();
+        tokio::task::spawn_blocking(move || client.get_urpf(&iface))
+            .await
+            .context("spawn_blocking panicked")?
+    }
+
     async fn attach_ingress(&self, interface: &str, mode: &str) -> Result<()> {
         let client = self.make_client();
         let iface = interface.to_string();
@@ -190,6 +243,54 @@ impl LocalPolicyClient for SpawnBlockingLocalClient {
         } else {
             anyhow::bail!("attach_tc failed: {}", result.message)
         }
+    }
+
+    async fn detach_ingress(&self, interface: &str) -> Result<()> {
+        let client = self.make_client();
+        let iface = interface.to_string();
+        let result = tokio::task::spawn_blocking(move || client.detach_ingress(&iface))
+            .await
+            .context("spawn_blocking panicked")??;
+        if result.success {
+            Ok(())
+        } else {
+            anyhow::bail!("detach_ingress failed: {}", result.message)
+        }
+    }
+
+    async fn detach_tc(&self, interface: &str) -> Result<()> {
+        let client = self.make_client();
+        let iface = interface.to_string();
+        let result = tokio::task::spawn_blocking(move || client.detach_tc(&iface))
+            .await
+            .context("spawn_blocking panicked")??;
+        if result.success {
+            Ok(())
+        } else {
+            anyhow::bail!("detach_tc failed: {}", result.message)
+        }
+    }
+
+    async fn set_fib_forwarding(&self, interface: &str, enabled: bool) -> Result<()> {
+        let client = self.make_client();
+        let iface = interface.to_string();
+        let result =
+            tokio::task::spawn_blocking(move || client.set_fib_forwarding(&iface, enabled))
+                .await
+                .context("spawn_blocking panicked")??;
+        if result.success {
+            Ok(())
+        } else {
+            anyhow::bail!("set_fib_forwarding failed: {}", result.message)
+        }
+    }
+
+    async fn get_fib_forwarding(&self, interface: &str) -> Result<bool> {
+        let client = self.make_client();
+        let iface = interface.to_string();
+        tokio::task::spawn_blocking(move || client.get_fib_forwarding(&iface))
+            .await
+            .context("spawn_blocking panicked")?
     }
 
     async fn list_attachments(&self) -> Result<Vec<(String, String, String)>> {
@@ -289,6 +390,49 @@ impl ConfigApplier {
             client,
             default_actions: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Query the current uRPF mode for an interface ("off"/"loose"/"strict").
+    pub async fn get_urpf(&self, interface: &str) -> Result<String> {
+        self.client.get_urpf(interface).await
+    }
+
+    /// Set the uRPF mode ("off"/"loose"/"strict") on an interface.
+    pub async fn set_urpf(&self, interface: &str, mode: &str) -> Result<()> {
+        self.client.set_urpf(interface, mode).await
+    }
+
+    /// List currently attached programs as (interface, direction, mode) tuples.
+    pub async fn list_attachments(&self) -> Result<Vec<(String, String, String)>> {
+        self.client.list_attachments().await
+    }
+
+    /// Attach a program for the given direction ("ingress" / "egress").
+    pub async fn attach(&self, interface: &str, direction: &str, mode: &str) -> Result<()> {
+        if direction.eq_ignore_ascii_case("egress") {
+            self.client.attach_tc(interface).await
+        } else {
+            self.client.attach_ingress(interface, mode).await
+        }
+    }
+
+    /// Detach a program for the given direction ("ingress" / "egress").
+    pub async fn detach(&self, interface: &str, direction: &str) -> Result<()> {
+        if direction.eq_ignore_ascii_case("egress") {
+            self.client.detach_tc(interface).await
+        } else {
+            self.client.detach_ingress(interface).await
+        }
+    }
+
+    /// Query whether FIB forwarding is enabled on an interface.
+    pub async fn get_fib_forwarding(&self, interface: &str) -> Result<bool> {
+        self.client.get_fib_forwarding(interface).await
+    }
+
+    /// Enable or disable FIB forwarding on an interface.
+    pub async fn set_fib_forwarding(&self, interface: &str, enabled: bool) -> Result<()> {
+        self.client.set_fib_forwarding(interface, enabled).await
     }
 
     /// Capture the inverse of a push *before* applying it.
@@ -408,6 +552,63 @@ impl ConfigApplier {
                             .lock()
                             .unwrap()
                             .insert(cache_key, action.clone());
+                    }
+                }
+                InverseOp::SetUrpf { interface, mode } => {
+                    if let Err(e) = self.client.set_urpf(interface, mode).await {
+                        log::warn!(
+                            "apply_inverse: set_urpf({}, {}) failed: {:#}",
+                            interface,
+                            mode,
+                            e
+                        );
+                    }
+                }
+                InverseOp::Attach {
+                    interface,
+                    direction,
+                    mode,
+                } => {
+                    let res = if direction.eq_ignore_ascii_case("egress") {
+                        self.client.attach_tc(interface).await
+                    } else {
+                        self.client.attach_ingress(interface, mode).await
+                    };
+                    if let Err(e) = res {
+                        log::warn!(
+                            "apply_inverse: attach({}, {}) failed: {:#}",
+                            interface,
+                            direction,
+                            e
+                        );
+                    }
+                }
+                InverseOp::Detach {
+                    interface,
+                    direction,
+                } => {
+                    let res = if direction.eq_ignore_ascii_case("egress") {
+                        self.client.detach_tc(interface).await
+                    } else {
+                        self.client.detach_ingress(interface).await
+                    };
+                    if let Err(e) = res {
+                        log::warn!(
+                            "apply_inverse: detach({}, {}) failed: {:#}",
+                            interface,
+                            direction,
+                            e
+                        );
+                    }
+                }
+                InverseOp::SetFibForwarding { interface, enabled } => {
+                    if let Err(e) = self.client.set_fib_forwarding(interface, *enabled).await {
+                        log::warn!(
+                            "apply_inverse: set_fib_forwarding({}, {}) failed: {:#}",
+                            interface,
+                            enabled,
+                            e
+                        );
                     }
                 }
             }
@@ -625,6 +826,9 @@ mod tests {
         deletes: Mutex<Vec<u64>>,
         defaults: Mutex<Vec<(String, String)>>,
         attaches: Mutex<Vec<(String, String)>>,
+        urpf_sets: Mutex<Vec<(String, String)>>,
+        detaches: Mutex<Vec<(String, String)>>,
+        fib_sets: Mutex<Vec<(String, bool)>>,
         /// Seeded rules returned by `list_rules_json`, keyed by direction.
         /// Each entry is (rule_id, JSON); the JSON must have an `interface` field
         /// so the delete path can resolve (interface, direction) for a given id.
@@ -718,6 +922,40 @@ mod tests {
 
         async fn get_stop_behavior(&self) -> Result<String> {
             Ok("clear-state".to_string())
+        }
+        async fn set_urpf(&self, interface: &str, mode: &str) -> Result<()> {
+            self.urpf_sets
+                .lock()
+                .unwrap()
+                .push((interface.to_string(), mode.to_string()));
+            Ok(())
+        }
+        async fn get_urpf(&self, _i: &str) -> Result<String> {
+            Ok("off".to_string())
+        }
+        async fn detach_ingress(&self, interface: &str) -> Result<()> {
+            self.detaches
+                .lock()
+                .unwrap()
+                .push((interface.to_string(), "ingress".to_string()));
+            Ok(())
+        }
+        async fn detach_tc(&self, interface: &str) -> Result<()> {
+            self.detaches
+                .lock()
+                .unwrap()
+                .push((interface.to_string(), "egress".to_string()));
+            Ok(())
+        }
+        async fn set_fib_forwarding(&self, interface: &str, enabled: bool) -> Result<()> {
+            self.fib_sets
+                .lock()
+                .unwrap()
+                .push((interface.to_string(), enabled));
+            Ok(())
+        }
+        async fn get_fib_forwarding(&self, _i: &str) -> Result<bool> {
+            Ok(false)
         }
     }
 
@@ -907,5 +1145,79 @@ mod tests {
 
         let attaches = client.attaches.lock().unwrap();
         assert!(!attaches.is_empty(), "Full restore should also auto-attach");
+    }
+
+    #[tokio::test]
+    async fn test_apply_inverse_seturpf_restores_prior_mode() {
+        // The uRPF watchdog rollback path: an InverseOp::SetUrpf must call
+        // set_urpf with the prior mode so a connectivity-killing change reverts.
+        let client = Arc::new(RecordingClient::default());
+        let applier = ConfigApplier::new(Arc::clone(&client) as Arc<dyn LocalPolicyClient>);
+
+        applier
+            .apply_inverse(&[InverseOp::SetUrpf {
+                interface: "eth0".to_string(),
+                mode: "off".to_string(),
+            }])
+            .await;
+
+        let sets = client.urpf_sets.lock().unwrap();
+        assert_eq!(
+            *sets,
+            vec![("eth0".to_string(), "off".to_string())],
+            "apply_inverse(SetUrpf) must restore the prior uRPF mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_inverse_detach_undoes_attach() {
+        // Inverse of an attach is a detach of the same interface+direction.
+        let client = Arc::new(RecordingClient::default());
+        let applier = ConfigApplier::new(Arc::clone(&client) as Arc<dyn LocalPolicyClient>);
+
+        applier
+            .apply_inverse(&[InverseOp::Detach {
+                interface: "eth0".to_string(),
+                direction: "ingress".to_string(),
+            }])
+            .await;
+
+        let detaches = client.detaches.lock().unwrap();
+        assert_eq!(*detaches, vec![("eth0".to_string(), "ingress".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn test_apply_inverse_attach_undoes_detach() {
+        // Inverse of a detach re-attaches with the prior mode.
+        let client = Arc::new(RecordingClient::default());
+        let applier = ConfigApplier::new(Arc::clone(&client) as Arc<dyn LocalPolicyClient>);
+
+        applier
+            .apply_inverse(&[InverseOp::Attach {
+                interface: "eth0".to_string(),
+                direction: "ingress".to_string(),
+                mode: "native".to_string(),
+            }])
+            .await;
+
+        // RecordingClient records ingress attaches as (interface, "INGRESS").
+        let attaches = client.attaches.lock().unwrap();
+        assert_eq!(*attaches, vec![("eth0".to_string(), "INGRESS".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn test_apply_inverse_setfib_restores_prior_state() {
+        let client = Arc::new(RecordingClient::default());
+        let applier = ConfigApplier::new(Arc::clone(&client) as Arc<dyn LocalPolicyClient>);
+
+        applier
+            .apply_inverse(&[InverseOp::SetFibForwarding {
+                interface: "eth0".to_string(),
+                enabled: false,
+            }])
+            .await;
+
+        let fib = client.fib_sets.lock().unwrap();
+        assert_eq!(*fib, vec![("eth0".to_string(), false)]);
     }
 }

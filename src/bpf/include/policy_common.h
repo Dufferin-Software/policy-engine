@@ -272,9 +272,27 @@ struct inspect_config {
 #define FIB_FORWARD_DISABLED 0
 #define FIB_FORWARD_ENABLED 1
 
+/*
+ * Unicast Reverse Path Forwarding (uRPF) mode.  Stored alongside the FIB
+ * forwarding mode in the same per-interface config entry (keyed by ingress
+ * ifindex) so a single map lookup covers both XDP ingress features.  uRPF is
+ * ingress-only (XDP); it is never applied on the TC egress path.
+ *
+ *   URPF_DISABLED — no reverse-path check.
+ *   URPF_LOOSE    — drop only if NO route to the source exists via any
+ *                   interface (blocks fully unroutable / bogon sources).
+ *   URPF_STRICT   — drop unless the best route back to the source exits via
+ *                   the interface the packet arrived on (blocks asymmetric
+ *                   spoofing; may drop legitimate asymmetrically-routed flows).
+ */
+#define URPF_DISABLED 0
+#define URPF_LOOSE 1
+#define URPF_STRICT 2
+
 struct fib_config {
-  __u32 mode;    /* FIB_FORWARD_DISABLED or FIB_FORWARD_ENABLED */
-  __u32 _pad[3]; /* reserved */
+  __u32 mode;      /* FIB_FORWARD_DISABLED or FIB_FORWARD_ENABLED */
+  __u32 urpf_mode; /* URPF_DISABLED / URPF_LOOSE / URPF_STRICT */
+  __u32 _pad[2];   /* reserved */
 } __attribute__((packed));
 
 /*
@@ -382,6 +400,8 @@ struct global_stats {
   __u64 fib_forwarded_packets; /* Packets forwarded via XDP FIB redirect */
   __u64 fib_forwarded_bytes;   /* Bytes forwarded via XDP FIB redirect */
   __u64 fib_fallback_packets;  /* FIB lookup attempted but fell back to XDP_PASS */
+  __u64 urpf_drop_packets;     /* Packets dropped by the uRPF reverse-path check */
+  __u64 urpf_drop_bytes;       /* Bytes dropped by the uRPF reverse-path check */
 } __attribute__((packed));
 
 /*

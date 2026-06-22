@@ -106,6 +106,7 @@ mod tests {
             fib_forwarding_interfaces: Vec::new(),
             per_interface_default_actions: Default::default(),
             stop_behavior: String::new(),
+            urpf_interfaces: Default::default(),
         };
 
         detector.update_baseline(&snapshot);

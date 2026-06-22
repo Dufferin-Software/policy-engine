@@ -177,12 +177,21 @@ unsafe impl plain::Plain for InspectConfig {}
 pub const FIB_FORWARD_DISABLED: u32 = 0;
 pub const FIB_FORWARD_ENABLED: u32 = 1;
 
-/// FIB forwarding configuration (must match BPF struct fib_config layout)
+/// uRPF (unicast Reverse Path Forwarding) mode constants (must match BPF
+/// policy_common.h). uRPF is ingress-only (XDP); it is never applied on egress.
+pub const URPF_DISABLED: u32 = 0;
+pub const URPF_LOOSE: u32 = 1;
+pub const URPF_STRICT: u32 = 2;
+
+/// FIB forwarding configuration (must match BPF struct fib_config layout).
+/// The same per-interface entry also carries the uRPF mode so a single BPF map
+/// lookup covers both XDP ingress features.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 pub struct FibConfig {
     pub mode: u32,
-    pub _pad: [u32; 3],
+    pub urpf_mode: u32,
+    pub _pad: [u32; 2],
 }
 
 impl FibConfig {
@@ -1320,6 +1329,8 @@ pub struct GlobalStats {
     pub fib_forwarded_packets: u64,
     pub fib_forwarded_bytes: u64,
     pub fib_fallback_packets: u64,
+    pub urpf_drop_packets: u64,
+    pub urpf_drop_bytes: u64,
 }
 
 impl GlobalStats {

@@ -3,7 +3,7 @@
 
 import { useState } from 'react'
 import { gql, useQuery } from '@apollo/client'
-import { StatusCard, InterfaceList, RulesList, StatsPanel, EventStream, InspectPanel, PerformancePanel, FibPanel, FlowExportPanel, RuleLifecycleStream, AuditLogPanel } from './components'
+import { StatusCard, InterfaceList, RulesList, StatsPanel, EventStream, InspectPanel, PerformancePanel, FibPanel, UrpfPanel, FlowExportPanel, RuleLifecycleStream, AuditLogPanel } from './components'
 
 const GET_INSPECT_SUPPORTED = gql`
   query GetInspectSupported {
@@ -103,6 +103,7 @@ function App() {
           <StatusCard />
           <StatsPanel />
           <FibPanel />
+          <UrpfPanel />
           {ipfixSupported && <FlowExportPanel />}
           <InterfaceList />
           <EventStream />

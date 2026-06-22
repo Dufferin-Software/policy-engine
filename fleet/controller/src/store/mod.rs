@@ -167,6 +167,9 @@ pub struct NodeInterface {
     /// Whether XDP FIB forwarding is enabled on this interface (ingress only).
     #[serde(default)]
     pub fib_forwarding: bool,
+    /// uRPF mode on this interface (ingress only): 0 = off, 1 = loose, 2 = strict.
+    #[serde(default)]
+    pub urpf_mode: u32,
     /// Controller-set default action for unmatched ingress packets ("pass" or "drop").
     #[serde(default)]
     pub ingress_default_action: Option<String>,
@@ -451,6 +454,15 @@ pub trait ControllerStore: Send + Sync {
         &self,
         node_id: &str,
         enabled_interfaces: &[String],
+    ) -> Result<()>;
+
+    /// Replace the per-interface uRPF mode on a node. Each entry is
+    /// `(interface_name, mode)` where mode is 1 (loose) or 2 (strict); any
+    /// interface not listed has its uRPF mode cleared to 0 (off).
+    async fn update_interface_urpf(
+        &self,
+        node_id: &str,
+        interface_modes: &[(String, u32)],
     ) -> Result<()>;
 
     /// Set the default action for a specific interface+direction on a node.

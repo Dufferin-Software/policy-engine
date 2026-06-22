@@ -23,6 +23,7 @@ const GET_INTERFACE_STATS = gql`
       bumPackets nonIpUnicast fragments parseErrors tailCalls inspectRedirects
       verdictPassPackets verdictPassBytes verdictDropPackets verdictDropBytes
       fibForwardedPackets fibForwardedBytes fibFallbackPackets
+      urpfDropPackets urpfDropBytes
     }
   }
 `
@@ -59,6 +60,8 @@ interface FullStats {
   fibForwardedPackets: number
   fibForwardedBytes: number
   fibFallbackPackets: number
+  urpfDropPackets: number
+  urpfDropBytes: number
 }
 
 interface EthertypeStat {
@@ -174,6 +177,15 @@ function DirectionPanel({
                 ['Forwarded Pkts', fmtCount(s.fibForwardedPackets)],
                 ['Forwarded Bytes', fmtBytes(s.fibForwardedBytes)],
                 ['Fallback Pkts', fmtCount(s.fibFallbackPackets)],
+              ]}
+            />
+          )}
+          {s.urpfDropPackets > 0 && (
+            <StatSection
+              title="uRPF"
+              rows={[
+                ['Drop Pkts', fmtCount(s.urpfDropPackets)],
+                ['Drop Bytes', fmtBytes(s.urpfDropBytes)],
               ]}
             />
           )}

@@ -190,6 +190,8 @@ impl MetricsFormatter for PrometheusFormatter {
                 "policy_engine_fib_fallback_packets_total",
                 s.fib_fallback_packets
             );
+            counter!("policy_engine_urpf_drop_packets_total", s.urpf_drop_packets);
+            counter!("policy_engine_urpf_drop_bytes_total", s.urpf_drop_bytes);
             #[cfg(feature = "suricata")]
             counter!("policy_engine_inspect_redirects_total", s.inspect_redirects);
         }
@@ -870,6 +872,8 @@ mod tests {
                     policy_pass: 8927,
                     fib_forwarded_packets: 50,
                     fib_forwarded_bytes: 5000,
+                    urpf_drop_packets: 77,
+                    urpf_drop_bytes: 7000,
                     ..GlobalStats::default()
                 },
             }],
@@ -890,6 +894,9 @@ mod tests {
         ));
         assert!(output.contains(
             "policy_engine_fib_forwarded_packets_total{interface=\"eth0\",direction=\"ingress\"} 50"
+        ));
+        assert!(output.contains(
+            "policy_engine_urpf_drop_packets_total{interface=\"eth0\",direction=\"ingress\"} 77"
         ));
     }
 

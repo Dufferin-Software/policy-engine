@@ -100,6 +100,8 @@ CREATE TABLE IF NOT EXISTS node_interfaces (
     tc_attached     INTEGER NOT NULL DEFAULT 0,
     -- Agent-reported XDP FIB forwarding enabled on this interface (ingress only)
     fib_forwarding  INTEGER NOT NULL DEFAULT 0,
+    -- uRPF mode on this interface (ingress only): 0 = off, 1 = loose, 2 = strict
+    urpf_mode       INTEGER NOT NULL DEFAULT 0,
     -- Operator-configured default action for unmatched packets (NULL = engine default PASS)
     ingress_default_action TEXT,
     egress_default_action  TEXT,

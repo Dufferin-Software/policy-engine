@@ -23,7 +23,7 @@ use tokio::sync::oneshot;
 
 use policy_controller_proto::controller::{
     controller_message::Payload as CtrlPayload, AttachProgram, BpfDirection, BpfMode,
-    ControllerMessage, DeltaConfigPush, DetachProgram, SetFibForwarding,
+    ControllerMessage, DeltaConfigPush, DetachProgram, SetFibForwarding, SetUrpf,
 };
 
 use crate::{
@@ -58,6 +58,12 @@ pub enum PendingOp {
         interface_name: String,
         enabled: bool,
     },
+    SetUrpf {
+        node_id: String,
+        interface_name: String,
+        /// 0 = off, 1 = loose, 2 = strict (matches URPF_* in policy_common.h).
+        mode: u32,
+    },
     SetDefaultAction {
         node_id: String,
         interface_name: String,
@@ -89,6 +95,7 @@ impl PendingOp {
             PendingOp::Attach { .. } => "attach",
             PendingOp::Detach { .. } => "detach",
             PendingOp::SetFibForwarding { .. } => "set_fib_forwarding",
+            PendingOp::SetUrpf { .. } => "set_urpf",
             PendingOp::SetDefaultAction { .. } => "set_default_action",
             PendingOp::SetStopBehavior { .. } => "set_stop_behavior",
             PendingOp::FlushRules { .. } => "flush_rules",
@@ -102,6 +109,7 @@ impl PendingOp {
             | PendingOp::Attach { node_id, .. }
             | PendingOp::Detach { node_id, .. }
             | PendingOp::SetFibForwarding { node_id, .. }
+            | PendingOp::SetUrpf { node_id, .. }
             | PendingOp::SetDefaultAction { node_id, .. }
             | PendingOp::SetStopBehavior { node_id, .. }
             | PendingOp::FlushRules { node_id, .. } => node_id,
@@ -167,6 +175,16 @@ impl PendingOp {
             } => CtrlPayload::SetFib(SetFibForwarding {
                 interface_name: interface_name.clone(),
                 enabled: *enabled,
+                generation_id: generation_id.to_string(),
+                confirm_deadline_ms,
+            }),
+            PendingOp::SetUrpf {
+                interface_name,
+                mode,
+                ..
+            } => CtrlPayload::SetUrpf(SetUrpf {
+                interface_name: interface_name.clone(),
+                mode: *mode,
                 generation_id: generation_id.to_string(),
                 confirm_deadline_ms,
             }),
@@ -288,6 +306,24 @@ impl PendingOp {
                     .update_interface_fib_forwarding(node_id, &enabled_ifaces)
                     .await
             }
+            PendingOp::SetUrpf {
+                node_id,
+                interface_name,
+                mode,
+            } => {
+                let current = store.list_node_interfaces(node_id).await?;
+                // Preserve the uRPF mode of every other interface, then apply
+                // the new mode for this one (mode 0 = off → simply omitted).
+                let mut modes: Vec<(String, u32)> = current
+                    .iter()
+                    .filter(|ni| ni.urpf_mode != 0 && ni.name != *interface_name)
+                    .map(|ni| (ni.name.clone(), ni.urpf_mode))
+                    .collect();
+                if *mode != 0 {
+                    modes.push((interface_name.clone(), *mode));
+                }
+                store.update_interface_urpf(node_id, &modes).await
+            }
             PendingOp::SetDefaultAction {
                 node_id,
                 interface_name,
@@ -364,6 +400,7 @@ impl From<&PendingGeneration> for PendingGenerationView {
             PendingOp::Attach { .. } => "attach",
             PendingOp::Detach { .. } => "detach",
             PendingOp::SetFibForwarding { .. } => "set_fib_forwarding",
+            PendingOp::SetUrpf { .. } => "set_urpf",
             PendingOp::SetDefaultAction { .. } => "set_default_action",
             PendingOp::SetStopBehavior { .. } => "set_stop_behavior",
             PendingOp::FlushRules { .. } => "flush_rules",

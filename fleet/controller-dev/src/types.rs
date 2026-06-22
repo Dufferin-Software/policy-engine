@@ -59,6 +59,8 @@ pub struct NodeInterface {
     pub xdp_attached: Option<bool>,
     pub tc_attached: Option<bool>,
     pub fib_forwarding: Option<bool>,
+    /// uRPF mode (ingress only): "off", "loose", or "strict".
+    pub urpf_mode: Option<String>,
     pub ingress_default_action: Option<String>,
     pub egress_default_action: Option<String>,
     pub last_reported: Option<String>,

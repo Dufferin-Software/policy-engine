@@ -182,6 +182,8 @@ impl PolicyClient {
                     inspectRedirects
                     fragments
                     verdictPassPackets verdictPassBytes verdictDropPackets verdictDropBytes
+                    fibForwardedPackets fibForwardedBytes fibFallbackPackets
+                    urpfDropPackets urpfDropBytes
                 }
             }
         "#;
@@ -615,6 +617,75 @@ impl PolicyClient {
             .find(|(name, _)| name == interface)
             .map(|(_, enabled)| enabled)
             .unwrap_or(false))
+    }
+
+    /// Set the uRPF (unicast Reverse Path Forwarding) mode for a single ingress
+    /// interface. `mode` is one of "OFF", "LOOSE", or "STRICT" (case-insensitive
+    /// at the API). uRPF is ingress-only (XDP); setting it on a non-XDP
+    /// interface returns an OperationResult with `success == false`.
+    pub fn set_urpf(&self, interface: &str, mode: &str) -> Result<OperationResult> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "setUrpf")]
+            set_urpf: OperationResult,
+        }
+
+        let query = r#"
+            mutation SetUrpf($input: SetUrpfInput!) {
+                setUrpf(input: $input) {
+                    success
+                    message
+                }
+            }
+        "#;
+
+        let variables = json!({
+            "input": {
+                "interface": interface,
+                "mode": mode.to_uppercase(),
+            }
+        });
+
+        let response: Response = self.execute(query, Some(variables))?;
+        Ok(response.set_urpf)
+    }
+
+    /// Query uRPF mode for all interfaces with uRPF enabled.
+    /// Returns `(interface, mode)` pairs where mode is "LOOSE" or "STRICT".
+    pub fn list_urpf(&self) -> Result<Vec<(String, String)>> {
+        #[derive(Deserialize)]
+        struct Entry {
+            interface: String,
+            mode: String,
+        }
+        #[derive(Deserialize)]
+        struct Response {
+            urpf: Vec<Entry>,
+        }
+
+        let query = r#"
+            query {
+                urpf { interface mode }
+            }
+        "#;
+
+        let response: Response = self.execute(query, None)?;
+        Ok(response
+            .urpf
+            .into_iter()
+            .map(|e| (e.interface, e.mode))
+            .collect())
+    }
+
+    /// Query the uRPF mode for a single interface. Returns "OFF" when the
+    /// interface has no uRPF entry.
+    pub fn get_urpf(&self, interface: &str) -> Result<String> {
+        Ok(self
+            .list_urpf()?
+            .into_iter()
+            .find(|(name, _)| name == interface)
+            .map(|(_, mode)| mode)
+            .unwrap_or_else(|| "OFF".to_string()))
     }
 
     /// Add a policy rule

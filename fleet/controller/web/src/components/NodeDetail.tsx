@@ -19,7 +19,7 @@ const GET_NODE_DETAIL = gql`
       id label hostname status dmiUuid certExpiry lastSeen enrolledAt tpmBacked agentVersion osPrettyName kernelVersion dmiSysVendor dmiProductName tenantId stopBehavior metricsIntervalSecs
     }
     nodeInterfaces(nodeId: $id) {
-      nodeId name macAddress linkState addressesJson tag lastReported xdpAttached tcAttached fibForwarding ingressDefaultAction egressDefaultAction
+      nodeId name macAddress linkState addressesJson tag lastReported xdpAttached tcAttached fibForwarding urpfMode ingressDefaultAction egressDefaultAction
     }
     rules(nodeId: $id) {
       id tenantId nodeId interfaceName direction

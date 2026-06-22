@@ -1240,6 +1240,21 @@ fn handle_show(client: &PolicyClient, cmd: ShowCommands, json_output: bool) -> R
                         .add_row(row!["Non-IP Unicast", format_packets(stats.non_ip_unicast)]);
                 }
                 policy_table.add_row(row!["Tail Calls", format_packets(stats.tail_calls)]);
+                // uRPF and FIB forwarding are ingress-only (XDP) features.
+                if direction.to_lowercase() != "egress" {
+                    policy_table
+                        .add_row(row!["uRPF Drops", format_packets(stats.urpf_drop_packets)]);
+                    policy_table
+                        .add_row(row!["uRPF Drop Bytes", format_bytes(stats.urpf_drop_bytes)]);
+                    policy_table.add_row(row![
+                        "FIB Forwarded",
+                        format_packets(stats.fib_forwarded_packets)
+                    ]);
+                    policy_table.add_row(row![
+                        "FIB Fallback",
+                        format_packets(stats.fib_fallback_packets)
+                    ]);
+                }
 
                 policy_table.printstd();
 
@@ -1811,6 +1826,11 @@ mod tests {
             verdict_pass_bytes: 0,
             verdict_drop_packets: 0,
             verdict_drop_bytes: 0,
+            fib_forwarded_packets: 0,
+            fib_forwarded_bytes: 0,
+            fib_fallback_packets: 0,
+            urpf_drop_packets: 0,
+            urpf_drop_bytes: 0,
         };
 
         let json = serde_json::to_string_pretty(&stats).unwrap();
@@ -2006,6 +2026,11 @@ mod tests {
                 verdict_pass_bytes: 0,
                 verdict_drop_packets: 0,
                 verdict_drop_bytes: 0,
+                fib_forwarded_packets: 0,
+                fib_forwarded_bytes: 0,
+                fib_fallback_packets: 0,
+                urpf_drop_packets: 0,
+                urpf_drop_bytes: 0,
             },
             ethertype_stats: vec![EthertypeStatsOutput {
                 ethertype: 0x0806,

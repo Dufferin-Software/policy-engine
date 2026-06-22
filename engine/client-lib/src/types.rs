@@ -214,6 +214,16 @@ pub struct GlobalStatsOutput {
     pub verdict_drop_packets: u64,
     #[serde(default)]
     pub verdict_drop_bytes: u64,
+    #[serde(default)]
+    pub fib_forwarded_packets: u64,
+    #[serde(default)]
+    pub fib_forwarded_bytes: u64,
+    #[serde(default)]
+    pub fib_fallback_packets: u64,
+    #[serde(default)]
+    pub urpf_drop_packets: u64,
+    #[serde(default)]
+    pub urpf_drop_bytes: u64,
 }
 
 /// Ethertype statistics output type.

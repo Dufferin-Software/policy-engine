@@ -234,6 +234,23 @@ Failures fall open to `XDP_PASS` (kernel routing takes over). This is useful for
 
 ---
 
+## uRPF (Unicast Reverse Path Forwarding)
+
+When enabled on an **ingress** interface, the XDP program checks each packet's
+*source* address against the FIB via `bpf_fib_lookup()` before policy evaluation
+and drops source-spoofed traffic at line rate:
+
+- **loose** — drop only if no route to the source exists via any interface.
+- **strict** — drop unless the route back to the source exits via the interface
+  the packet arrived on.
+
+uRPF is ingress-only (it is never applied on the TC egress path) and shares the
+per-interface `fib_config_map` entry with XDP FIB forwarding, so one map lookup
+covers both features. Drops are counted per interface (`urpf_drop_packets` /
+`urpf_drop_bytes`). Full design in [urpf.md](urpf.md).
+
+---
+
 ## Fleet Controller Architecture
 
 ### Certificate Authority

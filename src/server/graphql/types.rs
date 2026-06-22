@@ -218,6 +218,9 @@ pub struct GlobalStatsOutput {
     pub fib_forwarded_bytes: u64,
     /// XDP FIB forwarding: packets where FIB lookup was attempted but fell back to XDP_PASS
     pub fib_fallback_packets: u64,
+    /// uRPF: packets/bytes dropped by the reverse-path check (source spoofing)
+    pub urpf_drop_packets: u64,
+    pub urpf_drop_bytes: u64,
 }
 
 impl From<crate::types::GlobalStats> for GlobalStatsOutput {
@@ -244,6 +247,8 @@ impl From<crate::types::GlobalStats> for GlobalStatsOutput {
             fib_forwarded_packets: stats.fib_forwarded_packets,
             fib_forwarded_bytes: stats.fib_forwarded_bytes,
             fib_fallback_packets: stats.fib_fallback_packets,
+            urpf_drop_packets: stats.urpf_drop_packets,
+            urpf_drop_bytes: stats.urpf_drop_bytes,
         }
     }
 }
@@ -555,6 +560,51 @@ pub struct SetFibForwardingInput {
 pub struct FibForwardingEntry {
     pub interface: String,
     pub enabled: bool,
+}
+
+/// uRPF (unicast Reverse Path Forwarding) mode for an interface.
+/// uRPF is ingress-only (XDP); it can never be enabled on egress.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum UrpfMode {
+    Off,
+    Loose,
+    Strict,
+}
+
+impl From<UrpfMode> for u32 {
+    fn from(m: UrpfMode) -> u32 {
+        match m {
+            UrpfMode::Off => crate::types::URPF_DISABLED,
+            UrpfMode::Loose => crate::types::URPF_LOOSE,
+            UrpfMode::Strict => crate::types::URPF_STRICT,
+        }
+    }
+}
+
+impl From<u32> for UrpfMode {
+    fn from(v: u32) -> UrpfMode {
+        match v {
+            crate::types::URPF_LOOSE => UrpfMode::Loose,
+            crate::types::URPF_STRICT => UrpfMode::Strict,
+            _ => UrpfMode::Off,
+        }
+    }
+}
+
+/// Input for setting the uRPF mode on a single ingress interface.
+#[derive(InputObject, Clone, Debug, Serialize, Deserialize)]
+pub struct SetUrpfInput {
+    pub interface: String,
+    pub mode: UrpfMode,
+}
+
+/// uRPF mode for a single interface (only interfaces with uRPF enabled).
+#[derive(SimpleObject, Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UrpfEntry {
+    pub interface: String,
+    pub mode: UrpfMode,
 }
 
 /// CPU affinity configuration currently in effect.
@@ -1146,6 +1196,8 @@ mod tests {
             fib_forwarded_packets: 11,
             fib_forwarded_bytes: 22,
             fib_fallback_packets: 3,
+            urpf_drop_packets: 13,
+            urpf_drop_bytes: 26,
         };
         let out = GlobalStatsOutput::from(stats);
         assert_eq!(out.rx_packets, 100);
@@ -1157,6 +1209,8 @@ mod tests {
         assert_eq!(out.fib_forwarded_packets, 11);
         assert_eq!(out.fib_forwarded_bytes, 22);
         assert_eq!(out.fib_fallback_packets, 3);
+        assert_eq!(out.urpf_drop_packets, 13);
+        assert_eq!(out.urpf_drop_bytes, 26);
     }
 
     // -------------------------------------------------------------------------

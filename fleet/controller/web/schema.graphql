@@ -489,6 +489,7 @@ type MutationRoot {
 	any TC egress filtering on the outbound interface.
 	"""
 	setFibForwarding(nodeId: ID!, interfaceName: String!, enabled: Boolean!): OperationResult!
+	setUrpf(nodeId: ID!, interfaceName: String!, mode: String!): OperationResult!
 	"""
 	Record a client-initiated audit entry (e.g. events exported).
 	"""
@@ -602,6 +603,11 @@ type NodeInterfaceOutput {
 	"""
 	fibForwarding: Boolean!
 	"""
+	uRPF mode on this interface (ingress only): "off", "loose", or "strict".
+	uRPF drops source-spoofed traffic; it is never supported on egress.
+	"""
+	urpfMode: String!
+	"""
 	Controller-set default action for unmatched ingress packets ("pass" or "drop").
 	None means no explicit default has been set (engine default is "pass").
 	"""
@@ -641,6 +647,8 @@ type NodeInterfaceStatsOutput {
 	fibForwardedPackets: Int!
 	fibForwardedBytes: Int!
 	fibFallbackPackets: Int!
+	urpfDropPackets: Int!
+	urpfDropBytes: Int!
 }
 
 """
@@ -676,7 +684,7 @@ type PendingGenerationOutput {
 	generationId: String!
 	nodeId: String!
 	"""
-	One of: "create_rule", "delete_rule", "flush_rules", "attach", "detach", "set_fib_forwarding".
+	One of: "create_rule", "delete_rule", "flush_rules", "attach", "detach", "set_fib_forwarding", "set_urpf".
 	"""
 	opKind: String!
 	issuedAt: DateTime!

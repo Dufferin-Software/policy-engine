@@ -215,6 +215,9 @@ pub struct NodeInterfaceOutput {
     /// Forwarded transit traffic bypasses the kernel stack, which also means
     /// any TC egress filtering on the outbound interface is NOT applied.
     pub fib_forwarding: bool,
+    /// uRPF mode on this interface (ingress only): "off", "loose", or "strict".
+    /// uRPF drops source-spoofed traffic; it is never supported on egress.
+    pub urpf_mode: String,
     /// Controller-set default action for unmatched ingress packets ("pass" or "drop").
     /// None means no explicit default has been set (engine default is "pass").
     pub ingress_default_action: Option<String>,
@@ -237,6 +240,11 @@ impl From<NodeInterface> for NodeInterfaceOutput {
             xdp_attached: i.xdp_attached,
             tc_attached: i.tc_attached,
             fib_forwarding: i.fib_forwarding,
+            urpf_mode: match i.urpf_mode {
+                1 => "loose".to_string(),
+                2 => "strict".to_string(),
+                _ => "off".to_string(),
+            },
             ingress_default_action: i.ingress_default_action,
             egress_default_action: i.egress_default_action,
         }
@@ -282,7 +290,7 @@ pub struct AuditExportOutput {
 pub struct PendingGenerationOutput {
     pub generation_id: String,
     pub node_id: String,
-    /// One of: "create_rule", "delete_rule", "flush_rules", "attach", "detach", "set_fib_forwarding".
+    /// One of: "create_rule", "delete_rule", "flush_rules", "attach", "detach", "set_fib_forwarding", "set_urpf".
     pub op_kind: String,
     pub issued_at: DateTime<Utc>,
 }
@@ -363,6 +371,9 @@ pub struct NodeInterfaceStatsOutput {
     pub fib_forwarded_packets: u64,
     pub fib_forwarded_bytes: u64,
     pub fib_fallback_packets: u64,
+    // uRPF
+    pub urpf_drop_packets: u64,
+    pub urpf_drop_bytes: u64,
 }
 
 /// Fleet-wide rollup of dataplane counters, summed across the most-recent
@@ -919,6 +930,8 @@ impl QueryRoot {
             fib_forwarded_packets: s.fib_forwarded_packets,
             fib_forwarded_bytes: s.fib_forwarded_bytes,
             fib_fallback_packets: s.fib_fallback_packets,
+            urpf_drop_packets: s.urpf_drop_packets,
+            urpf_drop_bytes: s.urpf_drop_bytes,
         }))
     }
 
@@ -1698,6 +1711,53 @@ impl MutationRoot {
                 node_id: node_id.0.clone(),
                 interface_name,
                 enabled,
+            },
+            pending,
+            sessions,
+            store,
+        )
+        .await
+        {
+            Ok(()) => Ok(OperationResult::ok()),
+            Err(e) => Ok(OperationResult::err(e.message)),
+        }
+    }
+
+    /// Set the uRPF (unicast Reverse Path Forwarding) mode on a single ingress
+    /// interface of a node. uRPF drops source-spoofed traffic; it is ingress-only
+    /// (XDP) and is never supported on egress. `mode` must be one of "off",
+    /// "loose", or "strict" (case-insensitive).
+    #[graphql(guard = "Require::new(\"interface:write\")")]
+    async fn set_urpf(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+        interface_name: String,
+        mode: String,
+    ) -> Result<OperationResult> {
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        let pending = ctx.data::<Arc<PendingRegistry>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+
+        let mode_val: u32 = match mode.to_lowercase().as_str() {
+            "off" | "disabled" | "0" => 0,
+            "loose" | "1" => 1,
+            "strict" | "2" => 2,
+            other => {
+                return Ok(OperationResult::err(format!(
+                    "Invalid uRPF mode '{}'; expected off, loose, or strict",
+                    other
+                )))
+            }
+        };
+
+        match drive_pending(
+            PendingOp::SetUrpf {
+                node_id: node_id.0.clone(),
+                interface_name,
+                mode: mode_val,
             },
             pending,
             sessions,

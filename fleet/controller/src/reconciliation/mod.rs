@@ -742,6 +742,7 @@ mod tests {
             fib_forwarding_interfaces: Vec::new(),
             per_interface_default_actions: Default::default(),
             stop_behavior: String::new(),
+            urpf_interfaces: Default::default(),
         };
 
         let delta = compute_delta(&desired, &actual);
@@ -760,6 +761,7 @@ mod tests {
             fib_forwarding_interfaces: Vec::new(),
             per_interface_default_actions: Default::default(),
             stop_behavior: String::new(),
+            urpf_interfaces: Default::default(),
         };
 
         let delta = compute_delta(&desired, &actual);
@@ -780,6 +782,7 @@ mod tests {
             fib_forwarding_interfaces: Vec::new(),
             per_interface_default_actions: Default::default(),
             stop_behavior: String::new(),
+            urpf_interfaces: Default::default(),
         };
 
         let delta = compute_delta(&desired, &actual);
@@ -903,6 +906,7 @@ mod tests {
             fib_forwarding_interfaces: Vec::new(),
             per_interface_default_actions: Default::default(),
             stop_behavior: String::new(),
+            urpf_interfaces: Default::default(),
         }
     }
 
@@ -983,6 +987,7 @@ mod tests {
             xdp_attached: true,
             tc_attached: false,
             fib_forwarding: false,
+            urpf_mode: 0,
             ingress_default_action: Some("drop".into()),
             egress_default_action: Some("pass".into()),
         };

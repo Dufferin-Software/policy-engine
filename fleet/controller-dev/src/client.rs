@@ -551,6 +551,28 @@ impl ControllerClient {
         Ok(r.set_fib_forwarding)
     }
 
+    /// Set the uRPF mode on an ingress interface. `mode` is "off", "loose", or
+    /// "strict". uRPF is ingress-only (XDP) and is never supported on egress.
+    pub fn set_urpf(&self, node_id: &str, name: &str, mode: &str) -> Result<OperationResult> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "setUrpf")]
+            set_urpf: OperationResult,
+        }
+        let q = r#"
+            mutation SetUrpf($nodeId: ID!, $interfaceName: String!, $mode: String!) {
+                setUrpf(nodeId: $nodeId, interfaceName: $interfaceName, mode: $mode) {
+                    success message
+                }
+            }
+        "#;
+        let r: Response = self.execute(
+            q,
+            Some(json!({ "nodeId": node_id, "interfaceName": name, "mode": mode })),
+        )?;
+        Ok(r.set_urpf)
+    }
+
     /// Set the default action for unmatched packets on an interface+direction.
     pub fn set_interface_default_action(
         &self,

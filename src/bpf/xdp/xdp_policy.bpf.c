@@ -411,6 +411,7 @@ struct {
 #include "actions.h"
 #include "lookup.h"
 #include "fib.h"
+#include "urpf.h"
 // clang-format on
 
 /*
@@ -934,6 +935,16 @@ int xdp_policy_main(struct xdp_md *ctx) {
   /* Update QUIC stats if this packet looks like QUIC */
   if (flow_key.flags & FLOW_FLAG_QUIC)
     update_quic_stats(flow_key.flags, pkt_len);
+
+  /* uRPF (unicast Reverse Path Forwarding) check.  Runs before policy and the
+   * verdict cache so source-spoofed packets are dropped as cheaply as possible.
+   * No-op (single map lookup) unless uRPF is enabled on this ingress interface.
+   * Drops are accounted in global_stats by xdp_urpf_check itself. */
+  if (xdp_urpf_check(ctx, stats, eth_proto, l3_off, pkt_len)) {
+    update_action_stats(stats, ACTION_DROP);
+    XDP_RECORD_TIMING(t0);
+    return XDP_DROP;
+  }
 
   /* Check flow verdict cache.  Writers are the Suricata EVE consumer (IPS
    * DROP verdicts), the QUIC SNI inspector, and any future flow-verdict

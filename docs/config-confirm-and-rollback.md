@@ -17,6 +17,54 @@ Gated operations:
 - `createRule`, `deleteRule`, `createRulesMultiNode` (via `DeltaConfigPush`)
 - `attachProgram`, `detachProgram`
 - `setFibForwarding`
+- `setUrpf`
+
+### Agent-side auto-revert coverage
+
+Two distinct guarantees hang off "gated":
+
+1. **Controller-side gating** — the controller reserves a generation, awaits the
+   agent's `ConfigConfirm`, and abandons the change if it does not arrive. This
+   applies to *all* gated operations above.
+2. **Agent-side auto-revert** — the agent captures an inverse op, applies the
+   change, and arms a watchdog that rolls the change back locally and emits
+   `ConfigConfirm{REVERTED}` if the controller's `CommitAck` is not received in
+   time (see `pending_change.rs`). This is what protects against a change that
+   severs the agent's *own* control channel.
+
+   **Deadline coordination.** The agent's watchdog deadline is *not* the same as
+   the controller's `confirm_deadline_ms`; it is that value plus
+   `REVERT_GRACE_MS` (`watchdog_deadline_ms()`). The controller commits as soon
+   as `APPLIED` arrives — any time up to its own deadline — and only then sends
+   `CommitAck`, which still has to travel back. If the agent used the same
+   deadline, a `CommitAck` for a genuinely-committed change could land *after*
+   the watchdog already reverted, leaving the controller (committed) and node
+   (reverted) in disagreement until the next StateSnapshot reconciles them. The
+   grace gives a successful `CommitAck` time to return; if the controller
+   instead abandoned the change (dead channel) no `CommitAck` ever comes and the
+   watchdog still fires, just `REVERT_GRACE_MS` later.
+
+   Agent-side auto-revert is wired for **all** gated operations:
+
+   | Operation | Inverse captured before apply |
+   |---|---|
+   | `DeltaConfigPush` | re-add deleted rules / delete added rules; restore prior default actions |
+   | `setUrpf` | restore prior uRPF mode (fallback `off`) |
+   | `setFibForwarding` | restore prior enable state |
+   | `attachProgram` | detach (only if not already attached before the push) |
+   | `detachProgram` | re-attach with the prior mode (only if it was attached) |
+
+   `setUrpf` and `attachProgram` matter most: enabling uRPF or attaching a
+   default-drop program filters ingress on the interface and can cut the agent
+   off from the controller. The uRPF/FIB inverses fall back to the
+   connectivity-restoring direction (`off` / disabled) when the prior value
+   can't be read.
+
+   The inverse is always registered *before* the agent sends
+   `ConfigConfirm{APPLIED}`, so the controller's `CommitAck` (sent only in
+   response to APPLIED) can never race ahead of the watchdog being armed —
+   including for `attachProgram`, whose apply runs in a background task because
+   BPF first-load can take 10–25 s.
 
 Non-gated operations (sent without a `generation_id`):
 

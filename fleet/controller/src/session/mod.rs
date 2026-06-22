@@ -82,7 +82,10 @@ impl NodeSessionManager {
     /// Push a message to a single connected agent.
     ///
     /// Returns `true` if the node was online and the message was queued,
-    /// `false` if the node is not currently connected.
+    /// `false` if the node is not currently connected — or if its outbound
+    /// buffer is full, which means the agent has stopped draining the stream.
+    /// Non-blocking on purpose: a blocking send here would let one wedged agent
+    /// stall the operator/API task that called `push`.
     pub async fn push(&self, node_id: &str, msg: ControllerMessage) -> bool {
         // Clone the sender while holding the (sync) lock, then send outside it.
         let tx = {
@@ -90,7 +93,7 @@ impl NodeSessionManager {
             map.get(node_id).map(|s| s.tx.clone())
         };
         match tx {
-            Some(tx) => tx.send(Ok(msg)).await.is_ok(),
+            Some(tx) => tx.try_send(Ok(msg)).is_ok(),
             None => false,
         }
     }

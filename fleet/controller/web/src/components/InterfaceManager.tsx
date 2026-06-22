@@ -37,6 +37,14 @@ const SET_FIB_FORWARDING = gql`
   }
 `
 
+const SET_URPF = gql`
+  mutation SetUrpf($nodeId: ID!, $interfaceName: String!, $mode: String!) {
+    setUrpf(nodeId: $nodeId, interfaceName: $interfaceName, mode: $mode) {
+      success message
+    }
+  }
+`
+
 interface Props {
   nodeId: string
   interfaces: NodeInterfaceOutput[]
@@ -87,18 +95,22 @@ export default function InterfaceManager({
   const [attachProgram] = useMutation(ATTACH_PROGRAM)
   const [detachProgram] = useMutation(DETACH_PROGRAM)
   const [setFibForwarding] = useMutation(SET_FIB_FORWARDING)
+  const [setUrpf] = useMutation(SET_URPF)
   const [editingTag, setEditingTag] = useState<{ name: string; value: string } | null>(null)
   // Map key: "ifname:dir", value: expected attached state after op completes
   const [pending, setPending] = useState<Map<string, boolean>>(new Map())
   // Map key: ifname, value: expected fibForwarding state after op completes
   const [fibPending, setFibPending] = useState<Map<string, boolean>>(new Map())
+  // Map key: ifname, value: expected urpfMode ("off"/"loose"/"strict") after op completes
+  const [urpfPending, setUrpfPending] = useState<Map<string, string>>(new Map())
   const [error, setError] = useState<string | null>(null)
   const prevPendingSizeRef = useRef(0)
   const prevFibPendingSizeRef = useRef(0)
+  const prevUrpfPendingSizeRef = useRef(0)
 
   // Clear pending entries once the interface state reflects the expected outcome.
   useEffect(() => {
-    if (pending.size === 0 && fibPending.size === 0) return
+    if (pending.size === 0 && fibPending.size === 0 && urpfPending.size === 0) return
 
     let attachChanged = false
     const nextPending = new Map(pending)
@@ -119,6 +131,15 @@ export default function InterfaceManager({
       if (iface.fibForwarding === expected) { nextFib.delete(ifaceName); fibChanged = true }
     }
     if (fibChanged) setFibPending(nextFib)
+
+    let urpfChanged = false
+    const nextUrpf = new Map(urpfPending)
+    for (const [ifaceName, expected] of urpfPending) {
+      const iface = interfaces.find((i) => i.name === ifaceName)
+      if (!iface) continue
+      if ((iface.urpfMode ?? 'off') === expected) { nextUrpf.delete(ifaceName); urpfChanged = true }
+    }
+    if (urpfChanged) setUrpfPending(nextUrpf)
   }, [interfaces])
 
   // Clear pending-confirm badge when the attach/detach spinner resolves (pending→empty).
@@ -138,6 +159,15 @@ export default function InterfaceManager({
       onPendingChange?.(false)
     }
   }, [fibPending])
+
+  // Clear pending-confirm badge when the uRPF spinner resolves.
+  useEffect(() => {
+    const prevSize = prevUrpfPendingSizeRef.current
+    prevUrpfPendingSizeRef.current = urpfPending.size
+    if (prevSize > 0 && urpfPending.size === 0) {
+      onPendingChange?.(false)
+    }
+  }, [urpfPending])
 
   async function handleSaveTag(interfaceName: string, tag: string) {
     if (tag.trim()) {
@@ -219,6 +249,26 @@ export default function InterfaceManager({
     } catch (e) {
       setError(String(e).replace(/^ApolloError:\s*/, ''))
       setFibPending((prev) => { const next = new Map(prev); next.delete(ifaceName); return next })
+      onPendingChange?.(false)
+    }
+  }
+
+  async function handleSetUrpf(ifaceName: string, mode: string) {
+    setError(null)
+    onPendingChange?.(true, 'set_urpf')
+    setUrpfPending((prev) => new Map(prev).set(ifaceName, mode))
+    try {
+      const res = await setUrpf({ variables: { nodeId, interfaceName: ifaceName, mode } })
+      const r = res.data?.setUrpf
+      if (!r?.success) {
+        setError(r?.message ?? 'uRPF change failed')
+        setUrpfPending((prev) => { const next = new Map(prev); next.delete(ifaceName); return next })
+        onPendingChange?.(false)
+      }
+      // On success: badge clears via the urpfPending→empty useEffect so spinner and badge vanish together
+    } catch (e) {
+      setError(String(e).replace(/^ApolloError:\s*/, ''))
+      setUrpfPending((prev) => { const next = new Map(prev); next.delete(ifaceName); return next })
       onPendingChange?.(false)
     }
   }
@@ -326,11 +376,18 @@ export default function InterfaceManager({
                     detachTitle="Disable ingress filtering"
                     extra={
                       iface.xdpAttached ? (
-                        <FibToggle
-                          enabled={iface.fibForwarding}
-                          pending={fibPending.has(iface.name)}
-                          onToggle={(v) => handleToggleFib(iface.name, v)}
-                        />
+                        <>
+                          <FibToggle
+                            enabled={iface.fibForwarding}
+                            pending={fibPending.has(iface.name)}
+                            onToggle={(v) => handleToggleFib(iface.name, v)}
+                          />
+                          <UrpfControl
+                            mode={iface.urpfMode ?? 'off'}
+                            pending={urpfPending.has(iface.name)}
+                            onChange={(m) => handleSetUrpf(iface.name, m)}
+                          />
+                        </>
                       ) : null
                     }
                   />
@@ -442,5 +499,42 @@ function FibToggle({
     >
       FWD {enabled ? 'on' : 'off'}
     </button>
+  )
+}
+
+function UrpfControl({
+  mode,
+  pending,
+  onChange,
+}: {
+  mode: string
+  pending: boolean
+  onChange: (mode: string) => void
+}) {
+  if (pending) {
+    return <Spinner />
+  }
+  const m = (mode || 'off').toLowerCase()
+  const on = m !== 'off'
+  return (
+    <select
+      value={m}
+      onChange={(e) => onChange(e.target.value)}
+      title={
+        'uRPF (unicast Reverse Path Filtering) drops source-spoofed ingress traffic. ' +
+        'Loose: drop only if no route to the source exists. ' +
+        'Strict: drop unless the route back to the source exits via this interface. ' +
+        'Ingress-only; never applied on egress.'
+      }
+      className={`ml-1 px-1 py-0.5 rounded text-[10px] font-medium border bg-gray-900 ${
+        on
+          ? 'border-purple-700 text-purple-300'
+          : 'border-gray-700 text-gray-400'
+      }`}
+    >
+      <option value="off">uRPF off</option>
+      <option value="loose">uRPF loose</option>
+      <option value="strict">uRPF strict</option>
+    </select>
   )
 }

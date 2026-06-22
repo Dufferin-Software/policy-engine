@@ -410,6 +410,7 @@ impl ControllerStore for InMemoryControllerStore {
             let xdp = existing.is_some_and(|i| i.xdp_attached);
             let tc = existing.is_some_and(|i| i.tc_attached);
             let fib = existing.is_some_and(|i| i.fib_forwarding);
+            let urpf = existing.map(|i| i.urpf_mode).unwrap_or(0);
             let ingress_da = existing.and_then(|i| i.ingress_default_action.clone());
             let egress_da = existing.and_then(|i| i.egress_default_action.clone());
             state.interfaces.insert(
@@ -430,6 +431,7 @@ impl ControllerStore for InMemoryControllerStore {
                     xdp_attached: xdp,
                     tc_attached: tc,
                     fib_forwarding: fib,
+                    urpf_mode: urpf,
                     ingress_default_action: ingress_da,
                     egress_default_action: egress_da,
                 },
@@ -508,6 +510,24 @@ impl ControllerStore for InMemoryControllerStore {
         for iface in state.interfaces.values_mut() {
             if iface.node_id == node_id {
                 iface.fib_forwarding = enabled.contains(iface.name.as_str());
+            }
+        }
+        Ok(())
+    }
+
+    async fn update_interface_urpf(
+        &self,
+        node_id: &str,
+        interface_modes: &[(String, u32)],
+    ) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        let modes: std::collections::HashMap<&str, u32> = interface_modes
+            .iter()
+            .map(|(name, mode)| (name.as_str(), *mode))
+            .collect();
+        for iface in state.interfaces.values_mut() {
+            if iface.node_id == node_id {
+                iface.urpf_mode = modes.get(iface.name.as_str()).copied().unwrap_or(0);
             }
         }
         Ok(())

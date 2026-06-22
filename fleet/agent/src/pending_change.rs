@@ -33,6 +33,26 @@ pub struct PendingChangeRegistry {
     inner: Mutex<HashMap<String, Entry>>,
 }
 
+/// Grace added to the controller's confirm deadline to derive the agent-side
+/// watchdog deadline.
+///
+/// The controller commits as soon as the agent's `ConfigConfirm{APPLIED}`
+/// arrives (any time up to *its* deadline) and only then sends `CommitAck`,
+/// which must still travel back to the agent. If the agent's watchdog used the
+/// same deadline, a `CommitAck` for a genuinely-committed change could arrive
+/// *after* the watchdog already reverted — a false revert that leaves the
+/// controller (committed) and node (reverted) in disagreement. Waiting an extra
+/// grace period gives a successful `CommitAck` time to return. If the controller
+/// instead abandoned the change (channel dead), no `CommitAck` ever comes and
+/// the watchdog still fires — just `REVERT_GRACE_MS` later.
+pub const REVERT_GRACE_MS: u32 = 60_000;
+
+/// Derive the agent-side watchdog deadline from the controller's confirm
+/// deadline by adding [`REVERT_GRACE_MS`].
+pub fn watchdog_deadline_ms(controller_deadline_ms: u32) -> u32 {
+    controller_deadline_ms.saturating_add(REVERT_GRACE_MS)
+}
+
 impl PendingChangeRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -49,8 +69,9 @@ impl PendingChangeRegistry {
         applier: Arc<ConfigApplier>,
         outbound_tx: mpsc::Sender<AgentMessage>,
     ) {
-        // Clamp to a sane range to avoid 0-second or multi-hour deadlines.
-        let deadline_ms = deadline_ms.clamp(500, 60_000);
+        // Clamp to a sane range to avoid 0-second or multi-hour deadlines. The
+        // ceiling accommodates the controller deadline plus REVERT_GRACE_MS.
+        let deadline_ms = deadline_ms.clamp(500, 300_000);
 
         let registry = Arc::clone(self);
         let gen_id_for_task = generation_id.clone();
@@ -216,6 +237,24 @@ mod tests {
         async fn get_stop_behavior(&self) -> Result<String> {
             Ok(String::new())
         }
+        async fn set_urpf(&self, _i: &str, _m: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn get_urpf(&self, _i: &str) -> Result<String> {
+            Ok("off".to_string())
+        }
+        async fn detach_ingress(&self, _i: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn detach_tc(&self, _i: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn set_fib_forwarding(&self, _i: &str, _e: bool) -> Result<()> {
+            Ok(())
+        }
+        async fn get_fib_forwarding(&self, _i: &str) -> Result<bool> {
+            Ok(false)
+        }
     }
 
     #[tokio::test]
@@ -270,6 +309,24 @@ mod tests {
             }
             async fn get_stop_behavior(&self) -> Result<String> {
                 Ok(String::new())
+            }
+            async fn set_urpf(&self, _i: &str, _m: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn get_urpf(&self, _i: &str) -> Result<String> {
+                Ok("off".to_string())
+            }
+            async fn detach_ingress(&self, _i: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn detach_tc(&self, _i: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn set_fib_forwarding(&self, _i: &str, _e: bool) -> Result<()> {
+                Ok(())
+            }
+            async fn get_fib_forwarding(&self, _i: &str) -> Result<bool> {
+                Ok(false)
             }
         }
 
@@ -326,5 +383,15 @@ mod tests {
             }
             other => panic!("Expected ConfigConfirm, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_watchdog_deadline_adds_grace() {
+        // The agent waits the controller's deadline plus the grace, so a
+        // CommitAck for a genuinely-committed change has time to return before
+        // the watchdog reverts.
+        assert_eq!(watchdog_deadline_ms(30_000), 30_000 + REVERT_GRACE_MS);
+        // Saturates rather than overflowing for an absurd controller deadline.
+        assert_eq!(watchdog_deadline_ms(u32::MAX), u32::MAX);
     }
 }
