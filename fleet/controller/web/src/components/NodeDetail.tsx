@@ -29,7 +29,7 @@ const GET_NODE_DETAIL = gql`
       expiresAfterSecs scheduleJson
     }
     pendingGeneration(nodeId: $id) {
-      generationId nodeId opKind issuedAt
+      generationId nodeId opKind issuedAt interfaceName direction
     }
   }
 `
@@ -37,7 +37,7 @@ const GET_NODE_DETAIL = gql`
 const GET_PENDING_GEN = gql`
   query GetPendingGeneration($id: ID!) {
     pendingGeneration(nodeId: $id) {
-      generationId nodeId opKind issuedAt
+      generationId nodeId opKind issuedAt interfaceName direction
     }
   }
 `
@@ -106,6 +106,8 @@ interface PendingGeneration {
   nodeId: string
   opKind: string
   issuedAt: string
+  interfaceName: string | null
+  direction: string | null
 }
 
 interface NodeDetailData {
@@ -158,6 +160,11 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
   const { data, refetch } = useQuery<NodeDetailData>(GET_NODE_DETAIL, {
     variables: { id: nodeId },
     pollInterval: 10_000,
+    // Refetch on mount instead of serving stale cache: when an op completes
+    // while this view is unmounted (navigated away), a remount otherwise shows
+    // the pre-op interface state until the next 10s poll. cache-and-network
+    // paints cached data instantly and reconciles with a fresh fetch.
+    fetchPolicy: 'cache-and-network',
   })
   const { data: pendingPollData, refetch: refetchPending } = useQuery<{ pendingGeneration: PendingGeneration | null }>(
     GET_PENDING_GEN,
@@ -263,6 +270,8 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
       refetch()
     }
     prevPendingGenRef.current = pendingGeneration
+    // Fires only on the pending-generation transition; refetch is stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingGeneration])
 
   // Clear attach/detach pending entries once interface state reflects the expected outcome.
@@ -278,6 +287,8 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
       if (actual === expected) { next.delete(key); changed = true }
     }
     if (changed) setAttachPending(next)
+    // Re-evaluates only when fresh interface state arrives; attachPending is read, not watched.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [interfaces])
 
   // Clear the pending-confirm badge at the same moment the attach spinner clears —
@@ -288,6 +299,8 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
     if (prevSize > 0 && attachPending.size === 0) {
       handlePendingChange(false)
     }
+    // Keyed off attachPending only: handlePendingChange is recreated each render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [attachPending])
 
   function isAttachPending(ifaceName: string, dir: string): boolean {
@@ -528,6 +541,7 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
                   nodeId={nodeId}
                   interfaces={interfaces}
                   rules={rules}
+                  pendingGeneration={pendingGeneration}
                   onRefetch={() => refetch()}
                   onShowStats={(name) => setStatsIface((prev) => (prev === name ? null : name))}
                   onPendingChange={handlePendingChange}

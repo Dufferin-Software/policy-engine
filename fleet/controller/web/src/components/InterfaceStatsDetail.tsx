@@ -180,7 +180,7 @@ function DirectionPanel({
               ]}
             />
           )}
-          {s.urpfDropPackets > 0 && (
+          {isIngress && (
             <StatSection
               title="uRPF"
               rows={[

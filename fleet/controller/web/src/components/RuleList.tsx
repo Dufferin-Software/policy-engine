@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
 
 import { useMutation, useQuery, gql } from '@apollo/client'
-import { RuleOutput, fmtBytes, fmtCount } from './types.ts'
+import { RuleOutput, OperationResult, fmtBytes, fmtCount } from './types.ts'
 
 const DELETE_RULE = gql`
   mutation DeleteRule($ruleId: ID!) {
@@ -131,9 +131,11 @@ function formatActions(actionsJson: string): string {
 }
 
 export default function RuleList({ rules, direction, nodeId, interfaceName, onRefetch, onFlash, onPendingChange, isPending }: Props) {
-  const [deleteRule] = useMutation(DELETE_RULE)
-  const [flushRules] = useMutation(FLUSH_RULES)
-  const [clearRuleStats] = useMutation(CLEAR_RULE_STATS, { refetchQueries: ['NodeRuleStats'] })
+  const [deleteRule] = useMutation<{ deleteRule: OperationResult }>(DELETE_RULE)
+  const [flushRules] = useMutation<{ flushRules: OperationResult }>(FLUSH_RULES)
+  const [clearRuleStats] = useMutation<{ clearRuleStats: OperationResult }>(CLEAR_RULE_STATS, {
+    refetchQueries: ['NodeRuleStats'],
+  })
 
   const filtered = rules.filter(
     (r) => r.direction.toLowerCase() === direction.toLowerCase(),
@@ -145,7 +147,7 @@ export default function RuleList({ rules, direction, nodeId, interfaceName, onRe
     try {
       const result = await deleteRule({ variables: { ruleId } })
       onRefetch()
-      const dr = (result.data as any)?.deleteRule
+      const dr = result.data?.deleteRule
       if (dr?.success === true) {
         onFlash?.('Rule deleted.')
       } else if (dr?.success === false) {
@@ -160,7 +162,7 @@ export default function RuleList({ rules, direction, nodeId, interfaceName, onRe
     if (!nodeId) return
     try {
       const result = await clearRuleStats({ variables: { nodeId, ruleId, direction: ruleDirection } })
-      const cr = (result.data as any)?.clearRuleStats
+      const cr = result.data?.clearRuleStats
       // Success is assumed silently; only surface failures.
       if (cr?.success === false) onFlash?.(`Clear failed: ${cr?.message ?? 'unknown error'}`)
     } catch (e) {
@@ -177,7 +179,7 @@ export default function RuleList({ rules, direction, nodeId, interfaceName, onRe
         variables: { nodeId, interfaceName, direction },
       })
       onRefetch()
-      const fr = (result.data as any)?.flushRules
+      const fr = result.data?.flushRules
       if (fr?.success === true) {
         onFlash?.(fr.message ?? 'Rules flushed.')
       } else if (fr?.success === false) {

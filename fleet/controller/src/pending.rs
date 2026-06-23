@@ -116,6 +116,38 @@ impl PendingOp {
         }
     }
 
+    /// The (interface, direction) this op targets, for per-control UI display.
+    /// `direction` is `None` for ops that aren't direction-scoped (fib/urpf),
+    /// and both are `None` for node-scoped ops (delete-by-id, stop-behavior).
+    pub fn interface_target(&self) -> (Option<String>, Option<String>) {
+        match self {
+            PendingOp::Attach {
+                interface_name,
+                direction,
+                ..
+            }
+            | PendingOp::Detach {
+                interface_name,
+                direction,
+                ..
+            }
+            | PendingOp::SetDefaultAction {
+                interface_name,
+                direction,
+                ..
+            }
+            | PendingOp::FlushRules {
+                interface_name,
+                direction,
+                ..
+            } => (Some(interface_name.clone()), Some(direction.clone())),
+            PendingOp::SetFibForwarding { interface_name, .. }
+            | PendingOp::SetUrpf { interface_name, .. } => (Some(interface_name.clone()), None),
+            PendingOp::CreateRule(r) => (Some(r.interface_name.clone()), Some(r.direction.clone())),
+            PendingOp::DeleteRule { .. } | PendingOp::SetStopBehavior { .. } => (None, None),
+        }
+    }
+
     /// Build the outbound `ControllerMessage` that will drive this op on the
     /// agent. The generation_id and deadline are stamped in so the agent can
     /// correlate its `ConfigConfirm` reply.
@@ -390,27 +422,24 @@ pub struct PendingGenerationView {
     pub op_kind: &'static str,
     pub node_id: String,
     pub tenant_slug: String,
+    /// Interface the op targets, when it is interface-scoped. Lets the UI pin
+    /// the in-flight spinner to a specific interface row across navigation.
+    pub interface_name: Option<String>,
+    /// "ingress" | "egress" for direction-scoped ops; `None` otherwise.
+    pub direction: Option<String>,
 }
 
 impl From<&PendingGeneration> for PendingGenerationView {
     fn from(g: &PendingGeneration) -> Self {
-        let op_kind = match &g.op {
-            PendingOp::CreateRule(_) => "create_rule",
-            PendingOp::DeleteRule { .. } => "delete_rule",
-            PendingOp::Attach { .. } => "attach",
-            PendingOp::Detach { .. } => "detach",
-            PendingOp::SetFibForwarding { .. } => "set_fib_forwarding",
-            PendingOp::SetUrpf { .. } => "set_urpf",
-            PendingOp::SetDefaultAction { .. } => "set_default_action",
-            PendingOp::SetStopBehavior { .. } => "set_stop_behavior",
-            PendingOp::FlushRules { .. } => "flush_rules",
-        };
+        let (interface_name, direction) = g.op.interface_target();
         Self {
             generation_id: g.generation_id.clone(),
             issued_at: g.issued_at,
-            op_kind,
+            op_kind: g.op.kind(),
             node_id: g.op.node_id().to_string(),
             tenant_slug: g.tenant_slug.clone(),
+            interface_name,
+            direction,
         }
     }
 }
@@ -869,6 +898,55 @@ mod tests {
         assert!(reg.get_for_node("n-acme", "default").is_none());
         assert!(reg.get_for_node("n-default", "acme").is_none());
         assert!(reg.get_for_node("n-acme", "acme").is_some());
+    }
+
+    #[test]
+    fn interface_target_exposes_scope_for_per_control_ui() {
+        // Direction-scoped ops carry both interface and direction.
+        let attach = PendingOp::Attach {
+            node_id: "n1".to_string(),
+            interface_name: "eth0".to_string(),
+            direction: "ingress".to_string(),
+        };
+        assert_eq!(
+            attach.interface_target(),
+            (Some("eth0".to_string()), Some("ingress".to_string()))
+        );
+
+        // Interface-scoped but not direction-scoped: direction is None.
+        let fib = PendingOp::SetFibForwarding {
+            node_id: "n1".to_string(),
+            interface_name: "eth1".to_string(),
+            enabled: true,
+        };
+        assert_eq!(fib.interface_target(), (Some("eth1".to_string()), None));
+
+        // Node-scoped ops target no interface.
+        let stop = PendingOp::SetStopBehavior {
+            node_id: "n1".to_string(),
+            behavior: "clear-state".to_string(),
+        };
+        assert_eq!(stop.interface_target(), (None, None));
+    }
+
+    #[tokio::test]
+    async fn pending_view_carries_interface_and_direction() {
+        let reg = PendingRegistry::new();
+        let _ = reg
+            .try_begin(
+                PendingOp::Attach {
+                    node_id: "n1".to_string(),
+                    interface_name: "eth0".to_string(),
+                    direction: "egress".to_string(),
+                },
+                "default".to_string(),
+                60_000,
+            )
+            .unwrap();
+        let view = reg.get_for_node("n1", "default").unwrap();
+        assert_eq!(view.op_kind, "attach");
+        assert_eq!(view.interface_name.as_deref(), Some("eth0"));
+        assert_eq!(view.direction.as_deref(), Some("egress"));
     }
 
     #[tokio::test]

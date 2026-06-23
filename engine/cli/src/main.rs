@@ -8,10 +8,10 @@
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use std::collections::HashMap;
 use prettytable::{format, row, Table};
 use serde::Serialize;
 use serde_json::json;
+use std::collections::HashMap;
 
 use policy_engine_dev::output::{format_bytes, format_packets};
 use policy_engine_dev::types::*;
@@ -1151,7 +1151,8 @@ fn handle_show(client: &PolicyClient, cmd: ShowCommands, json_output: bool) -> R
                     Some(f) => f.into_iter().collect(),
                     None => return Ok(()),
                 };
-            let is_ingress = |iface: &InterfaceAttachment| iface.direction.eq_ignore_ascii_case("ingress");
+            let is_ingress =
+                |iface: &InterfaceAttachment| iface.direction.eq_ignore_ascii_case("ingress");
             let urpf_mode = |iface: &InterfaceAttachment| {
                 urpf.get(&iface.interface)
                     .cloned()

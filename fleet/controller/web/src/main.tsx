@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
 
+// Entry point: defines the root <Root> component alongside bootstrap/render
+// code, so the fast-refresh "only export components" rule doesn't apply here.
+/* eslint-disable react-refresh/only-export-components */
+
 import { StrictMode, useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import {

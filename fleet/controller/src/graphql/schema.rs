@@ -293,6 +293,11 @@ pub struct PendingGenerationOutput {
     /// One of: "create_rule", "delete_rule", "flush_rules", "attach", "detach", "set_fib_forwarding", "set_urpf".
     pub op_kind: String,
     pub issued_at: DateTime<Utc>,
+    /// Interface the op targets, when interface-scoped; lets the UI pin the
+    /// in-flight spinner to a specific interface row across navigation.
+    pub interface_name: Option<String>,
+    /// "ingress" | "egress" for direction-scoped ops; null otherwise.
+    pub direction: Option<String>,
 }
 
 impl From<crate::pending::PendingGenerationView> for PendingGenerationOutput {
@@ -302,6 +307,8 @@ impl From<crate::pending::PendingGenerationView> for PendingGenerationOutput {
             node_id: v.node_id,
             op_kind: v.op_kind.to_string(),
             issued_at: v.issued_at,
+            interface_name: v.interface_name,
+            direction: v.direction,
         }
     }
 }

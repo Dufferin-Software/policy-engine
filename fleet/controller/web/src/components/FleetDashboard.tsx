@@ -5,7 +5,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, gql } from '@apollo/client'
 import { ControlledNode, nodeDisplayName, relTime, shortId, statusColor } from './types.ts'
 import NodeDetail, { NodeTab } from './NodeDetail.tsx'
-import FleetRuleCreator from './FleetRuleCreator.tsx'
+import FleetConfig from './FleetConfig.tsx'
 import MonitoringSetup from './MonitoringSetup.tsx'
 import FleetMetricsBar from './FleetMetricsBar.tsx'
 
@@ -64,7 +64,7 @@ export default function FleetDashboard({ selectedNode, onSelectNode }: FleetDash
   const [decommission] = useMutation(DECOMMISSION)
   const [removeNode] = useMutation(REMOVE_NODE)
   const [labelNode] = useMutation(LABEL_NODE)
-  const [showFleetRule, setShowFleetRule] = useState(false)
+  const [showFleetConfig, setShowFleetConfig] = useState(false)
   const [showMonitoring, setShowMonitoring] = useState(false)
   const [labelEdit, setLabelEdit] = useState<{ id: string; value: string } | null>(null)
   const [msg, setMsg] = useState<string | null>(null)
@@ -140,10 +140,10 @@ export default function FleetDashboard({ selectedNode, onSelectNode }: FleetDash
             <span className="text-sm text-green-400 mr-2">{msg}</span>
           )}
           <button
-            onClick={() => setShowFleetRule(true)}
+            onClick={() => setShowFleetConfig(true)}
             className="bg-blue-800 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm"
           >
-            Fleet Rule
+            Fleet Config
           </button>
           <button
             onClick={() => setShowMonitoring(true)}
@@ -301,13 +301,13 @@ export default function FleetDashboard({ selectedNode, onSelectNode }: FleetDash
         </div>
       )}
 
-      {showFleetRule && (
-        <FleetRuleCreator
+      {showFleetConfig && (
+        <FleetConfig
           nodes={nodes}
-          onClose={() => setShowFleetRule(false)}
-          onCreated={() => {
-            setShowFleetRule(false)
-            flash('Fleet rule created.')
+          onClose={() => setShowFleetConfig(false)}
+          onApplied={(msg) => {
+            setShowFleetConfig(false)
+            flash(msg)
             refetch()
           }}
         />

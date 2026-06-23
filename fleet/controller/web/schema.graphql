@@ -489,6 +489,12 @@ type MutationRoot {
 	any TC egress filtering on the outbound interface.
 	"""
 	setFibForwarding(nodeId: ID!, interfaceName: String!, enabled: Boolean!): OperationResult!
+	"""
+	Set the uRPF (unicast Reverse Path Forwarding) mode on a single ingress
+	interface of a node. uRPF drops source-spoofed traffic; it is ingress-only
+	(XDP) and is never supported on egress. `mode` must be one of "off",
+	"loose", or "strict" (case-insensitive).
+	"""
 	setUrpf(nodeId: ID!, interfaceName: String!, mode: String!): OperationResult!
 	"""
 	Record a client-initiated audit entry (e.g. events exported).
@@ -688,6 +694,15 @@ type PendingGenerationOutput {
 	"""
 	opKind: String!
 	issuedAt: DateTime!
+	"""
+	Interface the op targets, when interface-scoped; lets the UI pin the
+	in-flight spinner to a specific interface row across navigation.
+	"""
+	interfaceName: String
+	"""
+	"ingress" | "egress" for direction-scoped ops; null otherwise.
+	"""
+	direction: String
 }
 
 type QueryRoot {

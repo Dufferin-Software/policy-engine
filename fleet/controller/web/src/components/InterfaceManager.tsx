@@ -45,10 +45,21 @@ const SET_URPF = gql`
   }
 `
 
+// Durable view of the node's single in-flight config op, polled from the
+// controller. Lets the per-control spinner survive navigation: after a remount
+// the local optimistic state is gone, but this still pins a spinner to the
+// interface+direction the op targets until the agent confirms.
+export interface PendingGenerationInfo {
+  opKind: string
+  interfaceName: string | null
+  direction: string | null
+}
+
 interface Props {
   nodeId: string
   interfaces: NodeInterfaceOutput[]
   rules?: RuleOutput[]
+  pendingGeneration?: PendingGenerationInfo | null
   onRefetch: () => void
   onShowStats?: (interfaceName: string) => void
   onPendingChange?: (pending: boolean, opKind?: string) => void
@@ -86,6 +97,7 @@ export default function InterfaceManager({
   nodeId,
   interfaces,
   rules = [],
+  pendingGeneration,
   onRefetch,
   onShowStats,
   onPendingChange,
@@ -140,6 +152,10 @@ export default function InterfaceManager({
       if ((iface.urpfMode ?? 'off') === expected) { nextUrpf.delete(ifaceName); urpfChanged = true }
     }
     if (urpfChanged) setUrpfPending(nextUrpf)
+    // Intentionally re-evaluates only when fresh interface state arrives; the
+    // pending maps are read, not watched (a pending entry clears the moment the
+    // interface it targets reaches the expected value).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [interfaces])
 
   // Clear pending-confirm badge when the attach/detach spinner resolves (pending→empty).
@@ -149,6 +165,9 @@ export default function InterfaceManager({
     if (prevSize > 0 && pending.size === 0) {
       onPendingChange?.(false)
     }
+    // Keyed off the pending map only: onPendingChange is recreated each render,
+    // so listing it would fire this size-transition check every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pending])
 
   // Clear pending-confirm badge when the fib-forwarding spinner resolves.
@@ -158,6 +177,7 @@ export default function InterfaceManager({
     if (prevSize > 0 && fibPending.size === 0) {
       onPendingChange?.(false)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fibPending])
 
   // Clear pending-confirm badge when the uRPF spinner resolves.
@@ -167,6 +187,7 @@ export default function InterfaceManager({
     if (prevSize > 0 && urpfPending.size === 0) {
       onPendingChange?.(false)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [urpfPending])
 
   async function handleSaveTag(interfaceName: string, tag: string) {
@@ -179,8 +200,33 @@ export default function InterfaceManager({
     onRefetch()
   }
 
+  // Server-derived pending: the controller tracks one in-flight op per node and
+  // tells us which interface/direction it targets. We OR this with the local
+  // optimistic maps so a spinner (a) appears instantly on click and (b) keeps
+  // showing after navigating away and back, until the agent confirms.
+  function serverPending(ifaceName: string, ...opKinds: string[]): boolean {
+    const pg = pendingGeneration
+    return (
+      !!pg &&
+      opKinds.includes(pg.opKind) &&
+      pg.interfaceName === ifaceName
+    )
+  }
+
   function isPending(ifaceName: string, dir: string): boolean {
-    return pending.has(`${ifaceName}:${dir}`)
+    if (pending.has(`${ifaceName}:${dir}`)) return true
+    return !!pendingGeneration
+      && (pendingGeneration.opKind === 'attach' || pendingGeneration.opKind === 'detach')
+      && pendingGeneration.interfaceName === ifaceName
+      && pendingGeneration.direction === dir
+  }
+
+  function isFibPending(ifaceName: string): boolean {
+    return fibPending.has(ifaceName) || serverPending(ifaceName, 'set_fib_forwarding')
+  }
+
+  function isUrpfPending(ifaceName: string): boolean {
+    return urpfPending.has(ifaceName) || serverPending(ifaceName, 'set_urpf')
   }
 
   function clearError() { setError(null) }
@@ -379,12 +425,12 @@ export default function InterfaceManager({
                         <>
                           <FibToggle
                             enabled={iface.fibForwarding}
-                            pending={fibPending.has(iface.name)}
+                            pending={isFibPending(iface.name)}
                             onToggle={(v) => handleToggleFib(iface.name, v)}
                           />
                           <UrpfControl
                             mode={iface.urpfMode ?? 'off'}
-                            pending={urpfPending.has(iface.name)}
+                            pending={isUrpfPending(iface.name)}
                             onChange={(m) => handleSetUrpf(iface.name, m)}
                           />
                         </>
