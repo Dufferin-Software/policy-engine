@@ -156,6 +156,39 @@ function PolicySpinner() {
   )
 }
 
+// Live BPF event buffers, keyed by node id, kept at module scope so they
+// persist across NodeDetail mount/unmount — i.e. navigating away from a node's
+// live events window and back no longer discards everything received so far.
+// Each buffer is capped at 500 events by the WebSocket handler below.
+//
+// To bound memory across a long-lived session, the cache is itself an LRU
+// keyed by node id: at most LIVE_EVENT_CACHE_MAX_NODES nodes are retained, and
+// the least-recently-touched node's buffer is evicted when that limit is hit.
+// Map iteration order is insertion order, so deleting and re-inserting on every
+// access keeps the oldest entry first.
+const LIVE_EVENT_CACHE_MAX_NODES = 50
+const liveEventCache = new Map<string, Event[]>()
+
+function getLiveEvents(nodeId: string): Event[] {
+  const buf = liveEventCache.get(nodeId)
+  if (buf === undefined) return []
+  // Bump recency.
+  liveEventCache.delete(nodeId)
+  liveEventCache.set(nodeId, buf)
+  return buf
+}
+
+function setLiveEvents(nodeId: string, buf: Event[]): void {
+  // Re-insert to mark most-recently-used, then evict from the front.
+  liveEventCache.delete(nodeId)
+  liveEventCache.set(nodeId, buf)
+  while (liveEventCache.size > LIVE_EVENT_CACHE_MAX_NODES) {
+    const oldest = liveEventCache.keys().next().value
+    if (oldest === undefined) break
+    liveEventCache.delete(oldest)
+  }
+}
+
 export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
   const { data, refetch } = useQuery<NodeDetailData>(GET_NODE_DETAIL, {
     variables: { id: nodeId },
@@ -361,16 +394,30 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
     }
   }
 
-  // Live event stream via WebSocket
-  const [events, setEvents] = useState<Event[]>([])
+  // Live event stream via WebSocket.
+  //
+  // The buffer is seeded from (and mirrored into) liveEventCache so it survives
+  // navigating away from this node's events window and back; unmounting
+  // NodeDetail otherwise discards every event received so far.
+  const [events, setEvents] = useState<Event[]>(() => getLiveEvents(nodeId))
   const wsRef = useRef<WebSocket | null>(null)
   const bottomRef = useRef<HTMLDivElement | null>(null)
+
+  // Restore the cached buffer when the viewed node changes without a remount,
+  // so one node's events never bleed into another's.
+  useEffect(() => {
+    setEvents(getLiveEvents(nodeId))
+  }, [nodeId])
 
   useEffect(() => {
     const ws = new WebSocket(wsUrl('/ws/events', { node: nodeId }))
     wsRef.current = ws
     ws.onmessage = (e: MessageEvent<string>) => {
-      setEvents((prev) => [...prev.slice(-499), { text: e.data, ts: Date.now() }])
+      setEvents((prev) => {
+        const next = [...prev.slice(-499), { text: e.data, ts: Date.now() }]
+        setLiveEvents(nodeId, next)
+        return next
+      })
     }
     return () => ws.close()
   }, [nodeId])
@@ -745,7 +792,10 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
                   Export JSON
                 </button>
                 <button
-                  onClick={() => setEvents([])}
+                  onClick={() => {
+                    setEvents([])
+                    setLiveEvents(nodeId, [])
+                  }}
                   className="text-xs text-gray-500 hover:text-gray-300"
                 >
                   Clear
