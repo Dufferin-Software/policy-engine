@@ -477,20 +477,31 @@ struct {
  * BPF_ANY so a DROP from a later rule in the chain overwrites an earlier
  * PASS seeded by an exhausted no-match probe on the same flow.
  */
+/*
+ * Build a flow_verdict_cache key from a parsed flow_key.  Shared by the
+ * verdict-cache lookup in xdp_policy_main and the verdict writer below so the
+ * two stay in sync on field layout (address family, addresses, ports, proto).
+ */
+static __always_inline void
+flow_verdict_key_from_flow(struct flow_verdict_key *fv_key,
+                           const struct flow_key *flow) {
+  if (flow->af == AF_INET) {
+    fv_key->saddr4 = flow->saddr4;
+    fv_key->daddr4 = flow->daddr4;
+  } else {
+    __builtin_memcpy(fv_key->saddr6, flow->saddr6, 16);
+    __builtin_memcpy(fv_key->daddr6, flow->daddr6, 16);
+  }
+  fv_key->sport = flow->sport;
+  fv_key->dport = flow->dport;
+  fv_key->protocol = flow->protocol;
+  fv_key->af = flow->af;
+}
+
 static __always_inline void
 xdp_sni_write_verdict(const struct flow_key *flow, __u32 action, __u64 now_ns) {
   struct flow_verdict_key fv_key = {};
-  if (flow->af == AF_INET) {
-    fv_key.saddr4 = flow->saddr4;
-    fv_key.daddr4 = flow->daddr4;
-  } else {
-    __builtin_memcpy(fv_key.saddr6, flow->saddr6, 16);
-    __builtin_memcpy(fv_key.daddr6, flow->daddr6, 16);
-  }
-  fv_key.sport = flow->sport;
-  fv_key.dport = flow->dport;
-  fv_key.protocol = flow->protocol;
-  fv_key.af = flow->af;
+  flow_verdict_key_from_flow(&fv_key, flow);
 
   struct flow_verdict v = {};
   v.action = action;
@@ -615,17 +626,7 @@ int xdp_sni_inspect(struct xdp_md *ctx) {
         if (!cfg || cfg->mode == INSPECT_MODE_DISABLED)
           break;
         struct flow_verdict_key fv_key = {};
-        if (meta->flow.af == AF_INET) {
-          fv_key.saddr4 = meta->flow.saddr4;
-          fv_key.daddr4 = meta->flow.daddr4;
-        } else {
-          __builtin_memcpy(fv_key.saddr6, meta->flow.saddr6, 16);
-          __builtin_memcpy(fv_key.daddr6, meta->flow.daddr6, 16);
-        }
-        fv_key.sport = meta->flow.sport;
-        fv_key.dport = meta->flow.dport;
-        fv_key.protocol = meta->flow.protocol;
-        fv_key.af = meta->flow.af;
+        flow_verdict_key_from_flow(&fv_key, &meta->flow);
         __u64 expiry = sni_now + INSPECT_CLONE_TTL_NS;
         bpf_map_update_elem(&flows_to_inspect, &fv_key, &expiry, BPF_ANY);
         struct flow_verdict pass_v = {};
@@ -823,6 +824,148 @@ pass_through:
   FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, XDP_PASS);
 }
 
+/*
+ * Check the flow verdict cache for a cached PASS/DROP decision.
+ *
+ * Returns the XDP verdict (XDP_PASS / XDP_DROP) on a live cache hit, having
+ * already updated the relevant counters and recorded timing, or -1 when there
+ * is no usable cached decision and the caller should continue to policy lookup.
+ */
+static __always_inline int
+check_flow_verdict_cache(struct global_stats *stats,
+                         const struct flow_verdict_key *fv_key, __u32 pkt_len,
+                         __u64 t0) {
+  struct flow_verdict *fv = bpf_map_lookup_elem(&flow_verdict_cache, fv_key);
+  if (!fv)
+    return -1;
+
+  __u64 now = bpf_ktime_get_ns();
+  if (fv->expires_ns != 0 && now >= fv->expires_ns)
+    return -1;
+
+  if (fv->action == ACTION_DROP) {
+    __sync_fetch_and_add(&fv->packets, 1);
+    __sync_fetch_and_add(&fv->bytes, pkt_len);
+    update_action_stats(stats, ACTION_DROP);
+    if (stats) {
+      stats->verdict_drop_packets++;
+      stats->verdict_drop_bytes += pkt_len;
+    }
+    /* Reuse 'now' already read above — avoids an extra clock call */
+    XDP_RECORD_TIMING_AT(t0, now);
+    return XDP_DROP;
+  } else if (fv->action == ACTION_PASS) {
+    /* Cached PASS verdict: flow previously inspected and not flagged.
+     * Pass through immediately, skipping the policy lookup. */
+    __sync_fetch_and_add(&fv->packets, 1);
+    __sync_fetch_and_add(&fv->bytes, pkt_len);
+    update_action_stats(stats, ACTION_PASS);
+    if (stats) {
+      stats->verdict_pass_packets++;
+      stats->verdict_pass_bytes += pkt_len;
+    }
+    XDP_RECORD_TIMING_AT(t0, now);
+    return XDP_PASS;
+  }
+
+  return -1;
+}
+
+/*
+ * Apply the L4 rules in a matched dst-prefix entry.
+ *
+ * rules[] is sorted by priority.  Non-SNI rules are evaluated immediately;
+ * SNI rules are queued into meta->sni_pending[] (meta->sni_count is bumped)
+ * for the chained tail-call inspection path.  Scanning stops at the first
+ * non-SNI rule that DROPs.  *fc_rule_id is set to the first matching rule
+ * (overridden by a DROP rule).
+ *
+ * Returns the immediate verdict: XDP_DROP if a non-SNI rule dropped, else
+ * XDP_PASS (the caller still consults meta->sni_count for the SNI tail call).
+ */
+static __always_inline __u32
+xdp_apply_l4_rules(struct xdp_md *ctx, struct global_stats *stats,
+                   struct dst_lpm_value *policy, struct flow_key *flow_key,
+                   __u64 t0, __u32 pkt_len, const __u8 *pkt_src_mac,
+                   const __u8 *pkt_dst_mac, struct pkt_meta *meta,
+                   __u64 *fc_rule_id
+#ifdef SURICATA_IPS
+                   ,
+                   struct flow_verdict_key *fv_key
+#endif
+) {
+  __u8 cnt = policy->count;
+  if (cnt > MAX_L4_RULES)
+    cnt = MAX_L4_RULES;
+
+  __u32 final_verdict = XDP_PASS;
+  __u8 dropped = 0;
+
+  for (int r = 0; r < MAX_L4_RULES; r++) {
+    if (!dropped && (__u8)r < cnt) {
+      struct l4_rule *rule = &policy->rules[r];
+      if (match_l4(flow_key, rule) &&
+          match_quic_version(flow_key->flags, rule->quic_version) &&
+          check_mac_rule_xdp(pkt_src_mac, pkt_dst_mac, rule->mac_match_flags,
+                             rule->rule_id)) {
+        if (rule->sni_match_type == SNI_MATCH_NONE) {
+          /* Non-SNI rule: apply immediately */
+          update_rule_stats(rule->rule_id, pkt_len, t0);
+          if (*fc_rule_id == 0)
+            *fc_rule_id = rule->rule_id;
+          __u32 v = process_rule_actions(ctx, stats, rule, flow_key, t0
+#ifdef SURICATA_IPS
+                                         ,
+                                         fv_key
+#endif
+          );
+          if (v == XDP_DROP) {
+            *fc_rule_id = rule->rule_id; /* override with the DROP rule */
+            dropped = 1;
+            final_verdict = XDP_DROP;
+          }
+        } else {
+          /* SNI rule: queue for tail-call chain */
+          if (meta && meta->sni_count < MAX_L4_RULES) {
+            __u8 si = meta->sni_count;
+            /* Mask index so the verifier sees a bounded offset.
+             * MAX_L4_RULES = 8 = 2^3. */
+            __asm__ volatile("" : "+r"(si));
+            si &= (MAX_L4_RULES - 1);
+            meta->sni_pending[si].rule_id = rule->rule_id;
+            meta->sni_pending[si].num_actions = rule->num_actions;
+#pragma unroll
+            for (__u8 ai = 0; ai < MAX_ACTIONS_PER_RULE; ai++)
+              meta->sni_pending[si].actions[ai] = rule->actions[ai];
+            meta->sni_count++;
+          }
+        }
+      }
+    }
+  }
+
+  return final_verdict;
+}
+
+/*
+ * Populate pkt_scratch with the flow metadata the SNI inspection tail call
+ * needs.  Called on the cold SNI path only (sni_count preserved from the rule
+ * loop); see the lazy-population note at the call site.
+ */
+static __always_inline void
+xdp_fill_sni_meta(struct pkt_meta *meta, const struct flow_key *flow_key,
+                  __u32 pkt_len, int l4_off, __u64 t0, int l3_off,
+                  __u16 eth_proto) {
+  __builtin_memcpy(&meta->flow, flow_key, sizeof(*flow_key));
+  meta->pkt_len = pkt_len;
+  meta->l4_off = (__u16)l4_off;
+  meta->sni_idx = 0;
+  meta->sni_seen = 0;
+  meta->t0 = t0;
+  meta->l3_off = (__u16)l3_off;
+  meta->eth_proto = eth_proto;
+}
+
 SEC("xdp")
 int xdp_policy_main(struct xdp_md *ctx) {
   struct flow_key flow_key;
@@ -857,10 +1000,10 @@ int xdp_policy_main(struct xdp_md *ctx) {
    * PTR_TO_STACK can.  eth bounds are already validated above. */
   __u8 pkt_src_mac[6];
   __u8 pkt_dst_mac[6];
-  __builtin_memcpy(pkt_src_mac, eth->h_source, 6);
-  __builtin_memcpy(pkt_dst_mac, eth->h_dest, 6);
+  __builtin_memcpy(pkt_src_mac, eth->h_source, sizeof(pkt_src_mac));
+  __builtin_memcpy(pkt_dst_mac, eth->h_dest, sizeof(pkt_dst_mac));
 
-  /* Get the real ethertype (handles VLAN tags) */
+  /* Get the ethertype */
   int l3_off = get_ethertype(data, data_end, &eth_proto);
   if (eth_proto == 0 || l3_off == 0) {
     /* Failed to parse ethertype - treat as parse error */
@@ -871,22 +1014,7 @@ int xdp_policy_main(struct xdp_md *ctx) {
   }
 
   /* Classify L3 protocol (buckets: 0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other) */
-  {
-    __u32 l3_key = 4;
-    if (eth_proto == ETH_P_IP)
-      l3_key = 0;
-    else if (eth_proto == ETH_P_IPV6)
-      l3_key = 1;
-    else if (eth_proto == ETH_P_ARP)
-      l3_key = 2;
-    else if (eth_proto == ETHERTYPE_MPLS || eth_proto == ETHERTYPE_MPLS_MC)
-      l3_key = 3;
-    struct proto_stats *l3ps = bpf_map_lookup_elem(&per_l3_stats, &l3_key);
-    if (l3ps) {
-      l3ps->packets++;
-      l3ps->bytes += pkt_len;
-    }
-  }
+  update_l3_proto_stats(eth_proto, pkt_len);
 
   /* Parse packet to extract flow key.
    * Returns >= 0 (L4 offset) on success, PARSE_NONFIRST_FRAG (-2) for a
@@ -924,13 +1052,7 @@ int xdp_policy_main(struct xdp_md *ctx) {
   }
 
   /* Update per-IP-protocol stats (flow_key.protocol is valid from here) */
-
-  __u32 proto_key = flow_key.protocol;
-  struct proto_stats *ps = bpf_map_lookup_elem(&per_proto_stats, &proto_key);
-  if (ps) {
-    ps->packets++;
-    ps->bytes += pkt_len;
-  }
+  update_ip_proto_stats(flow_key.protocol, pkt_len);
 
   /* Update QUIC stats if this packet looks like QUIC */
   if (flow_key.flags & FLOW_FLAG_QUIC)
@@ -951,48 +1073,11 @@ int xdp_policy_main(struct xdp_md *ctx) {
    * source.  A hit short-circuits the policy lookup at XDP line rate.
    * fv_key remains in scope for reuse by the INSPECT action below. */
   struct flow_verdict_key fv_key = {};
-  if (flow_key.af == AF_INET) {
-    fv_key.saddr4 = flow_key.saddr4;
-    fv_key.daddr4 = flow_key.daddr4;
-  } else {
-    __builtin_memcpy(fv_key.saddr6, flow_key.saddr6, 16);
-    __builtin_memcpy(fv_key.daddr6, flow_key.daddr6, 16);
-  }
-  fv_key.sport = flow_key.sport;
-  fv_key.dport = flow_key.dport;
-  fv_key.protocol = flow_key.protocol;
-  fv_key.af = flow_key.af;
+  flow_verdict_key_from_flow(&fv_key, &flow_key);
 
-  struct flow_verdict *fv = bpf_map_lookup_elem(&flow_verdict_cache, &fv_key);
-  if (fv) {
-    __u64 now = bpf_ktime_get_ns();
-    if (fv->expires_ns == 0 || now < fv->expires_ns) {
-      if (fv->action == ACTION_DROP) {
-        __sync_fetch_and_add(&fv->packets, 1);
-        __sync_fetch_and_add(&fv->bytes, pkt_len);
-        update_action_stats(stats, ACTION_DROP);
-        if (stats) {
-          stats->verdict_drop_packets++;
-          stats->verdict_drop_bytes += pkt_len;
-        }
-        /* Reuse 'now' already read above — avoids an extra clock call */
-        XDP_RECORD_TIMING_AT(t0, now);
-        return XDP_DROP;
-      } else if (fv->action == ACTION_PASS) {
-        /* Cached PASS verdict: flow previously inspected and not flagged.
-         * Pass through immediately, skipping the policy lookup. */
-        __sync_fetch_and_add(&fv->packets, 1);
-        __sync_fetch_and_add(&fv->bytes, pkt_len);
-        update_action_stats(stats, ACTION_PASS);
-        if (stats) {
-          stats->verdict_pass_packets++;
-          stats->verdict_pass_bytes += pkt_len;
-        }
-        XDP_RECORD_TIMING_AT(t0, now);
-        return XDP_PASS;
-      }
-    }
-  }
+  int cached_verdict = check_flow_verdict_cache(stats, &fv_key, pkt_len, t0);
+  if (cached_verdict >= 0)
+    return cached_verdict;
 
   /* Lookup policy (two-level LPM: src prefix → dst prefix → L4 rules).
    * Scoped per-interface by ctx->ingress_ifindex. */
@@ -1003,75 +1088,26 @@ int xdp_policy_main(struct xdp_md *ctx) {
     if (stats)
       stats->policy_matches++;
 
-    /* Pre-populate pkt_scratch with flow metadata for the SNI tail-call chain.
-     * sni_count/sni_idx are initialised here; the rule loop below may add SNI
-     * rules to sni_pending[]. */
+    /* Grab the pkt_scratch slot and reset only sni_count so the rule loop
+     * below can queue SNI rules into sni_pending[].  The full flow metadata
+     * (flow key, offsets, timestamps) is consumed solely by the SNI
+     * inspection tail call, so it is populated lazily just before that tail
+     * call fires (see below).  This keeps the common no-SNI path — the vast
+     * majority of packets — free of the 40-byte flow memcpy and the scalar
+     * field writes, which FLOW_CACHE_TAIL_CALL would overwrite anyway. */
     struct pkt_meta *meta = bpf_map_lookup_elem(&pkt_scratch, &zero);
-    if (meta) {
-      __builtin_memcpy(&meta->flow, &flow_key, sizeof(flow_key));
-      meta->pkt_len = pkt_len;
-      meta->l4_off = (__u16)l4_off;
+    if (meta)
       meta->sni_count = 0;
-      meta->sni_idx = 0;
-      meta->sni_seen = 0;
-      meta->t0 = t0;
-      meta->l3_off = (__u16)l3_off;
-      meta->eth_proto = eth_proto;
-    }
 
-    __u8 cnt = policy->count;
-    if (cnt > MAX_L4_RULES)
-      cnt = MAX_L4_RULES;
-
-    __u32 final_verdict = XDP_PASS;
-    __u8 dropped = 0;
-
-    /* Scan all L4 rules in this dst entry (rules[] is sorted by priority).
-     * Non-SNI rules are applied immediately; SNI rules are queued for the
-     * chained tail-call path.  If any non-SNI rule DROPs, skip remaining rules.
-     */
-    for (int r = 0; r < MAX_L4_RULES; r++) {
-      if (!dropped && (__u8)r < cnt) {
-        struct l4_rule *rule = &policy->rules[r];
-        if (match_l4(&flow_key, rule) &&
-            match_quic_version(flow_key.flags, rule->quic_version) &&
-            check_mac_rule_xdp(pkt_src_mac, pkt_dst_mac,
-                               rule->mac_match_flags, rule->rule_id)) {
-          if (rule->sni_match_type == SNI_MATCH_NONE) {
-            /* Non-SNI rule: apply immediately */
-            update_rule_stats(rule->rule_id, pkt_len, t0);
-            if (fc_rule_id == 0)
-              fc_rule_id = rule->rule_id;
-            __u32 v = process_rule_actions(ctx, stats, rule, &flow_key, t0
+    __u32 final_verdict = xdp_apply_l4_rules(ctx, stats, policy, &flow_key, t0,
+                                             pkt_len, pkt_src_mac, pkt_dst_mac,
+                                             meta, &fc_rule_id
 #ifdef SURICATA_IPS
-                                           ,
-                                           &fv_key
+                                             ,
+                                             &fv_key
 #endif
-            );
-            if (v == XDP_DROP) {
-              fc_rule_id = rule->rule_id; /* override with the DROP rule */
-              dropped = 1;
-              final_verdict = XDP_DROP;
-            }
-          } else {
-            /* SNI rule: queue for tail-call chain */
-            if (meta && meta->sni_count < MAX_L4_RULES) {
-              __u8 si = meta->sni_count;
-              /* Mask index so the verifier sees a bounded offset.
-               * MAX_L4_RULES = 8 = 2^3. */
-              __asm__ volatile("" : "+r"(si));
-              si &= (MAX_L4_RULES - 1);
-              meta->sni_pending[si].rule_id = rule->rule_id;
-              meta->sni_pending[si].num_actions = rule->num_actions;
-#pragma unroll
-              for (__u8 ai = 0; ai < MAX_ACTIONS_PER_RULE; ai++)
-                meta->sni_pending[si].actions[ai] = rule->actions[ai];
-              meta->sni_count++;
-            }
-          }
-        }
-      }
-    }
+    );
+    __u8 dropped = (final_verdict == XDP_DROP);
 
     /* If any SNI rules were queued (and no DROP already), tail-call to the
      * inspection program.  Branch by L4 protocol so the same `sni` rule field
@@ -1081,6 +1117,12 @@ int xdp_policy_main(struct xdp_md *ctx) {
     if (!dropped && meta && meta->sni_count > 0) {
       if (stats)
         stats->tail_calls++;
+      /* Now that we know an SNI inspection tail call is happening, populate the
+       * flow metadata the inspection program needs.  sni_count is preserved
+       * (set by the rule loop above); the rest is written here on the cold
+       * SNI path only. */
+      xdp_fill_sni_meta(meta, &flow_key, pkt_len, l4_off, t0, l3_off,
+                        eth_proto);
       /* Timing is recorded by the inspection tail-call program at its terminal
        * returns so that the full inspection path is included in the histogram. */
       if (flow_key.protocol == PROTO_UDP)
