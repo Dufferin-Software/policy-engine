@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
     let registry = Arc::new(NodeRegistry::new(Arc::clone(&store), Arc::new(NopCa)));
     let sessions = Arc::new(NodeSessionManager::new());
     let pending = Arc::new(PendingRegistry::new());
+    let flow_queries = Arc::new(policy_controller::flow_query::FlowQueryRegistry::new());
     let metrics_store = Arc::new(MetricsStore::new());
     let rule_lifecycle = Arc::new(RuleLifecycleBus::new());
     let alert_rule_bus = Arc::new(AlertRuleBus::new());
@@ -70,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
         store,
         sessions,
         pending,
+        flow_queries,
         metrics_store,
         rule_lifecycle,
         scope,

@@ -8,6 +8,7 @@ pub mod config;
 pub mod controller_metrics;
 pub mod event_bus;
 pub mod event_pipeline;
+pub mod flow_query;
 pub mod graphql;
 pub mod grpc;
 pub mod http;

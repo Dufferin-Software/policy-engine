@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::{
     api_tokens::ApiTokenStore,
     event_pipeline::{alert_bus::AlertRuleBus, TenantScope},
+    flow_query::FlowQueryRegistry,
     graphql::alerts::{
         resolve_alert_history, resolve_alert_rules, resolve_create_alert_rule,
         resolve_create_receiver, resolve_create_silence, resolve_delete_alert_rule,
@@ -423,6 +424,24 @@ pub struct NodeEthertypeStatOutput {
     pub ethertype: u32,
     pub name: String,
     pub packets: u64,
+}
+
+/// A single cached flow verdict entry, read live from a node's BPF verdict cache
+/// via an on-demand query to the agent (not from the Prometheus snapshot).
+#[derive(SimpleObject, Clone)]
+pub struct NodeFlowVerdictOutput {
+    pub src_ip: String,
+    pub dst_ip: String,
+    pub src_port: i32,
+    pub dst_port: i32,
+    pub protocol: String,
+    pub action: String,
+    /// Expiry time in nanoseconds (CLOCK_MONOTONIC); string to avoid i64 precision loss.
+    pub expires_ns: String,
+    /// Whether this verdict has already expired (pending cleanup).
+    pub expired: bool,
+    pub packets: u64,
+    pub bytes: u64,
 }
 
 // ── Input types ──────────────────────────────────────────────────────────────
@@ -969,6 +988,105 @@ impl QueryRoot {
                 ethertype: e.ethertype,
                 name: e.ethertype_name,
                 packets: e.packets,
+            })
+            .collect())
+    }
+
+    /// Live snapshot of a node's flow verdict cache for one direction.
+    ///
+    /// Unlike the per-node stats queries (which read the periodic Prometheus
+    /// snapshot), the verdict cache is live BPF state, so this issues an
+    /// on-demand `FlowVerdictQuery` to the connected agent and waits for the
+    /// matching reply. Returns an error if the node is offline or does not
+    /// answer within the deadline. `limit` caps the entries returned
+    /// (soonest-expiring first; 0/null = agent default of 1000).
+    #[graphql(guard = "Require::new(\"node:read\")")]
+    async fn node_flow_verdicts(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+        direction: String,
+        limit: Option<i32>,
+    ) -> Result<Vec<NodeFlowVerdictOutput>> {
+        use policy_controller_proto::controller::{
+            controller_message::Payload as CtrlPayload, ControllerMessage, FlowVerdictQuery,
+        };
+
+        validate_direction(&direction)?;
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        let flow_queries = ctx.data::<Arc<FlowQueryRegistry>>()?;
+
+        let (request_id, rx) = flow_queries.register();
+        let limit = limit.unwrap_or(0).max(0) as u32;
+        let sent = sessions
+            .push(
+                &node_id.0,
+                ControllerMessage {
+                    payload: Some(CtrlPayload::FlowVerdictQuery(FlowVerdictQuery {
+                        request_id: request_id.clone(),
+                        direction: direction.to_lowercase(),
+                        limit,
+                    })),
+                },
+            )
+            .await;
+
+        if !sent {
+            flow_queries.cancel(&request_id);
+            return Err(async_graphql::Error::new(format!(
+                "Node '{}' is not currently connected",
+                node_id.0
+            )));
+        }
+
+        // Generous deadline: a busy node may hold tens of thousands of cached
+        // verdicts, and enumerating the BPF map is slower than the config-ack
+        // path this machinery was first sized for. Kept under the agent's 30 s
+        // engine-query timeout so a slow read surfaces here, not as a hang.
+        let snapshot = match tokio::time::timeout(std::time::Duration::from_secs(20), rx).await {
+            Ok(Ok(snap)) => snap,
+            // Sender dropped without replying (stream closed mid-query).
+            Ok(Err(_)) => {
+                return Err(async_graphql::Error::new(
+                    "Node disconnected before answering the flow-verdict query",
+                ));
+            }
+            Err(_) => {
+                flow_queries.cancel(&request_id);
+                return Err(async_graphql::Error::new(format!(
+                    "Timed out waiting for node '{}' to return its flow-verdict cache. \
+                     The node is connected but did not answer — its agent may predate \
+                     this feature (rebuild/restart policy-node-agent) or be overloaded.",
+                    node_id.0
+                )));
+            }
+        };
+
+        if !snapshot.ok {
+            return Err(async_graphql::Error::new(format!(
+                "Node failed to read its flow-verdict cache: {}",
+                snapshot.error
+            )));
+        }
+
+        Ok(snapshot
+            .entries
+            .into_iter()
+            .map(|e| NodeFlowVerdictOutput {
+                src_ip: e.src_ip,
+                dst_ip: e.dst_ip,
+                src_port: e.src_port as i32,
+                dst_port: e.dst_port as i32,
+                protocol: e.protocol,
+                action: e.action,
+                expires_ns: e.expires_ns.to_string(),
+                expired: e.expired,
+                packets: e.packets,
+                bytes: e.bytes,
             })
             .collect())
     }
@@ -2381,6 +2499,7 @@ pub fn build_schema(
     store: Arc<dyn ControllerStore>,
     sessions: Arc<NodeSessionManager>,
     pending: Arc<PendingRegistry>,
+    flow_queries: Arc<FlowQueryRegistry>,
     metrics_store: Arc<MetricsStore>,
     rule_lifecycle_bus: Arc<RuleLifecycleBus>,
     tenant_scope: Arc<TenantScope>,
@@ -2396,6 +2515,7 @@ pub fn build_schema(
         .data(store)
         .data(sessions)
         .data(pending)
+        .data(flow_queries)
         .data(metrics_store)
         .data(rule_lifecycle_bus)
         .data(tenant_scope)
@@ -2514,6 +2634,7 @@ mod tests {
         store: Arc<dyn ControllerStore>,
         sessions: Arc<NodeSessionManager>,
         pending: Arc<PendingRegistry>,
+        flow_queries: Arc<FlowQueryRegistry>,
         metrics_store: Arc<MetricsStore>,
     }
 
@@ -2533,6 +2654,7 @@ mod tests {
         let registry = Arc::new(NodeRegistry::new(Arc::clone(&store), Arc::new(mock_ca)));
         let sessions = Arc::new(NodeSessionManager::new());
         let pending = Arc::new(PendingRegistry::new());
+        let flow_queries = Arc::new(FlowQueryRegistry::new());
         let metrics_store = Arc::new(MetricsStore::new());
         // Tests don't exercise the event-pipeline queries, but build_schema
         // requires the scope; hand it a throw-away in-memory pool.
@@ -2556,6 +2678,7 @@ mod tests {
             Arc::clone(&store),
             Arc::clone(&sessions),
             Arc::clone(&pending),
+            Arc::clone(&flow_queries),
             Arc::clone(&metrics_store),
             Arc::new(crate::rule_lifecycle_bus::RuleLifecycleBus::new()),
             tenant_scope,
@@ -2573,6 +2696,7 @@ mod tests {
             store,
             sessions,
             pending,
+            flow_queries,
             metrics_store,
         }
     }
@@ -2861,6 +2985,79 @@ mod tests {
             }
             other => panic!("expected ClearStats, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_node_flow_verdicts_offline_node_errors() {
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let res = h
+            .schema
+            .execute(r#"{ nodeFlowVerdicts(nodeId: "n1", direction: "ingress") { srcIp action } }"#)
+            .await;
+        assert!(!res.errors.is_empty());
+        assert!(res.errors[0].message.contains("not currently connected"));
+    }
+
+    #[tokio::test]
+    async fn test_node_flow_verdicts_returns_agent_snapshot() {
+        use policy_controller_proto::controller::{
+            controller_message::Payload as P, FlowVerdictEntryProto, FlowVerdictSnapshot,
+        };
+        use tokio::sync::mpsc;
+
+        let h = make_harness().await;
+        insert_default_tenant_node(&h.store, "n1").await;
+        let (tx, mut rx) = mpsc::channel(4);
+        h.sessions
+            .register("n1".to_string(), "default".to_string(), tx);
+
+        // Simulate the agent: read the FlowVerdictQuery, then resolve the waiter
+        // with a snapshot carrying the echoed request_id.
+        let flow_queries = Arc::clone(&h.flow_queries);
+        let agent = tokio::spawn(async move {
+            let msg = rx.recv().await.expect("a message").expect("ok message");
+            let request_id = match msg.payload {
+                Some(P::FlowVerdictQuery(q)) => {
+                    assert_eq!(q.direction, "ingress");
+                    q.request_id
+                }
+                other => panic!("expected FlowVerdictQuery, got {other:?}"),
+            };
+            flow_queries.resolve(FlowVerdictSnapshot {
+                request_id,
+                direction: "ingress".to_string(),
+                ok: true,
+                error: String::new(),
+                entries: vec![FlowVerdictEntryProto {
+                    src_ip: "10.0.0.1".to_string(),
+                    dst_ip: "10.0.0.2".to_string(),
+                    src_port: 1234,
+                    dst_port: 443,
+                    protocol: "tcp".to_string(),
+                    action: "DROP".to_string(),
+                    expires_ns: 42,
+                    expired: false,
+                    packets: 7,
+                    bytes: 512,
+                }],
+            });
+        });
+
+        let res = h
+            .schema
+            .execute(
+                r#"{ nodeFlowVerdicts(nodeId: "n1", direction: "ingress") { srcIp dstIp srcPort action expiresNs packets } }"#,
+            )
+            .await;
+        agent.await.unwrap();
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let data = res.data.into_json().unwrap();
+        let entry = &data["nodeFlowVerdicts"][0];
+        assert_eq!(entry["srcIp"], "10.0.0.1");
+        assert_eq!(entry["action"], "DROP");
+        assert_eq!(entry["expiresNs"], "42");
+        assert_eq!(entry["packets"], 7);
     }
 
     #[tokio::test]

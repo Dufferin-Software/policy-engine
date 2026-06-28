@@ -21,8 +21,9 @@ use super::bpf_manager::BpfManager;
 #[cfg(feature = "suricata")]
 use super::eve_consumer::EveConsumer;
 use super::event_stream;
+use super::flow_verdict_manager::FlowVerdictManager;
 #[cfg(feature = "suricata")]
-use super::flow_verdict_manager::alert_to_flow_verdict_key;
+use super::flow_verdict_manager::{alert_to_flow_verdict_key, monotonic_now_ns};
 use super::graphql::{build_schema, AppState, PeerAddr, PolicyEngineSchema};
 use super::metrics::{self, MetricsFormatter, PrometheusFormatter};
 use super::policy_service::{PolicyService, QueueCmd};
@@ -35,21 +36,6 @@ use super::veth_manager::VethManager;
 use crate::config::{AffinityPlan, ConfigProvider};
 #[cfg(feature = "suricata")]
 use crate::types::{Direction, FlowVerdict, InspectMode, PolicyAction};
-
-/// Return current CLOCK_MONOTONIC time in nanoseconds.
-///
-/// Must match the clock used by `bpf_ktime_get_ns()` so that `expires_ns`
-/// values written by userspace compare correctly against BPF verdict checks.
-#[cfg(feature = "suricata")]
-fn monotonic_now_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: ts is a valid out-pointer; CLOCK_MONOTONIC never fails on Linux.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-}
 
 /// GraphQL endpoint handler
 async fn graphql_handler(
@@ -309,29 +295,24 @@ async fn start_inspect_tasks(state: &Arc<AppState>) -> std::io::Result<()> {
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    spawn_flow_verdict_cleanup_loop(state.clone());
     spawn_ips_enforcement_loop(state.clone());
     Ok(())
 }
 
 /// Background loop: periodically evict expired flow verdicts from the BPF maps.
-#[cfg(feature = "suricata")]
+///
+/// Not gated behind `suricata`: SNI/QUIC matching writes verdicts into the same
+/// cache in every build, so the cache needs an evictor regardless of IPS. Plain
+/// HASH maps don't auto-expire — without this loop, expired entries accumulate
+/// until the map fills (`MAX_FLOW_VERDICTS`).
 fn spawn_flow_verdict_cleanup_loop(state: Arc<AppState>) {
+    let manager = FlowVerdictManager::new();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut interval = tokio::time::interval(manager.cleanup_interval());
         loop {
             interval.tick().await;
             let mut service = state.service.lock().await;
-            for direction in [Direction::Ingress, Direction::Egress] {
-                if let Ok(verdicts) = service.list_flow_verdicts(direction) {
-                    let now_ns = monotonic_now_ns();
-                    for (key, verdict) in verdicts {
-                        if verdict.expires_ns > 0 && now_ns >= verdict.expires_ns {
-                            service.delete_flow_verdict(&key, direction).ok();
-                        }
-                    }
-                }
-            }
+            let _ = manager.cleanup_expired(&mut service);
         }
     });
 }
@@ -643,6 +624,9 @@ pub async fn run_server(config: ServerConfig) -> std::io::Result<()> {
     start_inspect_tasks(&state).await?;
     #[cfg(feature = "ipfix")]
     spawn_ipfix_export_loop(state.clone());
+    // Evict expired flow verdicts in every build — SNI/QUIC matching populates
+    // the cache even without the IPS (suricata) feature.
+    spawn_flow_verdict_cleanup_loop(state.clone());
     spawn_rule_timer_loop(state.clone(), timer_rx);
 
     // BPF event stream broadcaster (ring-buffer polling thread pinned to event_cpus).
@@ -894,22 +878,6 @@ mod resolve_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(feature = "suricata")]
-    #[test]
-    fn monotonic_now_ns_returns_nonzero() {
-        let ns = monotonic_now_ns();
-        assert!(ns > 0, "CLOCK_MONOTONIC should return a nonzero value");
-    }
-
-    #[cfg(feature = "suricata")]
-    #[test]
-    fn monotonic_now_ns_increases_over_time() {
-        let t1 = monotonic_now_ns();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let t2 = monotonic_now_ns();
-        assert!(t2 > t1, "monotonic clock must be non-decreasing");
-    }
 
     #[test]
     fn server_config_default_host() {

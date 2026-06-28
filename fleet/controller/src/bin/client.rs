@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use policy_controller_dev::{
     AuditEntry, ClientConfig, ControllerClient, CreateRuleInput, CreateRuleMultiNodeInput,
-    EnrollmentTokenInfo, IssuedEnrollmentToken, Node, NodeInterface, OperationResult,
-    PendingGeneration, Rule,
+    EnrollmentTokenInfo, IssuedEnrollmentToken, Node, NodeFlowVerdict, NodeInterface,
+    OperationResult, PendingGeneration, Rule,
 };
 use serde::Serialize;
 
@@ -51,6 +51,17 @@ enum Cmd {
     /// Interface management commands.
     #[command(subcommand)]
     Interfaces(InterfacesCmd),
+    /// Read a node's live flow verdict cache.
+    Verdicts {
+        /// Node ID.
+        node_id: String,
+        /// Direction: ingress or egress.
+        #[arg(long, default_value = "ingress")]
+        direction: String,
+        /// Max entries to show (soonest-expiring first).
+        #[arg(long, default_value_t = 1000)]
+        limit: i32,
+    },
     /// In-flight config generation commands.
     #[command(subcommand)]
     Pending(PendingCmd),
@@ -673,6 +684,47 @@ fn handle_interfaces(client: &ControllerClient, cmd: InterfacesCmd, json: bool) 
     Ok(())
 }
 
+fn handle_verdicts(
+    client: &ControllerClient,
+    node_id: &str,
+    direction: &str,
+    limit: i32,
+    json: bool,
+) -> Result<()> {
+    let entries = client.node_flow_verdicts(node_id, direction, Some(limit))?;
+    if json {
+        print_json(&entries);
+    } else {
+        print_table_verdicts(direction, &entries);
+    }
+    Ok(())
+}
+
+fn print_table_verdicts(direction: &str, entries: &[NodeFlowVerdict]) {
+    println!("Flow Verdict Cache ({}):", direction.to_uppercase());
+    if entries.is_empty() {
+        println!("(cache empty)");
+        return;
+    }
+
+    println!(
+        "{:<24} {:<24} {:<6} {:<6} {:<8} {:<12} BYTES",
+        "SOURCE", "DESTINATION", "PROTO", "ACTION", "STATE", "PACKETS"
+    );
+    println!("{}", &"-".repeat(100));
+
+    for e in entries {
+        let src = format!("{}:{}", e.src_ip, e.src_port);
+        let dst = format!("{}:{}", e.dst_ip, e.dst_port);
+        let state = if e.expired { "expired" } else { "active" };
+        println!(
+            "{src:<24} {dst:<24} {:<6} {:<6} {state:<8} {:<12} {}",
+            e.protocol, e.action, e.packets, e.bytes
+        );
+    }
+    println!("({} entries)", entries.len());
+}
+
 fn handle_pending(client: &ControllerClient, cmd: PendingCmd, json: bool) -> Result<()> {
     match cmd {
         PendingCmd::List => {
@@ -1060,6 +1112,11 @@ fn main() -> Result<()> {
         Cmd::Nodes(cmd) => handle_nodes(&client, cmd, json),
         Cmd::Rules(cmd) => handle_rules(&client, cmd, json),
         Cmd::Interfaces(cmd) => handle_interfaces(&client, cmd, json),
+        Cmd::Verdicts {
+            node_id,
+            direction,
+            limit,
+        } => handle_verdicts(&client, &node_id, &direction, limit, json),
         Cmd::Pending(cmd) => handle_pending(&client, cmd, json),
         Cmd::Audit(cmd) => handle_audit(&client, cmd, json),
         Cmd::CaCert => handle_ca_cert(&client, json),

@@ -46,6 +46,7 @@ message AgentMessage {
         StateRestoreRequest     restore_request        = 9;
         ConfigConfirm           config_confirm         = 10;
         RuleLifecycleBatch      rule_lifecycle_events  = 11;
+        FlowVerdictSnapshot     flow_verdict_snapshot  = 12;
     }
 }
 
@@ -201,11 +202,45 @@ message ControllerMessage {
         ClearStats         clear_stats    = 9;
         SetMetricsInterval set_metrics_interval = 10;
         SetUrpf            set_urpf       = 11;
+        FlowVerdictQuery   flow_verdict_query = 12;
     }
 }
 
 // Controller requesting an immediate metrics push from the agent.
 message MetricsQuery {}
+
+// Controller requesting a snapshot of the node's flow verdict cache for one
+// direction. The agent queries the local policy-engine and replies with a
+// FlowVerdictSnapshot carrying the same request_id. Unlike config pushes this
+// is a read-only query — not gated by the pending-generation machinery.
+message FlowVerdictQuery {
+    string request_id = 1;  // Correlation ID echoed back in the snapshot
+    string direction  = 2;  // "ingress" or "egress"
+    uint32 limit      = 3;  // Max entries (0 = agent default)
+}
+
+// Agent → controller reply to a FlowVerdictQuery.
+message FlowVerdictSnapshot {
+    string request_id = 1;  // Echoes the query's request_id
+    string direction  = 2;  // "ingress" or "egress"
+    bool   ok         = 3;  // False if the local query failed
+    string error      = 4;  // Populated when ok == false
+    repeated FlowVerdictEntryProto entries = 5;
+}
+
+// A single cached flow verdict entry.
+message FlowVerdictEntryProto {
+    string src_ip     = 1;
+    string dst_ip     = 2;
+    uint32 src_port   = 3;
+    uint32 dst_port   = 4;
+    string protocol   = 5;  // "tcp"/"udp"/"icmp"/...
+    string action     = 6;  // "PASS"/"DROP"/...
+    uint64 expires_ns = 7;  // CLOCK_MONOTONIC nanoseconds (0 = never)
+    bool   expired    = 8;
+    uint64 packets    = 9;
+    uint64 bytes      = 10;
+}
 
 // Controller → agent acknowledgement of a ConfigConfirm{APPLIED}.
 // When committed == true the controller has durably recorded the change; the

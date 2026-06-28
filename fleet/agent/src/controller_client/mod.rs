@@ -17,8 +17,9 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use policy_controller_proto::controller::{
     agent_message::Payload as AgentPayload, controller_message::Payload as CtrlPayload,
-    AddressReport, AgentHello, AgentMessage, Capabilities, ControllerMessage, Heartbeat,
-    InterfaceReport, LocalChangeReport, PersistedAttachment, PersistedRule, StateSnapshot,
+    AddressReport, AgentHello, AgentMessage, Capabilities, ControllerMessage,
+    FlowVerdictEntryProto, FlowVerdictSnapshot, Heartbeat, InterfaceReport, LocalChangeReport,
+    PersistedAttachment, PersistedRule, StateSnapshot,
 };
 use policy_controller_proto::PROTOCOL_VERSION;
 
@@ -1159,11 +1160,129 @@ async fn handle_controller_message(
                 log::warn!("No local GraphQL URL configured — cannot clear stats");
             }
         }
+        Some(CtrlPayload::FlowVerdictQuery(query)) => {
+            log::info!(
+                "Received FlowVerdictQuery (request_id={}, direction={}, limit={})",
+                query.request_id,
+                query.direction,
+                query.limit,
+            );
+            // Read-only query against the local engine's BPF verdict cache. We
+            // always reply (even on failure) so the controller's waiter resolves
+            // promptly rather than timing out.
+            let started = std::time::Instant::now();
+            let snapshot = match local_graphql_url {
+                Some(url) => fetch_flow_verdicts(url, &query).await,
+                None => FlowVerdictSnapshot {
+                    request_id: query.request_id.clone(),
+                    direction: query.direction.clone(),
+                    ok: false,
+                    error: "No local GraphQL URL configured".to_string(),
+                    entries: Vec::new(),
+                },
+            };
+            log::info!(
+                "FlowVerdictQuery {} answered in {:?} (ok={}, entries={}{})",
+                query.request_id,
+                started.elapsed(),
+                snapshot.ok,
+                snapshot.entries.len(),
+                if snapshot.ok {
+                    String::new()
+                } else {
+                    format!(", error={}", snapshot.error)
+                },
+            );
+            outbound_tx
+                .send(AgentMessage {
+                    payload: Some(AgentPayload::FlowVerdictSnapshot(snapshot)),
+                })
+                .await
+                .context("Failed to send FlowVerdictSnapshot")?;
+        }
         None => {
             log::warn!("Received ControllerMessage with no payload");
         }
     }
     Ok(())
+}
+
+/// Query the local policy-engine's flow verdict cache and build a
+/// [`FlowVerdictSnapshot`] reply for the controller. Never returns an error —
+/// failures are encoded in the snapshot's `ok`/`error` fields so the controller
+/// always gets a correlated response.
+async fn fetch_flow_verdicts(
+    graphql_url: &str,
+    query: &policy_controller_proto::controller::FlowVerdictQuery,
+) -> FlowVerdictSnapshot {
+    use policy_engine_dev::{ClientConfig, GqlDirection, PolicyClient};
+
+    let request_id = query.request_id.clone();
+    let direction = query.direction.clone();
+    let limit = query.limit;
+    let url = graphql_url.to_string();
+
+    let dir: GqlDirection = match direction.to_lowercase().parse() {
+        Ok(d) => d,
+        Err(_) => {
+            return FlowVerdictSnapshot {
+                request_id,
+                ok: false,
+                error: format!("invalid direction '{}'", direction),
+                direction,
+                entries: Vec::new(),
+            };
+        }
+    };
+    // Treat 0 (or no limit) as the engine default by passing None.
+    let limit_opt = if limit == 0 { None } else { Some(limit as i32) };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let client = PolicyClient::with_config(ClientConfig {
+            server_url: url,
+            ..Default::default()
+        });
+        client.flow_verdict_list(dir, limit_opt)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(entries)) => FlowVerdictSnapshot {
+            request_id,
+            direction,
+            ok: true,
+            error: String::new(),
+            entries: entries
+                .into_iter()
+                .map(|e| FlowVerdictEntryProto {
+                    src_ip: e.src_ip,
+                    dst_ip: e.dst_ip,
+                    src_port: e.src_port as u32,
+                    dst_port: e.dst_port as u32,
+                    protocol: e.protocol,
+                    action: e.action,
+                    expires_ns: e.expires_ns.parse().unwrap_or(0),
+                    expired: e.expired,
+                    packets: e.packets as u64,
+                    bytes: e.bytes as u64,
+                })
+                .collect(),
+        },
+        Ok(Err(e)) => FlowVerdictSnapshot {
+            request_id,
+            direction,
+            ok: false,
+            error: format!("local engine query failed: {:#}", e),
+            entries: Vec::new(),
+        },
+        Err(e) => FlowVerdictSnapshot {
+            request_id,
+            direction,
+            ok: false,
+            error: format!("flow-verdict query task panicked: {}", e),
+            entries: Vec::new(),
+        },
+    }
 }
 
 /// Apply a [`ClearStats`] request against the local policy-engine, returning a

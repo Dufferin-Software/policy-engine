@@ -10,7 +10,7 @@ import ThemeToggle from './components/ThemeToggle.tsx'
 import { getUsername, logout } from './lib/auth'
 
 type Tab = 'fleet' | 'enrollment' | 'events' | 'audit'
-type NodeTab = 'overview' | 'policy' | 'events' | 'rule-lifecycle'
+type NodeTab = 'overview' | 'policy' | 'verdict-cache' | 'events' | 'rule-lifecycle'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'fleet', label: 'Fleet' },

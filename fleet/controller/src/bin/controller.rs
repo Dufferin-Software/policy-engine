@@ -136,6 +136,8 @@ async fn main() -> Result<()> {
 
     // ── Pending-generation registry (in-memory) ────────────────────────────────
     let pending = Arc::new(policy_controller::pending::PendingRegistry::new());
+    // Correlates live flow-verdict-cache queries (GraphQL resolver ↔ gRPC stream).
+    let flow_queries = Arc::new(policy_controller::flow_query::FlowQueryRegistry::new());
     {
         let reg = Arc::clone(&pending);
         let store = Arc::clone(&store);
@@ -205,6 +207,7 @@ async fn main() -> Result<()> {
         Arc::clone(&store),
         Arc::clone(&sessions),
         Arc::clone(&pending),
+        Arc::clone(&flow_queries),
         Arc::clone(&metrics_store),
         Arc::clone(&rule_lifecycle_bus),
         Arc::clone(&tenant_scope),
@@ -366,6 +369,7 @@ async fn main() -> Result<()> {
         Arc::clone(&metrics_store),
         Arc::clone(&pending),
         Arc::clone(&rule_lifecycle_bus),
+        Arc::clone(&flow_queries),
         Arc::clone(&registry),
     );
 

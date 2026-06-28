@@ -644,13 +644,20 @@ impl QueryRoot {
         })
     }
 
-    /// List individual flow verdict entries for a direction
+    /// List individual flow verdict entries for a direction.
+    ///
+    /// Entries are returned soonest-expiring first and capped at `limit`
+    /// (default 1000) to bound the response — the cache can hold tens of
+    /// thousands of entries per direction.
     async fn flow_verdict_list<'ctx>(
         &self,
         ctx: &Context<'ctx>,
         direction: GqlDirection,
+        limit: Option<i32>,
     ) -> Result<Vec<FlowVerdictOutput>> {
         use std::net::{Ipv4Addr, Ipv6Addr};
+
+        let limit = limit.unwrap_or(1000).max(0) as usize;
 
         let state = ctx.data::<Arc<AppState>>()?;
         let service = state.service.lock().await;
@@ -669,7 +676,7 @@ impl QueryRoot {
             ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
         };
 
-        let result = verdicts
+        let mut result: Vec<FlowVerdictOutput> = verdicts
             .into_iter()
             .map(|(key, verdict)| {
                 let (src_ip, dst_ip) = if key.af == crate::types::AF_INET {
@@ -708,6 +715,18 @@ impl QueryRoot {
                 }
             })
             .collect();
+
+        // Soonest-expiring first. A zero `expires_ns` means "never expires";
+        // sort those last so live, time-bounded entries surface at the top.
+        result.sort_by_key(|v| {
+            let e: u64 = v.expires_ns.parse().unwrap_or(0);
+            if e == 0 {
+                u64::MAX
+            } else {
+                e
+            }
+        });
+        result.truncate(limit);
 
         Ok(result)
     }
@@ -3169,6 +3188,49 @@ mod tests {
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         let data = resp.data.into_json().unwrap();
         assert_eq!(data["flushRules"]["success"], true);
+    }
+
+    #[tokio::test]
+    async fn flow_verdict_list_sorts_soonest_first_and_applies_limit() {
+        // Three cached verdicts with out-of-order expiry. The resolver must
+        // return them soonest-expiring first and honor `limit`.
+        fn entry(sport: u16, expires_ns: u64) -> (FlowVerdictKey, FlowVerdict) {
+            let mut key = FlowVerdictKey {
+                af: AF_INET,
+                protocol: libc::IPPROTO_TCP as u8,
+                sport,
+                dport: 443,
+                ..Default::default()
+            };
+            key.saddr[..4].copy_from_slice(&[10, 0, 0, 1]);
+            key.daddr[..4].copy_from_slice(&[10, 0, 0, 2]);
+            let verdict = FlowVerdict {
+                action: PolicyAction::Drop as u32,
+                expires_ns,
+                ..Default::default()
+            };
+            (key, verdict)
+        }
+
+        let mut mock = make_mock_bpf();
+        mock.expect_list_flow_verdicts().returning(|_| {
+            Ok(vec![
+                entry(3000, 3_000_000_000),
+                entry(1000, 1_000_000_000),
+                entry(2000, 2_000_000_000),
+            ])
+        });
+        let schema = make_schema(mock);
+        let resp = schema
+            .execute("{ flowVerdictList(direction: INGRESS, limit: 2) { srcPort expiresNs } }")
+            .await;
+        assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+        let data = resp.data.into_json().unwrap();
+        let list = data["flowVerdictList"].as_array().unwrap();
+        assert_eq!(list.len(), 2, "limit should cap to 2: {:?}", list);
+        // Soonest-expiring first: sport 1000 then 2000.
+        assert_eq!(list[0]["srcPort"], 1000);
+        assert_eq!(list[1]["srcPort"], 2000);
     }
 
     #[tokio::test]

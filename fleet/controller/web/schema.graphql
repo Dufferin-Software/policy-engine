@@ -587,6 +587,29 @@ type NodeEthertypeStatOutput {
 	packets: Int!
 }
 
+"""
+A single cached flow verdict entry, read live from a node's BPF verdict cache
+via an on-demand query to the agent (not from the Prometheus snapshot).
+"""
+type NodeFlowVerdictOutput {
+	srcIp: String!
+	dstIp: String!
+	srcPort: Int!
+	dstPort: Int!
+	protocol: String!
+	action: String!
+	"""
+	Expiry time in nanoseconds (CLOCK_MONOTONIC); string to avoid i64 precision loss.
+	"""
+	expiresNs: String!
+	"""
+	Whether this verdict has already expired (pending cleanup).
+	"""
+	expired: Boolean!
+	packets: Int!
+	bytes: Int!
+}
+
 type NodeInterfaceOutput {
 	nodeId: String!
 	name: String!
@@ -827,6 +850,17 @@ type QueryRoot {
 	Returns an empty list when no metrics have been received for the node yet.
 	"""
 	nodeEthertypeStats(nodeId: ID!, interfaceName: String!, direction: String!): [NodeEthertypeStatOutput!]!
+	"""
+	Live snapshot of a node's flow verdict cache for one direction.
+	
+	Unlike the per-node stats queries (which read the periodic Prometheus
+	snapshot), the verdict cache is live BPF state, so this issues an
+	on-demand `FlowVerdictQuery` to the connected agent and waits for the
+	matching reply. Returns an error if the node is offline or does not
+	answer within the deadline. `limit` caps the entries returned
+	(soonest-expiring first; 0/null = agent default of 1000).
+	"""
+	nodeFlowVerdicts(nodeId: ID!, direction: String!, limit: Int): [NodeFlowVerdictOutput!]!
 	"""
 	The authenticated caller's identity, permissions, and scope set.
 	Unguarded by design — every authenticated principal can see itself.

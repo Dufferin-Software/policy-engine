@@ -66,6 +66,23 @@ pub struct NodeInterface {
     pub last_reported: Option<String>,
 }
 
+/// A single cached flow verdict entry read live from a node's BPF verdict cache.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeFlowVerdict {
+    pub src_ip: String,
+    pub dst_ip: String,
+    pub src_port: i32,
+    pub dst_port: i32,
+    pub protocol: String,
+    pub action: String,
+    /// Expiry time in nanoseconds (CLOCK_MONOTONIC); string to avoid precision loss.
+    pub expires_ns: String,
+    pub expired: bool,
+    pub packets: u64,
+    pub bytes: u64,
+}
+
 /// An audit log entry recording an operator action.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

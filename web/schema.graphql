@@ -776,9 +776,13 @@ type QueryRoot {
 	"""
 	flowVerdicts(direction: GqlDirection!): FlowVerdictStatsOutput!
 	"""
-	List individual flow verdict entries for a direction
+	List individual flow verdict entries for a direction.
+
+	Entries are returned soonest-expiring first and capped at `limit`
+	(default 1000) to bound the response — the cache can hold tens of
+	thousands of entries per direction.
 	"""
-	flowVerdictList(direction: GqlDirection!): [FlowVerdictOutput!]!
+	flowVerdictList(direction: GqlDirection!, limit: Int): [FlowVerdictOutput!]!
 	"""
 	Get performance statistics (timing histogram, per-protocol stats, bandwidth)
 	"""

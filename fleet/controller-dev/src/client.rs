@@ -413,6 +413,34 @@ impl ControllerClient {
         Ok(r.node_interfaces)
     }
 
+    /// Read a node's live flow verdict cache for one direction. `limit` caps the
+    /// entries (soonest-expiring first); `None` uses the server default (1000).
+    pub fn node_flow_verdicts(
+        &self,
+        node_id: &str,
+        direction: &str,
+        limit: Option<i32>,
+    ) -> Result<Vec<NodeFlowVerdict>> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "nodeFlowVerdicts")]
+            node_flow_verdicts: Vec<NodeFlowVerdict>,
+        }
+        let q = r#"
+            query NodeFlowVerdicts($nodeId: ID!, $direction: String!, $limit: Int) {
+                nodeFlowVerdicts(nodeId: $nodeId, direction: $direction, limit: $limit) {
+                    srcIp dstIp srcPort dstPort protocol action
+                    expiresNs expired packets bytes
+                }
+            }
+        "#;
+        let r: Response = self.execute(
+            q,
+            Some(json!({ "nodeId": node_id, "direction": direction, "limit": limit })),
+        )?;
+        Ok(r.node_flow_verdicts)
+    }
+
     /// List all interfaces across all nodes.
     pub fn all_node_interfaces(&self) -> Result<Vec<NodeInterface>> {
         #[derive(Deserialize)]

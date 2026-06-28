@@ -1,23 +1,46 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
 
-//! Flow verdict cache manager
+//! Flow verdict cache eviction.
 //!
-//! Manages the lifecycle of flow verdict entries in the BPF map,
-//! including applying verdicts from Suricata alerts and cleaning up expired entries.
+//! The flow verdict cache (`flow_verdict_cache` / `tc_flow_verdict_cache`) is a
+//! plain BPF HASH map: it does not auto-expire entries. The dataplane treats an
+//! expired hit as a miss and re-evaluates, but the stale entry lingers until
+//! userspace deletes it. [`FlowVerdictManager`] is that evictor — a single
+//! periodic sweep that removes expired entries in every build, because SNI/QUIC
+//! matching populates the cache even without the IPS (`suricata`) feature.
 
 use anyhow::Result;
-use log::{debug, info};
-use std::net::{IpAddr, Ipv4Addr};
-use std::sync::{Arc, Mutex};
+use log::info;
 use std::time::Duration;
 
-use crate::traits::BpfOperations;
 use crate::types::*;
 
-use super::eve_consumer::SuricataAlert;
+use super::policy_service::PolicyService;
 
-/// Convert a Suricata alert to a flow verdict key (usable without FlowVerdictManager instance)
+#[cfg(feature = "suricata")]
+use super::eve_consumer::SuricataAlert;
+#[cfg(feature = "suricata")]
+use std::net::{IpAddr, Ipv4Addr};
+
+/// Current `CLOCK_MONOTONIC` time in nanoseconds.
+///
+/// Must match the clock `bpf_ktime_get_ns()` uses, so that `expires_ns` values
+/// written from BPF compare correctly here. Using wall-clock time
+/// (`SystemTime`) would be a bug: the two clocks have unrelated epochs.
+pub fn monotonic_now_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: ts is a valid out-pointer; CLOCK_MONOTONIC never fails on Linux.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Convert a Suricata alert to a flow verdict key. Suricata-only: the IPS
+/// enforcement loop uses it to install DROP verdicts from EVE alerts.
+#[cfg(feature = "suricata")]
 #[allow(clippy::field_reassign_with_default)]
 pub fn alert_to_flow_verdict_key(alert: &SuricataAlert) -> Result<FlowVerdictKey> {
     let src_ip: IpAddr = alert
@@ -60,100 +83,63 @@ pub fn alert_to_flow_verdict_key(alert: &SuricataAlert) -> Result<FlowVerdictKey
     Ok(key)
 }
 
-/// Manages the flow verdict cache
+/// Periodic evictor for expired flow verdict cache entries.
+///
+/// Holds only the sweep cadence; it operates on the shared [`PolicyService`]
+/// passed to [`cleanup_expired`](Self::cleanup_expired), so it shares the same
+/// BPF handles the rest of the engine uses rather than owning a second one.
 pub struct FlowVerdictManager {
-    bpf_ops: Arc<Mutex<Box<dyn BpfOperations>>>,
-    verdict_ttl: Duration,
     cleanup_interval: Duration,
 }
 
+impl Default for FlowVerdictManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FlowVerdictManager {
-    /// Create a new flow verdict manager
-    pub fn new(bpf_ops: Arc<Mutex<Box<dyn BpfOperations>>>) -> Self {
+    /// Create a manager with the default 30 s sweep interval.
+    pub fn new() -> Self {
         Self {
-            bpf_ops,
-            verdict_ttl: Duration::from_secs(300),
             cleanup_interval: Duration::from_secs(30),
         }
     }
 
-    /// Set the verdict TTL
-    pub fn with_ttl(mut self, ttl: Duration) -> Self {
-        self.verdict_ttl = ttl;
+    /// Override the sweep interval.
+    pub fn with_cleanup_interval(mut self, interval: Duration) -> Self {
+        self.cleanup_interval = interval;
         self
     }
 
-    /// Apply a DROP verdict for a flow (from Suricata alert)
-    pub fn apply_drop_verdict(&self, alert: &SuricataAlert) -> Result<()> {
-        let key = self.alert_to_verdict_key(alert)?;
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-
-        let verdict = FlowVerdict {
-            action: PolicyAction::Drop as u32,
-            _pad: 0,
-            timestamp_ns: now_ns,
-            expires_ns: now_ns + self.verdict_ttl.as_nanos() as u64,
-            packets: 0,
-            bytes: 0,
-        };
-
-        let mut bpf = self.bpf_ops.lock().unwrap();
-        // Apply to ingress by default (most common for IPS)
-        bpf.update_flow_verdict(&key, &verdict, Direction::Ingress)?;
-
-        debug!(
-            "Applied DROP verdict for flow {}:{} -> {}:{}",
-            alert.src_ip, alert.src_port, alert.dest_ip, alert.dest_port
-        );
-        Ok(())
+    /// How often the background sweep should run.
+    pub fn cleanup_interval(&self) -> Duration {
+        self.cleanup_interval
     }
 
-    /// Clean up expired verdicts
-    pub fn cleanup_expired(&self) -> Result<u64> {
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
-
+    /// Evict every expired verdict from both directions, returning how many were
+    /// removed. An `expires_ns` of 0 means "never expires" and is left in place.
+    pub fn cleanup_expired(&self, service: &mut PolicyService) -> Result<u64> {
+        let now_ns = monotonic_now_ns();
         let mut removed = 0u64;
 
         for direction in [Direction::Ingress, Direction::Egress] {
-            let verdicts = {
-                let bpf = self.bpf_ops.lock().unwrap();
-                match bpf.list_flow_verdicts(direction) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                }
+            let verdicts = match service.list_flow_verdicts(direction) {
+                Ok(v) => v,
+                Err(_) => continue,
             };
-
-            let mut bpf = self.bpf_ops.lock().unwrap();
             for (key, verdict) in verdicts {
-                let expires = verdict.expires_ns;
-                if expires > 0 && now_ns >= expires {
-                    bpf.delete_flow_verdict(&key, direction).ok();
+                if verdict.expires_ns > 0 && now_ns >= verdict.expires_ns {
+                    service.delete_flow_verdict(&key, direction).ok();
                     removed += 1;
                 }
             }
         }
 
         if removed > 0 {
-            info!("Cleaned up {} expired flow verdicts", removed);
+            info!("Evicted {} expired flow verdicts", removed);
         }
-
         Ok(removed)
-    }
-
-    /// Get the cleanup interval
-    pub fn cleanup_interval(&self) -> Duration {
-        self.cleanup_interval
-    }
-
-    /// Convert a Suricata alert to a flow verdict key
-    fn alert_to_verdict_key(&self, alert: &SuricataAlert) -> Result<FlowVerdictKey> {
-        alert_to_flow_verdict_key(alert)
     }
 }
 
@@ -162,6 +148,7 @@ mod tests {
     use super::*;
     use crate::traits::MockBpfOperations;
 
+    #[cfg(feature = "suricata")]
     fn make_alert(
         src_ip: &str,
         dest_ip: &str,
@@ -181,18 +168,17 @@ mod tests {
         }
     }
 
-    fn make_mgr(mock: MockBpfOperations) -> FlowVerdictManager {
-        let bpf_ops: Arc<Mutex<Box<dyn BpfOperations>>> = Arc::new(Mutex::new(Box::new(mock)));
-        FlowVerdictManager::new(bpf_ops)
+    fn make_service(mock: MockBpfOperations) -> PolicyService {
+        PolicyService::new(Box::new(mock))
     }
 
     // ── alert_to_flow_verdict_key ─────────────────────────────────────────
 
+    #[cfg(feature = "suricata")]
     #[test]
     fn key_ipv4_tcp() {
         let alert = make_alert("10.0.0.1", "192.168.1.1", 12345, 80, "TCP");
         let key = alert_to_flow_verdict_key(&alert).unwrap();
-        // Copy packed fields to locals before asserting
         let sport = key.sport;
         let dport = key.dport;
         let af = key.af;
@@ -207,6 +193,7 @@ mod tests {
         assert_eq!(&daddr[..4], &[192, 168, 1, 1]);
     }
 
+    #[cfg(feature = "suricata")]
     #[test]
     fn key_ipv4_udp() {
         let alert = make_alert("10.0.0.1", "8.8.8.8", 1234, 53, "UDP");
@@ -217,6 +204,7 @@ mod tests {
         assert_eq!(af, AF_INET);
     }
 
+    #[cfg(feature = "suricata")]
     #[test]
     fn key_ipv4_icmp() {
         let alert = make_alert("10.0.0.1", "10.0.0.2", 0, 0, "ICMP");
@@ -225,6 +213,7 @@ mod tests {
         assert_eq!(proto, libc::IPPROTO_ICMP as u8);
     }
 
+    #[cfg(feature = "suricata")]
     #[test]
     fn key_unknown_proto_is_zero() {
         let alert = make_alert("10.0.0.1", "10.0.0.2", 0, 0, "IGMP");
@@ -233,6 +222,7 @@ mod tests {
         assert_eq!(proto, 0);
     }
 
+    #[cfg(feature = "suricata")]
     #[test]
     fn key_proto_case_insensitive() {
         let alert = make_alert("10.0.0.1", "10.0.0.2", 0, 0, "tcp");
@@ -241,6 +231,7 @@ mod tests {
         assert_eq!(proto, libc::IPPROTO_TCP as u8);
     }
 
+    #[cfg(feature = "suricata")]
     #[test]
     fn key_ipv6() {
         let alert = make_alert("2001:db8::1", "2001:db8::2", 12345, 443, "TCP");
@@ -249,6 +240,7 @@ mod tests {
         assert_eq!(af, AF_INET6);
     }
 
+    #[cfg(feature = "suricata")]
     #[test]
     fn key_invalid_src_ip_falls_back_to_unspecified() {
         let alert = make_alert("not-an-ip", "192.168.1.1", 0, 0, "TCP");
@@ -259,6 +251,7 @@ mod tests {
         assert_eq!(&saddr[..4], &[0, 0, 0, 0]);
     }
 
+    #[cfg(feature = "suricata")]
     #[test]
     fn key_invalid_dst_ip_falls_back_to_unspecified() {
         let alert = make_alert("10.0.0.1", "bad-ip", 0, 0, "TCP");
@@ -267,6 +260,7 @@ mod tests {
         assert_eq!(daddr[..4], [0, 0, 0, 0]);
     }
 
+    #[cfg(feature = "suricata")]
     #[test]
     fn key_mixed_af_defaults_to_v4() {
         let alert = make_alert("10.0.0.1", "2001:db8::1", 0, 0, "TCP");
@@ -275,83 +269,49 @@ mod tests {
         assert_eq!(af, AF_INET);
     }
 
+    // ── monotonic clock ──────────────────────────────────────────────────
+
+    #[test]
+    fn monotonic_now_ns_returns_nonzero() {
+        assert!(
+            monotonic_now_ns() > 0,
+            "CLOCK_MONOTONIC should return a nonzero value"
+        );
+    }
+
+    #[test]
+    fn monotonic_now_ns_increases_over_time() {
+        let t1 = monotonic_now_ns();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let t2 = monotonic_now_ns();
+        assert!(t2 > t1, "monotonic clock must be non-decreasing");
+    }
+
     // ── FlowVerdictManager construction ──────────────────────────────────
 
     #[test]
-    fn new_sets_defaults() {
-        let mgr = make_mgr(MockBpfOperations::new());
-        assert_eq!(mgr.verdict_ttl, Duration::from_secs(300));
-        assert_eq!(mgr.cleanup_interval, Duration::from_secs(30));
-    }
-
-    #[test]
-    fn with_ttl_overrides_ttl() {
-        let mgr = make_mgr(MockBpfOperations::new()).with_ttl(Duration::from_secs(60));
-        assert_eq!(mgr.verdict_ttl, Duration::from_secs(60));
-    }
-
-    #[test]
-    fn cleanup_interval_accessor() {
-        let mgr = make_mgr(MockBpfOperations::new());
+    fn new_sets_default_interval() {
+        let mgr = FlowVerdictManager::new();
         assert_eq!(mgr.cleanup_interval(), Duration::from_secs(30));
     }
 
-    // ── apply_drop_verdict ────────────────────────────────────────────────
-
     #[test]
-    fn apply_drop_verdict_success() {
-        let mut mock = MockBpfOperations::new();
-        mock.expect_update_flow_verdict()
-            .times(1)
-            .returning(|_, _, _| Ok(()));
-        let mgr = make_mgr(mock);
-
-        let alert = make_alert("10.0.0.1", "192.168.1.1", 1234, 80, "TCP");
-        assert!(mgr.apply_drop_verdict(&alert).is_ok());
-    }
-
-    #[test]
-    fn apply_drop_verdict_bpf_error_propagates() {
-        let mut mock = MockBpfOperations::new();
-        mock.expect_update_flow_verdict()
-            .times(1)
-            .returning(|_, _, _| Err(anyhow::anyhow!("BPF write error")));
-        let mgr = make_mgr(mock);
-
-        let alert = make_alert("10.0.0.1", "192.168.1.1", 1234, 80, "TCP");
-        assert!(mgr.apply_drop_verdict(&alert).is_err());
-    }
-
-    #[test]
-    fn apply_drop_verdict_uses_ingress_direction() {
-        let mut mock = MockBpfOperations::new();
-        mock.expect_update_flow_verdict()
-            .withf(|_, _, dir| *dir == Direction::Ingress)
-            .times(1)
-            .returning(|_, _, _| Ok(()));
-        let mgr = make_mgr(mock);
-
-        let alert = make_alert("10.0.0.1", "10.0.0.2", 0, 0, "TCP");
-        assert!(mgr.apply_drop_verdict(&alert).is_ok());
+    fn with_cleanup_interval_overrides() {
+        let mgr = FlowVerdictManager::new().with_cleanup_interval(Duration::from_secs(5));
+        assert_eq!(mgr.cleanup_interval(), Duration::from_secs(5));
     }
 
     // ── cleanup_expired ───────────────────────────────────────────────────
 
     #[test]
-    fn cleanup_expired_removes_expired_entries() {
+    fn cleanup_removes_expired_entries_both_directions() {
         let mut mock = MockBpfOperations::new();
-
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-
         let key = FlowVerdictKey::default();
+        // expires_ns well in the past relative to CLOCK_MONOTONIC now.
         let verdict = FlowVerdict {
-            expires_ns: now_ns - 1_000_000_000, // 1 second ago — expired
+            expires_ns: 1,
             ..Default::default()
         };
-
         mock.expect_list_flow_verdicts()
             .times(2)
             .returning(move |_| Ok(vec![(key, verdict)]));
@@ -359,74 +319,68 @@ mod tests {
             .times(2)
             .returning(|_, _| Ok(()));
 
-        let mgr = make_mgr(mock);
-        let removed = mgr.cleanup_expired().unwrap();
-        assert_eq!(removed, 2); // one per direction
+        let mut service = make_service(mock);
+        let mgr = FlowVerdictManager::new();
+        assert_eq!(mgr.cleanup_expired(&mut service).unwrap(), 2);
     }
 
     #[test]
-    fn cleanup_expired_keeps_fresh_entries() {
+    fn cleanup_keeps_fresh_entries() {
         let mut mock = MockBpfOperations::new();
-
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-
         let key = FlowVerdictKey::default();
+        // Far enough in the future that CLOCK_MONOTONIC now is below it.
         let verdict = FlowVerdict {
-            expires_ns: now_ns + 60_000_000_000, // 1 minute in future
+            expires_ns: monotonic_now_ns() + 3_600_000_000_000,
             ..Default::default()
         };
-
         mock.expect_list_flow_verdicts()
             .times(2)
             .returning(move |_| Ok(vec![(key, verdict)]));
-        // delete should NOT be called
+        // delete must NOT be called.
 
-        let mgr = make_mgr(mock);
-        let removed = mgr.cleanup_expired().unwrap();
-        assert_eq!(removed, 0);
+        let mut service = make_service(mock);
+        let mgr = FlowVerdictManager::new();
+        assert_eq!(mgr.cleanup_expired(&mut service).unwrap(), 0);
     }
 
     #[test]
-    fn cleanup_expired_zero_expires_never_removed() {
+    fn cleanup_never_removes_zero_expiry() {
         let mut mock = MockBpfOperations::new();
         let key = FlowVerdictKey::default();
         let verdict = FlowVerdict {
-            expires_ns: 0, // zero means never expire
+            expires_ns: 0, // never expires
             ..Default::default()
         };
         mock.expect_list_flow_verdicts()
             .times(2)
             .returning(move |_| Ok(vec![(key, verdict)]));
 
-        let mgr = make_mgr(mock);
-        let removed = mgr.cleanup_expired().unwrap();
-        assert_eq!(removed, 0);
+        let mut service = make_service(mock);
+        let mgr = FlowVerdictManager::new();
+        assert_eq!(mgr.cleanup_expired(&mut service).unwrap(), 0);
     }
 
     #[test]
-    fn cleanup_expired_list_error_skips_direction() {
+    fn cleanup_skips_direction_on_list_error() {
         let mut mock = MockBpfOperations::new();
         mock.expect_list_flow_verdicts()
             .times(2)
             .returning(|_| Err(anyhow::anyhow!("map error")));
 
-        let mgr = make_mgr(mock);
-        let result = mgr.cleanup_expired();
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 0);
+        let mut service = make_service(mock);
+        let mgr = FlowVerdictManager::new();
+        assert_eq!(mgr.cleanup_expired(&mut service).unwrap(), 0);
     }
 
     #[test]
-    fn cleanup_expired_empty_lists_return_zero() {
+    fn cleanup_empty_lists_return_zero() {
         let mut mock = MockBpfOperations::new();
         mock.expect_list_flow_verdicts()
             .times(2)
             .returning(|_| Ok(vec![]));
 
-        let mgr = make_mgr(mock);
-        assert_eq!(mgr.cleanup_expired().unwrap(), 0);
+        let mut service = make_service(mock);
+        let mgr = FlowVerdictManager::new();
+        assert_eq!(mgr.cleanup_expired(&mut service).unwrap(), 0);
     }
 }

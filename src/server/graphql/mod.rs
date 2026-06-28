@@ -6,5 +6,8 @@
 mod schema;
 mod types;
 
+#[cfg(test)]
+mod tests;
+
 pub use schema::*;
 pub use types::*;

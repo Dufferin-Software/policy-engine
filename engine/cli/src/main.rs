@@ -116,11 +116,18 @@ enum InspectCommand {
     },
     /// Disable inspect mode
     Disable,
-    /// Show flow verdicts
+    /// Show flow verdicts. By default prints the active-verdict count; pass
+    /// `--list` to dump the individual cached entries.
     Verdicts {
         /// Direction
         #[arg(long, default_value = "ingress")]
         direction: String,
+        /// List individual cached entries instead of just the count
+        #[arg(long)]
+        list: bool,
+        /// Max entries to show with --list (soonest-expiring first)
+        #[arg(long, default_value_t = 1000)]
+        limit: i32,
     },
     /// Clear flow verdicts
     ClearVerdicts {
@@ -1065,18 +1072,38 @@ fn handle_inspect(client: &PolicyClient, cmd: InspectCommand, json_output: bool)
             handle_operation(|| client.disable_inspect(), json_output)?;
         }
 
-        InspectCommand::Verdicts { direction } => {
+        InspectCommand::Verdicts {
+            direction,
+            list,
+            limit,
+        } => {
             let dir = parse_direction(&direction)?;
-            let verdicts = match try_operation_json(|| client.flow_verdicts(dir), json_output)? {
-                Some(v) => v,
-                None => return Ok(()),
-            };
-            if json_output {
-                print_json(&verdicts)?;
+            if list {
+                let entries = match try_operation_json(
+                    || client.flow_verdict_list(dir, Some(limit)),
+                    json_output,
+                )? {
+                    Some(v) => v,
+                    None => return Ok(()),
+                };
+                if json_output {
+                    print_json(&entries)?;
+                } else {
+                    print_flow_verdicts(&direction, &entries);
+                }
             } else {
-                println!("Flow Verdicts ({}):", direction.to_uppercase());
-                println!("{}", "─".repeat(40));
-                println!("  Active Verdicts: {}", verdicts.active_verdicts);
+                let verdicts = match try_operation_json(|| client.flow_verdicts(dir), json_output)?
+                {
+                    Some(v) => v,
+                    None => return Ok(()),
+                };
+                if json_output {
+                    print_json(&verdicts)?;
+                } else {
+                    println!("Flow Verdicts ({}):", direction.to_uppercase());
+                    println!("{}", "─".repeat(40));
+                    println!("  Active Verdicts: {}", verdicts.active_verdicts);
+                }
             }
         }
 
@@ -1805,6 +1832,45 @@ fn print_rules_table(rules: &[LpmRuleOutput]) {
     }
 
     table.printstd();
+}
+
+fn print_flow_verdicts(direction: &str, entries: &[FlowVerdictEntry]) {
+    println!("Flow Verdict Cache ({}):", direction.to_uppercase());
+    if entries.is_empty() {
+        println!("  (cache empty)");
+        return;
+    }
+
+    let mut table = Table::new();
+    table.set_format(*format::consts::FORMAT_BOX_CHARS);
+    table.add_row(row![
+        "Source",
+        "Destination",
+        "Proto",
+        "Action",
+        "State",
+        "Packets",
+        "Bytes"
+    ]);
+
+    for e in entries {
+        table.add_row(row![
+            format!("{}:{}", e.src_ip, e.src_port),
+            format!("{}:{}", e.dst_ip, e.dst_port),
+            e.protocol,
+            e.action,
+            if e.expired { "expired" } else { "active" },
+            format_packets(e.packets as u64),
+            format_bytes(e.bytes as u64),
+        ]);
+    }
+
+    table.printstd();
+    println!(
+        "  {} entr{}",
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" }
+    );
 }
 
 #[cfg(test)]

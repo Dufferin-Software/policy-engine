@@ -212,7 +212,34 @@ Suricata) run at most once per flow. TTLs:
 | Suricata INSPECT initial PASS verdict | 30 s | `INSPECT_PASS_VERDICT_TTL_NS` |
 | Suricata flow entry in `flows_to_inspect` | 5 min | `INSPECT_CLONE_TTL_NS` |
 
-The cleanup task in `http.rs` evicts expired entries.
+BPF HASH maps don't auto-expire, so the dataplane treats an expired hit as a
+miss and re-evaluates, but the stale entry persists until userspace deletes it.
+`FlowVerdictManager` (`flow_verdict_manager.rs`) is the evictor: a background
+sweep started in `http.rs` removes expired entries from both directions every
+30 s, using `CLOCK_MONOTONIC` to match the `bpf_ktime_get_ns()` `expires_ns`.
+It runs in **every build** — SNI/QUIC matching populates the cache even without
+the IPS (`suricata`) feature, so the cache always needs an evictor.
+
+#### Inspecting the cache
+
+The cache contents are visible end-to-end:
+
+```bash
+# Single host — count, then the individual entries (soonest-expiring first)
+policy-client inspect verdicts --direction ingress
+policy-client inspect verdicts --direction ingress --list --limit 1000
+
+# Fleet — read a node's live cache through the controller
+policy-controller-client verdicts <node-id> --direction ingress --limit 1000
+```
+
+The GraphQL surface is `flowVerdictList(direction, limit)` on the engine and
+`nodeFlowVerdicts(nodeId, direction, limit)` on the controller. Because the
+cache is live BPF state (not part of the periodic Prometheus snapshot), the
+controller query issues an on-demand `FlowVerdictQuery` to the node's agent and
+waits for the reply — so it errors if the node is offline. Both the policy-engine
+web UI (Inspect panel) and the policy-controller web UI (per-node **Verdict
+Cache** tab) render the same data. Results are capped at `limit` (default 1000).
 
 ### Per-rule stats
 

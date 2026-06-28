@@ -20,6 +20,7 @@ use policy_controller_proto::{
 
 use crate::{
     event_bus::{EventBus, TaggedEventBatch},
+    flow_query::FlowQueryRegistry,
     metrics_store::MetricsStore,
     node_registry::NodeRegistry,
     pending::{ConfirmOutcome, PendingRegistry},
@@ -62,6 +63,9 @@ pub struct NodeManagementServiceImpl {
     metrics_store: Arc<MetricsStore>,
     pending: Arc<PendingRegistry>,
     rule_lifecycle_bus: Arc<RuleLifecycleBus>,
+    /// Correlates live flow-verdict-cache queries with the agent replies that
+    /// arrive on this stream. Shared with the GraphQL resolver that issues them.
+    flow_queries: Arc<FlowQueryRegistry>,
     /// Used by `renew_client_cert` to drive CSR-signing + old-serial
     /// revocation in a single registry-level operation that also publishes
     /// to the in-memory revocation watch.
@@ -77,6 +81,7 @@ impl NodeManagementServiceImpl {
         metrics_store: Arc<MetricsStore>,
         pending: Arc<PendingRegistry>,
         rule_lifecycle_bus: Arc<RuleLifecycleBus>,
+        flow_queries: Arc<FlowQueryRegistry>,
         registry: Arc<NodeRegistry>,
     ) -> Self {
         Self {
@@ -86,6 +91,7 @@ impl NodeManagementServiceImpl {
             metrics_store,
             pending,
             rule_lifecycle_bus,
+            flow_queries,
             registry,
         }
     }
@@ -105,6 +111,7 @@ impl NodeManagementService for NodeManagementServiceImpl {
         let event_bus = Arc::clone(&self.event_bus);
         let metrics_store = Arc::clone(&self.metrics_store);
         let pending = Arc::clone(&self.pending);
+        let flow_queries = Arc::clone(&self.flow_queries);
 
         // Wrap the tonic Streaming in a boxed stream so the handler is testable
         // without a real gRPC connection.
@@ -118,6 +125,7 @@ impl NodeManagementService for NodeManagementServiceImpl {
             metrics_store,
             pending,
             Arc::clone(&self.rule_lifecycle_bus),
+            flow_queries,
         ));
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -271,6 +279,7 @@ async fn handle_agent_stream(
     metrics_store: Arc<MetricsStore>,
     pending: Arc<PendingRegistry>,
     rule_lifecycle_bus: Arc<RuleLifecycleBus>,
+    flow_queries: Arc<FlowQueryRegistry>,
 ) {
     // Buffered outbound + dedicated writer task. The inbound reader and session
     // pushes enqueue onto `out_tx` (never blocking); the writer drains onto the
@@ -295,6 +304,7 @@ async fn handle_agent_stream(
         &metrics_store,
         &pending,
         &rule_lifecycle_bus,
+        &flow_queries,
     )
     .await
     {
@@ -329,6 +339,7 @@ async fn drive_stream(
     metrics_store: &Arc<MetricsStore>,
     pending: &Arc<PendingRegistry>,
     rule_lifecycle_bus: &Arc<RuleLifecycleBus>,
+    flow_queries: &Arc<FlowQueryRegistry>,
 ) -> anyhow::Result<String> {
     // ── Step 1: receive and validate AgentHello ───────────────────────────────
     let hello = match inbound.next().await {
@@ -832,6 +843,16 @@ async fn drive_stream(
             Some(AgentPayload::ConfigConfirm(confirm)) => {
                 handle_config_confirm(&node_id, confirm, pending, store, tx).await?;
             }
+            Some(AgentPayload::FlowVerdictSnapshot(snapshot)) => {
+                log::debug!(
+                    "FlowVerdictSnapshot from {} (request_id={}, ok={}, entries={})",
+                    node_id,
+                    snapshot.request_id,
+                    snapshot.ok,
+                    snapshot.entries.len(),
+                );
+                flow_queries.resolve(snapshot);
+            }
             Some(AgentPayload::Hello(_)) => {
                 log::warn!("Unexpected second AgentHello from {}", node_id);
             }
@@ -1189,6 +1210,10 @@ mod tests {
         Arc::new(RuleLifecycleBus::new())
     }
 
+    fn make_flow_queries() -> Arc<FlowQueryRegistry> {
+        Arc::new(FlowQueryRegistry::new())
+    }
+
     async fn insert_active_node(store: &InMemoryControllerStore, node_id: &str) {
         store
             .upsert_node(&NodeRecord {
@@ -1262,6 +1287,7 @@ mod tests {
             &make_metrics(),
             &make_pending(),
             &make_lifecycle_bus(),
+            &make_flow_queries(),
         )
         .await
         .unwrap();
@@ -1285,6 +1311,7 @@ mod tests {
             &make_metrics(),
             &make_pending(),
             &make_lifecycle_bus(),
+            &make_flow_queries(),
         )
         .await;
 
@@ -1308,6 +1335,7 @@ mod tests {
             &make_metrics(),
             &make_pending(),
             &make_lifecycle_bus(),
+            &make_flow_queries(),
         )
         .await;
 
@@ -1354,6 +1382,7 @@ mod tests {
             &make_metrics(),
             &make_pending(),
             &make_lifecycle_bus(),
+            &make_flow_queries(),
         )
         .await
         .unwrap();
@@ -1389,6 +1418,7 @@ mod tests {
             &make_metrics(),
             &make_pending(),
             &make_lifecycle_bus(),
+            &make_flow_queries(),
         )
         .await
         .unwrap();
@@ -1423,6 +1453,7 @@ mod tests {
             &metrics,
             &make_pending(),
             &make_lifecycle_bus(),
+            &make_flow_queries(),
         )
         .await
         .unwrap();
@@ -1459,6 +1490,7 @@ mod tests {
             &make_metrics(),
             &make_pending(),
             &make_lifecycle_bus(),
+            &make_flow_queries(),
         )
         .await
         .unwrap();
@@ -1501,6 +1533,7 @@ mod tests {
             &make_metrics(),
             &make_pending(),
             &make_lifecycle_bus(),
+            &make_flow_queries(),
         )
         .await
         .unwrap();
@@ -1559,6 +1592,7 @@ mod tests {
             &make_metrics(),
             &make_pending(),
             &make_lifecycle_bus(),
+            &make_flow_queries(),
         )
         .await;
 
@@ -1589,6 +1623,7 @@ mod tests {
             &make_metrics(),
             &make_pending(),
             &make_lifecycle_bus(),
+            &make_flow_queries(),
         )
         .await;
         assert!(result.is_ok());

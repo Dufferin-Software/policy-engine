@@ -11,6 +11,7 @@ import InterfaceStatsDetail from './InterfaceStatsDetail.tsx'
 import RuleList from './RuleList.tsx'
 import RuleCreator from './RuleCreator.tsx'
 import RuleLifecycleStream from './RuleLifecycleStream.tsx'
+import NodeVerdictCache from './NodeVerdictCache.tsx'
 import { wsUrl } from '../lib/auth'
 
 const GET_NODE_DETAIL = gql`
@@ -88,7 +89,7 @@ const DETACH_PROGRAM = gql`
   }
 `
 
-export type NodeTab = 'overview' | 'policy' | 'events' | 'rule-lifecycle'
+export type NodeTab = 'overview' | 'policy' | 'verdict-cache' | 'events' | 'rule-lifecycle'
 
 interface Props {
   nodeId: string
@@ -435,6 +436,7 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
   const tabs: { id: NodeTab; label: string; badge?: number }[] = [
     { id: 'overview', label: 'Overview' },
     { id: 'policy', label: 'Policy', badge: rules.length },
+    { id: 'verdict-cache', label: 'Verdict Cache' },
     { id: 'events', label: 'Events', badge: events.length > 0 ? events.length : undefined },
     { id: 'rule-lifecycle', label: 'Rule Lifecycle', badge: lifecycleEventCount > 0 ? lifecycleEventCount : undefined },
   ]
@@ -751,6 +753,9 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
         <div className={tab === 'rule-lifecycle' ? '' : 'hidden'}>
           <RuleLifecycleStream nodeId={nodeId} onCountChange={setLifecycleEventCount} />
         </div>
+
+        {/* ── Verdict Cache tab ───────────────────────────────────────── */}
+        {tab === 'verdict-cache' && <NodeVerdictCache nodeId={nodeId} />}
 
         {/* ── Events tab ──────────────────────────────────────────────── */}
         {tab === 'events' && (

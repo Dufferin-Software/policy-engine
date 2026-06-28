@@ -19,7 +19,6 @@ pub mod cpu_affinity;
 #[cfg(feature = "suricata")]
 pub mod eve_consumer;
 pub mod event_stream;
-#[cfg(feature = "suricata")]
 pub mod flow_verdict_manager;
 pub mod graphql;
 mod http;
@@ -42,7 +41,6 @@ pub mod veth_manager;
 pub use bpf_manager::BpfManager;
 #[cfg(feature = "suricata")]
 pub use eve_consumer::{AlertInfo, EveConsumer, SuricataAlert};
-#[cfg(feature = "suricata")]
 pub use flow_verdict_manager::FlowVerdictManager;
 pub use http::{resolve_server_config, run_server, CliOverrides, ServerConfig};
 pub use policy_service::{

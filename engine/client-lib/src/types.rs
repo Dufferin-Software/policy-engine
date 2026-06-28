@@ -421,6 +421,24 @@ pub struct FlowVerdictStatsOutput {
     pub active_verdicts: i64,
 }
 
+/// A single cached flow verdict entry, as returned by `flowVerdictList`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowVerdictEntry {
+    pub src_ip: String,
+    pub dst_ip: String,
+    pub src_port: i32,
+    pub dst_port: i32,
+    pub protocol: String,
+    pub action: String,
+    /// Expiry time as nanoseconds (CLOCK_MONOTONIC); string to avoid i64 precision loss.
+    pub expires_ns: String,
+    /// Whether this verdict has already expired (pending cleanup).
+    pub expired: bool,
+    pub packets: i64,
+    pub bytes: i64,
+}
+
 /// Server compile-time feature flags.
 /// Always available — use this to discover what the server supports before
 /// calling IPS/IDS-specific queries or mutations.

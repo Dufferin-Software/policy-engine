@@ -1259,6 +1259,47 @@ impl PolicyClient {
         Ok(response.flow_verdicts)
     }
 
+    /// List individual cached flow verdict entries for a direction.
+    ///
+    /// Entries come back soonest-expiring first, capped server-side at `limit`
+    /// (default 1000 when `None`).
+    pub fn flow_verdict_list(
+        &self,
+        direction: GqlDirection,
+        limit: Option<i32>,
+    ) -> Result<Vec<FlowVerdictEntry>> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "flowVerdictList")]
+            flow_verdict_list: Vec<FlowVerdictEntry>,
+        }
+
+        let query = r#"
+            query FlowVerdictList($direction: GqlDirection!, $limit: Int) {
+                flowVerdictList(direction: $direction, limit: $limit) {
+                    srcIp
+                    dstIp
+                    srcPort
+                    dstPort
+                    protocol
+                    action
+                    expiresNs
+                    expired
+                    packets
+                    bytes
+                }
+            }
+        "#;
+
+        let variables = json!({
+            "direction": direction,
+            "limit": limit,
+        });
+
+        let response: Response = self.execute(query, Some(variables))?;
+        Ok(response.flow_verdict_list)
+    }
+
     /// Clear flow verdicts for a direction (only succeeds against IPS/IDS servers)
     pub fn clear_flow_verdicts(&self, direction: GqlDirection) -> Result<OperationResult> {
         #[derive(Deserialize)]
