@@ -1546,8 +1546,8 @@ impl MutationRoot {
     /// Set the stop behavior for the policy engine daemon.
     ///
     /// `input.stop_behavior` must be "clear-state" or "preserve-state".
-    /// "clear-state": detach all BPF programs and remove pinned maps on shutdown.
-    /// "preserve-state" (default): leave programs attached and maps in the kernel (traffic
+    /// "clear-state" (default): detach all BPF programs and remove pinned maps on shutdown.
+    /// "preserve-state": leave programs attached and maps in the kernel (traffic
     /// enforcement continues while the daemon is not running).
     async fn configure_stop_behavior<'ctx>(
         &self,
