@@ -3,14 +3,12 @@
 
 import { useState } from 'react'
 import { gql, useQuery } from '@apollo/client'
-import { StatusCard, InterfaceList, RulesList, StatsPanel, EventStream, InspectPanel, PerformancePanel, FibPanel, UrpfPanel, FlowExportPanel, RuleLifecycleStream, AuditLogPanel } from './components'
+import { StatusCard, InterfaceList, RulesList, StatsPanel, EventStream, InspectPanel, PerformancePanel, FibPanel, UrpfPanel, FlowExportPanel, RuleLifecycleStream, AuditLogPanel, VerdictCachePanel } from './components'
 
 const GET_INSPECT_SUPPORTED = gql`
   query GetInspectSupported {
-    status {
-      inspectMode
-    }
     serverFeatures {
+      suricata
       ipfix
     }
   }
@@ -29,11 +27,10 @@ const TAB_LABELS: Record<Tab, string> = {
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('overview')
   const { data: statusData } = useQuery<{
-    status: { inspectMode: string | null }
-    serverFeatures: { ipfix: boolean }
+    serverFeatures: { suricata: boolean; ipfix: boolean }
   }>(GET_INSPECT_SUPPORTED, { pollInterval: 10000 })
 
-  const inspectSupported = statusData !== undefined && statusData.status.inspectMode !== null
+  const inspectSupported = statusData?.serverFeatures?.suricata ?? false
   const ipfixSupported = statusData?.serverFeatures?.ipfix ?? false
   const tabs: Tab[] = inspectSupported
     ? ['overview', 'rules', 'inspect', 'performance', 'audit']
@@ -102,6 +99,7 @@ function App() {
         <div className={activeTab === 'overview' ? 'space-y-6' : 'hidden'}>
           <StatusCard />
           <StatsPanel />
+          <VerdictCachePanel />
           <FibPanel />
           <UrpfPanel />
           {ipfixSupported && <FlowExportPanel />}

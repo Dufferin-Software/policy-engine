@@ -3,7 +3,6 @@
 
 import { useState, useRef, useEffect } from 'react'
 import { gql, useQuery, useMutation } from '@apollo/client'
-import { getProtocolName } from './protocolMappings'
 
 function Tooltip({ children, content }: { children: React.ReactNode; content: string }) {
   const [visible, setVisible] = useState(false)
@@ -30,14 +29,6 @@ function Tooltip({ children, content }: { children: React.ReactNode; content: st
   )
 }
 
-/** Format a byte count as a human-readable string (e.g. 1.2 MB). */
-function fmtBytes(b: number): string {
-  if (b < 1024) return `${b} B`
-  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`
-  if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`
-  return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`
-}
-
 /** Extract the numeric SID from a Suricata rule string, or null if absent. */
 function extractSid(rule: string): number | null {
   const m = rule.match(/\bsid:\s*(\d+)\s*;/)
@@ -52,7 +43,6 @@ const GET_INSPECT_STATUS = gql`
       mirrorInterface
       mirrorIfindex
       peerInterface
-      flowVerdictCount
       suricataVersion
       rulesetVersion
       customRuleFiles {
@@ -94,15 +84,6 @@ const DEPLOY_SURICATA_RULES = gql`
 const RELOAD_SURICATA_RULES = gql`
   mutation ReloadSuricataRules {
     reloadSuricataRules {
-      success
-      message
-    }
-  }
-`
-
-const CLEAR_FLOW_VERDICTS = gql`
-  mutation ClearFlowVerdicts($direction: GqlDirection!) {
-    clearFlowVerdicts(direction: $direction) {
       success
       message
     }
@@ -185,23 +166,6 @@ const ATTACH_TC_FOR_INSPECT = gql`
   }
 `
 
-const LIST_FLOW_VERDICTS = gql`
-  query ListFlowVerdicts($direction: GqlDirection!) {
-    flowVerdictList(direction: $direction) {
-      srcIp
-      dstIp
-      srcPort
-      dstPort
-      protocol
-      action
-      expiresNs
-      expired
-      packets
-      bytes
-    }
-  }
-`
-
 interface CustomRuleFile {
   filename: string
   ruleCount: number
@@ -214,7 +178,6 @@ interface InspectStatus {
   mirrorInterface: string | null
   mirrorIfindex: number | null
   peerInterface: string | null
-  flowVerdictCount: number
   suricataVersion: string | null
   rulesetVersion: string | null
   customRuleFiles: CustomRuleFile[]
@@ -227,23 +190,6 @@ interface InspectStatusData {
 interface OperationResult {
   success: boolean
   message: string
-}
-
-interface FlowVerdictEntry {
-  srcIp: string
-  dstIp: string
-  srcPort: number
-  dstPort: number
-  protocol: string
-  action: string
-  expiresNs: string
-  expired: boolean
-  packets: number
-  bytes: number
-}
-
-interface FlowVerdictListData {
-  flowVerdictList: FlowVerdictEntry[]
 }
 
 interface InterfaceEntry {
@@ -296,10 +242,6 @@ export function InspectPanel() {
     reloadSuricataRules: OperationResult
   }>(RELOAD_SURICATA_RULES)
 
-  const [clearFlowVerdicts, { loading: clearing }] = useMutation<{
-    clearFlowVerdicts: OperationResult
-  }>(CLEAR_FLOW_VERDICTS)
-
   const [addCustomRule, { loading: addingRule }] = useMutation<{
     addCustomRule: OperationResult
   }>(ADD_CUSTOM_RULE)
@@ -340,11 +282,6 @@ export function InspectPanel() {
       return next
     })
   }
-
-  const { data: verdictData, refetch: refetchVerdicts } = useQuery<FlowVerdictListData>(
-    LIST_FLOW_VERDICTS,
-    { variables: { direction: 'INGRESS' }, pollInterval: 3000 }
-  )
 
   const showFeedback = (type: 'success' | 'error', message: string) => {
     setFeedback({ type, message })
@@ -425,17 +362,6 @@ export function InspectPanel() {
     try {
       const { data: r } = await reloadSuricataRules()
       handleResult(r?.reloadSuricataRules, 'Failed to reload rules')
-    } catch (e) {
-      showFeedback('error', String(e))
-    }
-  }
-
-  const handleClearVerdicts = async (direction: string) => {
-    try {
-      const { data: r } = await clearFlowVerdicts({ variables: { direction } })
-      handleResult(r?.clearFlowVerdicts, 'Failed to clear verdicts')
-      refetch()
-      refetchVerdicts()
     } catch (e) {
       showFeedback('error', String(e))
     }
@@ -544,7 +470,7 @@ export function InspectPanel() {
       <div className="space-y-4">
         <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wide">Status</h3>
 
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
           {/* Mode */}
           <div className="bg-gray-700/50 rounded-lg p-3">
             <div className="text-xs text-gray-400 mb-1">Mode</div>
@@ -588,14 +514,6 @@ export function InspectPanel() {
             ) : (
               <span className="text-sm text-gray-500">Not created</span>
             )}
-          </div>
-
-          {/* Flow verdicts */}
-          <div className="bg-gray-700/50 rounded-lg p-3">
-            <div className="text-xs text-gray-400 mb-1">Cached Verdicts</div>
-            <div className="text-lg font-semibold text-blue-400">
-              {(status?.flowVerdictCount ?? 0).toLocaleString()}
-            </div>
           </div>
 
         </div>
@@ -865,94 +783,6 @@ export function InspectPanel() {
               {reloading ? 'Reloading...' : 'Reload Rules'}
             </button>
           </div>
-        </div>
-      </div>
-
-      {/* Section 4: Flow verdict cache */}
-      <div className="border-t border-gray-700 pt-4 space-y-3">
-        <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wide">
-          Flow Verdict Cache
-        </h3>
-
-        {/* Verdict list */}
-        {(() => {
-          const verdicts = verdictData?.flowVerdictList ?? []
-          if (verdicts.length === 0) {
-            return <p className="text-sm text-gray-500">No cached verdicts.</p>
-          }
-          return (
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs font-mono">
-                <thead>
-                  <tr className="text-gray-400 border-b border-gray-700">
-                    <th className="text-left py-1 pr-3">Src IP</th>
-                    <th className="text-left py-1 pr-3">Dst IP</th>
-                    <th className="text-left py-1 pr-3">Sport</th>
-                    <th className="text-left py-1 pr-3">Dport</th>
-                    <th className="text-left py-1 pr-3">Proto</th>
-                    <th className="text-left py-1 pr-3">Action</th>
-                    <th className="text-right py-1 pr-3">Packets</th>
-                    <th className="text-right py-1 pr-3">Bytes</th>
-                    <th className="text-left py-1">Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {verdicts.map((v, i) => (
-                    <tr
-                      key={i}
-                      className={`border-b border-gray-700/50 ${v.expired ? 'opacity-40' : ''}`}
-                    >
-                      <td className="py-1 pr-3 text-blue-300">{v.srcIp}</td>
-                      <td className="py-1 pr-3 text-blue-300">{v.dstIp}</td>
-                      <td className="py-1 pr-3 text-gray-300">{v.srcPort}</td>
-                      <td className="py-1 pr-3 text-gray-300">{v.dstPort}</td>
-                      <td className="py-1 pr-3 text-gray-300">{getProtocolName(v.protocol)}</td>
-                      <td className="py-1 pr-3">
-                        <span
-                          className={`px-1.5 py-0.5 rounded text-xs font-semibold ${
-                            v.action === 'DROP'
-                              ? 'bg-red-500/20 text-red-400'
-                              : v.action === 'PASS'
-                              ? 'bg-green-500/20 text-green-400'
-                              : 'bg-gray-500/20 text-gray-400'
-                          }`}
-                        >
-                          {v.action}
-                        </span>
-                      </td>
-                      <td className="py-1 pr-3 text-right text-gray-300">{v.packets.toLocaleString()}</td>
-                      <td className="py-1 pr-3 text-right text-gray-300">{fmtBytes(v.bytes)}</td>
-                      <td className="py-1">
-                        <span className={v.expired ? 'text-gray-500' : 'text-green-400'}>
-                          {v.expired ? 'expired' : 'active'}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )
-        })()}
-
-        <p className="text-xs text-gray-500">
-          Ingress verdicts only. Clear to force Suricata re-evaluation.
-        </p>
-        <div className="flex gap-3">
-          <button
-            onClick={() => handleClearVerdicts('INGRESS')}
-            disabled={clearing}
-            className="px-4 py-2 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded text-sm font-medium transition"
-          >
-            {clearing ? 'Clearing...' : 'Clear Ingress'}
-          </button>
-          <button
-            onClick={() => handleClearVerdicts('EGRESS')}
-            disabled={clearing}
-            className="px-4 py-2 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded text-sm font-medium transition"
-          >
-            {clearing ? 'Clearing...' : 'Clear Egress'}
-          </button>
         </div>
       </div>
     </div>
