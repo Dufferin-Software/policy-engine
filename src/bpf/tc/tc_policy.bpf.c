@@ -66,9 +66,14 @@ struct {
  * IPS path, the QUIC SNI inspector (userspace), and the in-kernel TCP SNI
  * inspector tc_sni_inspect (PASS/DROP after walking matched rule actions).
  * Always compiled in.
+ *
+ * LRU_HASH (not plain HASH): the plain L4 fast path seeds a verdict for every
+ * flow with a 12 h TTL, so the table must self-evict under flow-count pressure
+ * rather than fill and reject inserts.  See flow_verdict_cache in
+ * src/bpf/xdp/xdp_policy.bpf.c for the full rationale.
  */
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, MAX_FLOW_VERDICTS);
   __type(key, struct flow_verdict_key);
   __type(value, struct flow_verdict);
@@ -94,7 +99,7 @@ struct {
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, MAX_FLOWS_TO_INSPECT);
-  __type(key, struct flow_verdict_key);
+  __type(key, struct flow_inspect_key);
   __type(value, __u64); /* expiry timestamp in ns */
 } flows_to_inspect SEC(".maps");
 #endif /* SURICATA_IPS */
@@ -365,7 +370,7 @@ struct {
  */
 static __always_inline void
 tc_flow_verdict_key_from_flow(struct flow_verdict_key *fv_key,
-                              const struct flow_key *flow) {
+                              const struct flow_key *flow, __u32 ifindex) {
   if (flow->af == AF_INET) {
     fv_key->saddr4 = flow->saddr4;
     fv_key->daddr4 = flow->daddr4;
@@ -377,28 +382,33 @@ tc_flow_verdict_key_from_flow(struct flow_verdict_key *fv_key,
   fv_key->dport = flow->dport;
   fv_key->protocol = flow->protocol;
   fv_key->af = flow->af;
+  fv_key->ifindex = ifindex;
 }
 
 /*
- * Build a flow_verdict_cache / flows_to_inspect key with the 5-tuple reversed
- * (src<->dst swapped).  Egress sees the client->server direction, but the
- * inspection maps are keyed by the ingress direction (server->client), so the
- * tuple must be flipped to match.  See the callers under SURICATA_IPS.
+ * Seed tc_flow_verdict_cache from the plain policy fast path (the two-level LPM
+ * result — L3 prefix + L4 port/proto — or the default action; no SNI / IPS).
+ * Mirrors xdp_policy_write_verdict for egress: the first packet of a flow walks
+ * the trie; the resulting PASS/DROP is cached so subsequent packets
+ * short-circuit at the verdict-cache check in tc_policy_egress.  These verdicts
+ * never expire on time (POLICY_VERDICT_EXPIRES_NS == 0): flushed on rule change,
+ * reclaimed by LRU under pressure.  rule_id (0 for the default path) keeps
+ * rule_stats accurate on cache hits.  Callers must only invoke this for
+ * cacheable (pure PASS/DROP) flows.  Defined here (before tc_policy_egress)
+ * since the main program calls it.
  */
 static __always_inline void
-tc_flow_verdict_key_from_flow_reversed(struct flow_verdict_key *fv_key,
-                                       const struct flow_key *flow) {
-  if (flow->af == AF_INET) {
-    fv_key->saddr4 = flow->daddr4;
-    fv_key->daddr4 = flow->saddr4;
-  } else {
-    __builtin_memcpy(fv_key->saddr6, flow->daddr6, 16);
-    __builtin_memcpy(fv_key->daddr6, flow->saddr6, 16);
-  }
-  fv_key->sport = flow->dport;
-  fv_key->dport = flow->sport;
-  fv_key->protocol = flow->protocol;
-  fv_key->af = flow->af;
+tc_policy_write_verdict(const struct flow_key *flow, __u32 action,
+                        __u64 rule_id, __u64 now_ns, __u32 ifindex) {
+  struct flow_verdict_key fv_key = {};
+  tc_flow_verdict_key_from_flow(&fv_key, flow, ifindex);
+
+  struct flow_verdict v = {};
+  v.action = action;
+  v.rule_id = rule_id;
+  v.timestamp_ns = now_ns;
+  v.expires_ns = POLICY_VERDICT_EXPIRES_NS;
+  bpf_map_update_elem(&tc_flow_verdict_cache, &fv_key, &v, BPF_ANY);
 }
 
 /*
@@ -428,6 +438,16 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
       gs->verdict_drop_packets++;
       gs->verdict_drop_bytes += pkt_len;
     }
+    /* A rule-derived verdict (rule_id != 0) counts as a policy match on every
+     * packet, mirroring the cache-miss LPM path, so policy_matches stays
+     * consistent with policy_drops/policy_pass (which already count per packet
+     * here).  Also keep per-rule stats accurate.  rule_id is 0 for default /
+     * SNI / IPS verdicts — no rule matched, so no bump. */
+    if (fv->rule_id) {
+      tc_update_rule_stats(fv->rule_id, pkt_len, now);
+      if (gs)
+        gs->policy_matches++;
+    }
     /* Reuse 'now' already read above — avoids an extra clock call */
     TC_RECORD_TIMING_AT(t0, now);
     return TC_ACT_SHOT;
@@ -439,6 +459,11 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
     if (gs) {
       gs->verdict_pass_packets++;
       gs->verdict_pass_bytes += pkt_len;
+    }
+    if (fv->rule_id) {
+      tc_update_rule_stats(fv->rule_id, pkt_len, now);
+      if (gs)
+        gs->policy_matches++;
     }
     TC_RECORD_TIMING_AT(t0, now);
     return TC_ACT_OK;
@@ -464,7 +489,7 @@ tc_apply_l4_rules(struct __sk_buff *ctx, struct global_stats *gs,
                   struct dst_lpm_value *policy, struct flow_key *flow_key,
                   __u64 t0, __u32 pkt_len, const __u8 *pkt_src_mac,
                   const __u8 *pkt_dst_mac, struct tc_pkt_meta *meta,
-                  __u64 *fc_rule_id
+                  __u64 *fc_rule_id, __u8 *cacheable
 #ifdef SURICATA_IPS
                   ,
                   struct inspect_config *icfg
@@ -488,7 +513,7 @@ tc_apply_l4_rules(struct __sk_buff *ctx, struct global_stats *gs,
           tc_update_rule_stats(rule->rule_id, pkt_len, t0);
           if (*fc_rule_id == 0)
             *fc_rule_id = rule->rule_id;
-          int v = tc_process_rule_actions(ctx, gs, rule, flow_key, t0
+          int v = tc_process_rule_actions(ctx, gs, rule, flow_key, t0, cacheable
 #ifdef SURICATA_IPS
                                           ,
                                           icfg
@@ -615,7 +640,7 @@ int tc_policy_egress(struct __sk_buff *ctx) {
    * QUIC SNI inspector; a hit short-circuits the policy lookup. */
   {
     struct flow_verdict_key fv_key = {};
-    tc_flow_verdict_key_from_flow(&fv_key, &flow_key);
+    tc_flow_verdict_key_from_flow(&fv_key, &flow_key, ctx->ifindex);
 
     int cached_verdict = tc_check_flow_verdict_cache(gs, &fv_key, pkt_len, t0);
     if (cached_verdict >= 0)
@@ -631,10 +656,10 @@ int tc_policy_egress(struct __sk_buff *ctx) {
   {
     if (icfg && icfg->mode != INSPECT_MODE_DISABLED &&
         icfg->mirror_ifindex != 0) {
-      struct flow_verdict_key fv_key = {};
-      tc_flow_verdict_key_from_flow_reversed(&fv_key, &flow_key);
+      struct flow_inspect_key fi_key = {};
+      flow_inspect_key_from_flow_reversed(&fi_key, &flow_key);
 
-      const __u64 *expiry = bpf_map_lookup_elem(&flows_to_inspect, &fv_key);
+      const __u64 *expiry = bpf_map_lookup_elem(&flows_to_inspect, &fi_key);
       if (expiry) {
         __u64 now = bpf_ktime_get_ns();
         if (*expiry == 0 || now < *expiry)
@@ -664,9 +689,12 @@ int tc_policy_egress(struct __sk_buff *ctx) {
     if (meta)
       meta->sni_count = 0;
 
+    /* Cleared by tc_apply_l4_rules if any matched rule carries a LOG / INSPECT
+     * / TAIL_CALL action; gates the policy verdict seed below. */
+    __u8 cacheable = 1;
     int final_verdict = tc_apply_l4_rules(ctx, gs, policy, &flow_key, t0,
                                           pkt_len, pkt_src_mac, pkt_dst_mac,
-                                          meta, &tc_fc_rule_id
+                                          meta, &tc_fc_rule_id, &cacheable
 #ifdef SURICATA_IPS
                                           ,
                                           icfg
@@ -696,6 +724,12 @@ int tc_policy_egress(struct __sk_buff *ctx) {
     }
 
     TC_RECORD_TIMING(t0);
+    /* Seed the policy verdict cache so subsequent packets on this 5-tuple
+     * short-circuit at the verdict-cache check instead of re-walking the
+     * two-level LPM trie.  Only for cacheable flows (pure PASS/DROP). */
+    if (cacheable)
+      tc_policy_write_verdict(&flow_key, dropped ? ACTION_DROP : ACTION_PASS,
+                              tc_fc_rule_id, t0, ctx->ifindex);
     TC_FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, tc_fc_rule_id,
                             final_verdict == TC_ACT_SHOT ? ACTION_DROP : ACTION_PASS,
                             final_verdict);
@@ -706,6 +740,12 @@ int tc_policy_egress(struct __sk_buff *ctx) {
     __u32 *def_action = bpf_map_lookup_elem(&tc_default_action, &ifidx);
     __u32 action = def_action ? *def_action : ACTION_PASS;
     update_action_stats(gs, action);
+
+    /* Seed the default verdict (rule_id 0) so unmatched flows skip the LPM walk
+     * on subsequent packets.  Flushed on any rule change. */
+    tc_policy_write_verdict(&flow_key,
+                            action == ACTION_DROP ? ACTION_DROP : ACTION_PASS, 0,
+                            t0, ctx->ifindex);
 
     TC_RECORD_TIMING(t0);
     switch (action) {
@@ -728,9 +768,10 @@ int tc_policy_egress(struct __sk_buff *ctx) {
  * tail call.
  */
 static __always_inline void
-tc_sni_write_verdict(const struct flow_key *flow, __u32 action, __u64 now_ns) {
+tc_sni_write_verdict(const struct flow_key *flow, __u32 action, __u64 now_ns,
+                     __u32 ifindex) {
   struct flow_verdict_key fv_key = {};
-  tc_flow_verdict_key_from_flow(&fv_key, flow);
+  tc_flow_verdict_key_from_flow(&fv_key, flow, ifindex);
 
   struct flow_verdict v = {};
   v.action = action;
@@ -760,7 +801,7 @@ int tc_sni_inspect(struct __sk_buff *ctx) {
      * before the real CH arrives. */
     __u64 sni_now = bpf_ktime_get_ns();
     if (meta->sni_seen)
-      tc_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now);
+      tc_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now, ctx->ifindex);
     TC_RECORD_TIMING_AT(meta->t0, sni_now);
     TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, TC_ACT_OK);
   }
@@ -853,10 +894,10 @@ int tc_sni_inspect(struct __sk_buff *ctx) {
             bpf_map_lookup_elem(&tc_inspect_config, &icfg_key);
         if (!icfg || icfg->mode == INSPECT_MODE_DISABLED)
           break;
-        struct flow_verdict_key fv_key = {};
-        tc_flow_verdict_key_from_flow_reversed(&fv_key, &meta->flow);
+        struct flow_inspect_key fi_key = {};
+        flow_inspect_key_from_flow_reversed(&fi_key, &meta->flow);
         __u64 expiry = sni_now + INSPECT_CLONE_TTL_NS;
-        bpf_map_update_elem(&flows_to_inspect, &fv_key, &expiry, BPF_ANY);
+        bpf_map_update_elem(&flows_to_inspect, &fi_key, &expiry, BPF_ANY);
         if (icfg->mirror_ifindex != 0)
           bpf_clone_redirect(ctx, icfg->mirror_ifindex, 0);
         break;
@@ -890,7 +931,7 @@ int tc_sni_inspect(struct __sk_buff *ctx) {
     update_action_stats(gs, final_action);
 
     if (final_verdict == TC_ACT_SHOT) {
-      tc_sni_write_verdict(&meta->flow, ACTION_DROP, sni_now);
+      tc_sni_write_verdict(&meta->flow, ACTION_DROP, sni_now, ctx->ifindex);
       TC_RECORD_TIMING_AT(meta->t0, sni_now);
       TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, rule_id, ACTION_DROP, TC_ACT_SHOT);
     }
@@ -908,7 +949,7 @@ next_rule:
   {
     __u64 sni_now = bpf_ktime_get_ns();
     if (meta->sni_seen)
-      tc_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now);
+      tc_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now, ctx->ifindex);
     TC_RECORD_TIMING_AT(meta->t0, sni_now);
   }
   TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, TC_ACT_OK);
@@ -1081,29 +1122,19 @@ int tc_policy_ingress(struct __sk_buff *ctx) {
   if (l4_off < 0 && l4_off != PARSE_NONFIRST_FRAG)
     return TC_ACT_OK;
 
-  /* Build the flow verdict key for the flows_to_inspect lookup */
-  struct flow_verdict_key fv_key = {};
-  if (flow_key.af == AF_INET) {
-    fv_key.saddr4 = flow_key.saddr4;
-    fv_key.daddr4 = flow_key.daddr4;
-  } else {
-    __builtin_memcpy(fv_key.saddr6, flow_key.saddr6, 16);
-    __builtin_memcpy(fv_key.daddr6, flow_key.daddr6, 16);
-  }
-  fv_key.sport = flow_key.sport;
-  fv_key.dport = flow_key.dport;
-  fv_key.protocol = flow_key.protocol;
-  fv_key.af = flow_key.af;
+  /* Build the (ifindex-less) flows_to_inspect key for the clone lookup */
+  struct flow_inspect_key fi_key = {};
+  flow_inspect_key_from_flow(&fi_key, &flow_key);
 
   /* Check if this flow should be cloned to Suricata */
-  const __u64 *expiry = bpf_map_lookup_elem(&flows_to_inspect, &fv_key);
+  const __u64 *expiry = bpf_map_lookup_elem(&flows_to_inspect, &fi_key);
   if (!expiry)
     return TC_ACT_OK;
 
   /* Remove expired entries to keep the map tidy */
   __u64 now = bpf_ktime_get_ns();
   if (*expiry != 0 && now >= *expiry) {
-    bpf_map_delete_elem(&flows_to_inspect, &fv_key);
+    bpf_map_delete_elem(&flows_to_inspect, &fi_key);
     return TC_ACT_OK;
   }
 

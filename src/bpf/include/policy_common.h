@@ -72,12 +72,30 @@
  * Always compiled in so non-Suricata builds can still cache verdicts. */
 #define MAX_FLOW_VERDICTS 65536
 
-/* TTL for verdicts written by the in-kernel TCP SNI inspector and the QUIC
- * userspace consumer.  Sized to cover the bulk of a TCP TLS or QUIC session
- * so the L4 fast path drops/passes every subsequent packet without re-running
- * inspection.  Kept in sync with QUIC_VERDICT_TTL_NS in
- * src/server/event_stream.rs. */
-#define SNI_VERDICT_TTL_NS 60000000000ULL
+/* Verdict cache expiry, split by what the verdict actually depends on.
+ *
+ * Plain policy verdicts (the two-level LPM result — L3 src/dst prefix + L4
+ * port/proto match — and the per-interface default action; written by
+ * xdp_policy_write_verdict / tc_policy_write_verdict) NEVER expire on time.
+ * Such a verdict is a pure function of the 5-tuple and the current rule set, so
+ * it stays valid for the life of that rule set; rule edits flush the cache
+ * (PolicyService::invalidate_flow_verdicts → clear_flow_verdicts), and the
+ * LRU_HASH maps evict the least-recently-used entry under capacity pressure (an
+ * evicted flow just pays one more LPM walk).  0 = never; check_flow_verdict_cache
+ * treats expires_ns == 0 as non-expiring.
+ *
+ * SNI/QUIC verdicts DO expire on time (10 min).  They are keyed by the 5-tuple
+ * but the decision depends on the SNI hostname, which is NOT part of the key: a
+ * reused 5-tuple (client ephemeral-port reuse to a CDN / SAN-shared IP) can
+ * carry a different hostname on a later connection, so a long-lived entry would
+ * mis-apply.  Rule-change flushing does not cover this (the rules didn't change,
+ * the connection did), so a bounded TTL is the only safeguard.  Kept in sync
+ * with QUIC_VERDICT_TTL_NS in src/server/event_stream.rs.
+ *
+ * IPS/IDS verdicts use the short INSPECT_PASS_VERDICT_TTL_NS so Suricata
+ * re-inspects periodically. */
+#define POLICY_VERDICT_EXPIRES_NS 0ULL     /* never expires */
+#define SNI_VERDICT_TTL_NS 600000000000ULL /* 10 min */
 
 #ifdef SURICATA_IPS
 /* Inspect mode */
@@ -217,12 +235,45 @@ struct sni_pending_entry {
 }; /* 16 + 4*16 = 80 bytes */
 
 /*
- * Flow verdict key (used in flow_verdict_cache hash map).
- * Generic 5-tuple keyed cache.  Written by any verdict source (Suricata EVE
- * consumer, QUIC SNI inspector, future inspectors); checked by XDP/TC at
- * packet entry for cached PASS/DROP decisions.
+ * Flow verdict key (used in flow_verdict_cache / tc_flow_verdict_cache).
+ * Generic 5-tuple keyed cache, scoped per-interface by ifindex.  Written by any
+ * verdict source (plain policy fast path, Suricata EVE consumer, QUIC SNI
+ * inspector, future inspectors); checked by XDP/TC at packet entry for cached
+ * PASS/DROP decisions.
+ *
+ * ifindex disambiguates the same 5-tuple ingressing on different interfaces:
+ * policy is per-interface (src_lpm_key carries ifindex), so without it two
+ * interfaces with different policies would share one cached verdict.  The XDP
+ * and TC verdict caches are distinct maps, so each scopes by its own natural
+ * ifindex — XDP uses ctx->ingress_ifindex, TC uses ctx->ifindex (egress).
  */
 struct flow_verdict_key {
+  union {
+    __u32 saddr4;
+    __u32 saddr6[4];
+  };
+  union {
+    __u32 daddr4;
+    __u32 daddr6[4];
+  };
+  __u16 sport;
+  __u16 dport;
+  __u8 protocol;
+  __u8 af;
+  __u16 _pad;
+  __u32 ifindex;
+} __attribute__((packed));
+
+/*
+ * Flows-to-inspect key (used in the flows_to_inspect hash map).
+ * Plain 5-tuple — deliberately NOT scoped by ifindex, unlike flow_verdict_key.
+ * flows_to_inspect is shared (pinned) between the XDP and TC skeletons and
+ * carries cross-direction correlation the verdict cache does not: XDP ingress
+ * writes the ingress 5-tuple, TC egress writes the reversed (ingress-direction)
+ * tuple, and TC egress cannot know the ingress ifindex.  Keeping it ifindex-less
+ * preserves that correlation.  Layout mirrors the pre-ifindex flow_verdict_key.
+ */
+struct flow_inspect_key {
   union {
     __u32 saddr4;
     __u32 saddr6[4];
@@ -239,6 +290,48 @@ struct flow_verdict_key {
 } __attribute__((packed));
 
 /*
+ * Build a flows_to_inspect key from a parsed flow_key (forward 5-tuple).
+ * Shared by the XDP INSPECT writer and the TC ingress clone lookup.
+ */
+static __always_inline void
+flow_inspect_key_from_flow(struct flow_inspect_key *k,
+                           const struct flow_key *flow) {
+  if (flow->af == AF_INET) {
+    k->saddr4 = flow->saddr4;
+    k->daddr4 = flow->daddr4;
+  } else {
+    __builtin_memcpy(k->saddr6, flow->saddr6, 16);
+    __builtin_memcpy(k->daddr6, flow->daddr6, 16);
+  }
+  k->sport = flow->sport;
+  k->dport = flow->dport;
+  k->protocol = flow->protocol;
+  k->af = flow->af;
+}
+
+/*
+ * Build a flows_to_inspect key with the 5-tuple reversed (src<->dst swapped).
+ * TC egress sees the client->server direction but flows_to_inspect is keyed by
+ * the ingress (server->client) direction, so the tuple must be flipped to match
+ * what XDP ingress wrote.  See the SURICATA_IPS callers in tc_policy.bpf.c.
+ */
+static __always_inline void
+flow_inspect_key_from_flow_reversed(struct flow_inspect_key *k,
+                                    const struct flow_key *flow) {
+  if (flow->af == AF_INET) {
+    k->saddr4 = flow->daddr4;
+    k->daddr4 = flow->saddr4;
+  } else {
+    __builtin_memcpy(k->saddr6, flow->daddr6, 16);
+    __builtin_memcpy(k->daddr6, flow->saddr6, 16);
+  }
+  k->sport = flow->dport;
+  k->dport = flow->sport;
+  k->protocol = flow->protocol;
+  k->af = flow->af;
+}
+
+/*
  * Flow verdict value: cached decision with expiry and traffic counters.
  * packets/bytes are incremented atomically by XDP/TC on every verdict hit.
  */
@@ -249,6 +342,11 @@ struct flow_verdict {
   __u64 expires_ns;   /* Auto-expire timestamp (0 = never) */
   __u64 packets;      /* Packets matched by this verdict */
   __u64 bytes;        /* Bytes matched by this verdict */
+  __u64 rule_id;      /* Rule that produced this verdict (0 = none / default /
+                         SNI / IPS).  When non-zero the dataplane bumps
+                         rule_stats[rule_id] on every cache hit so per-rule
+                         packet/byte/last_seen counters stay accurate even though
+                         the fast path skips rule evaluation. */
 };
 
 #ifdef SURICATA_IPS

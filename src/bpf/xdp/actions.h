@@ -5,11 +5,18 @@
 
 /*
  * Process all actions for a matched rule in priority order
- * Returns the final XDP verdict (drop or pass)
+ * Returns the final XDP verdict (drop or pass).
+ *
+ * *cacheable is cleared to 0 if this rule carries any action that must run on
+ * every packet (LOG — per-packet emission / rate-limit windows; INSPECT — IPS
+ * mirroring with its own short verdict TTL; TAIL_CALL).  The caller only seeds
+ * the policy verdict cache when *cacheable is still set after all matched
+ * rules, so pure PASS/DROP flows get the fast path while LOG/INSPECT flows keep
+ * re-evaluating.  Caller initialises *cacheable = 1.
  */
 static __always_inline __u32 process_rule_actions(
     struct xdp_md *ctx, struct global_stats *gs, struct l4_rule *policy,
-    struct flow_key *flow_key, __u64 now_ns
+    struct flow_key *flow_key, __u64 now_ns, __u8 *cacheable
 #ifdef SURICATA_IPS
     ,
     const struct flow_verdict_key *fv_key
@@ -33,6 +40,9 @@ static __always_inline __u32 process_rule_actions(
       stop_actions = 1; /* DROP stops further action processing */
       break;
     case ACTION_LOG: {
+      /* A LOG rule must be re-evaluated per packet (event emission and
+       * rate-limit windows), so its flow cannot be served from the cache. */
+      *cacheable = 0;
       __u64 param = policy->actions[i].param; /* rate-limit interval in ns */
       if (param > 0) {
         /* Rate limiting via rule_stats.last_log_ns (no extra map needed).
@@ -61,6 +71,7 @@ static __always_inline __u32 process_rule_actions(
         final_verdict = XDP_PASS;
       break;
     case ACTION_TAIL_CALL:
+      *cacheable = 0;
       if (policy->tail_call_idx < MAX_DISPATCHER_PROGS) {
         if (gs)
           gs->tail_calls++;
@@ -70,6 +81,10 @@ static __always_inline __u32 process_rule_actions(
       break;
 #ifdef SURICATA_IPS
     case ACTION_INSPECT: {
+      /* INSPECT manages its own short PASS verdict (INSPECT_PASS_VERDICT_TTL_NS)
+       * and is overwritten with a DROP by the EVE consumer; never seed a
+       * non-expiring policy verdict over it. */
+      *cacheable = 0;
       __u32 cfg_key = 0;
       const struct inspect_config *cfg =
           bpf_map_lookup_elem(&inspect_config, &cfg_key);
@@ -80,15 +95,19 @@ static __always_inline __u32 process_rule_actions(
         gs->inspect_redirects++;
 
       /* Mark this flow for TC ingress cloning to Suricata.
-       * fv_key is pre-built by the caller — no need to reconstruct here.
+       * flows_to_inspect is keyed by the ifindex-less flow_inspect_key (shared
+       * with the TC skeleton), so build that from the flow rather than reusing
+       * fv_key (which now carries an ifindex for the verdict cache).
        * TC ingress reads flows_to_inspect and calls bpf_clone_redirect to
        * mirror each packet on this flow to pe-inspect0 while the original
        * continues to the application.  Suricata receives the full TCP stream
        * on pe-inspect1 (the veth peer) and fires alerts via EVE JSON.
        * The EveConsumer writes DROP verdicts to flow_verdict_cache; the next
        * packet on this flow is then dropped at the XDP verdict-cache check. */
+      struct flow_inspect_key fi_key = {};
+      flow_inspect_key_from_flow(&fi_key, flow_key);
       __u64 expiry = now_ns + INSPECT_CLONE_TTL_NS;
-      bpf_map_update_elem(&flows_to_inspect, fv_key, &expiry, BPF_ANY);
+      bpf_map_update_elem(&flows_to_inspect, &fi_key, &expiry, BPF_ANY);
 
       /* Write a temporary PASS verdict so the EveConsumer can overwrite it
        * with DROP when Suricata alerts.  BPF_NOEXIST prevents overwriting an

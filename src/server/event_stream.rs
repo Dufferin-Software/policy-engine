@@ -40,9 +40,12 @@ use crate::types::{
 use crate::{PolicyAction, Protocol};
 
 /// PASS/DROP verdict TTL written after a successful Initial SNI extraction.
-/// Long enough to cover the bulk of a QUIC session; an outright DROP entry
-/// has the same TTL since the BPF fast path will reject every packet anyway.
-const QUIC_VERDICT_TTL_NS: u64 = 60_000_000_000;
+/// 10 minutes — a QUIC/SNI verdict is keyed by the 5-tuple but decided by the
+/// SNI hostname (not part of the key), so a reused 5-tuple can carry a different
+/// hostname; a bounded TTL caps that staleness (rule-change flushing does not
+/// cover it). Kept in sync with SNI_VERDICT_TTL_NS in
+/// src/bpf/include/policy_common.h.
+const QUIC_VERDICT_TTL_NS: u64 = 600_000_000_000;
 
 const MAP_EVENTS: &str = "events";
 const MAP_TC_EVENTS: &str = "tc_events";
@@ -680,7 +683,7 @@ async fn process_quic_sample(
         return Ok(());
     }
 
-    let vkey = flow_to_verdict_key(&sample.flow);
+    let vkey = flow_to_verdict_key(&sample.flow, sample.ifindex);
     let now_ns = monotonic_now_ns();
     let verdict = FlowVerdict {
         action,
@@ -689,6 +692,7 @@ async fn process_quic_sample(
         expires_ns: now_ns + QUIC_VERDICT_TTL_NS,
         packets: 0,
         bytes: 0,
+        rule_id: 0,
     };
     bpf.update_flow_verdict(&vkey, &verdict, sample.direction)
         .with_context(|| {
@@ -711,7 +715,7 @@ async fn process_quic_sample(
     Ok(())
 }
 
-fn flow_to_verdict_key(flow: &FlowKey) -> FlowVerdictKey {
+fn flow_to_verdict_key(flow: &FlowKey, ifindex: u32) -> FlowVerdictKey {
     let mut key = FlowVerdictKey::default();
     if flow.af == AF_INET {
         key.saddr[..4].copy_from_slice(&flow.saddr6[0].to_le_bytes());
@@ -726,6 +730,10 @@ fn flow_to_verdict_key(flow: &FlowKey) -> FlowVerdictKey {
     key.dport = flow.dport;
     key.protocol = flow.protocol;
     key.af = flow.af;
+    // Verdict cache is per-interface (see flow_verdict_key.ifindex in BPF). The
+    // QUIC inspect sample carries the ifindex the dataplane observed this flow
+    // on, which matches the cache key the XDP/TC fast path builds.
+    key.ifindex = ifindex;
     key
 }
 

@@ -324,6 +324,10 @@ pub struct FlowVerdictKey {
     pub protocol: u8,
     pub af: u8,
     pub _pad: u16,
+    /// Interface index scoping this verdict (must match the BPF
+    /// `flow_verdict_key.ifindex`). Policy is per-interface, so the cache key
+    /// is too: XDP keys by `ctx->ingress_ifindex`, TC by `ctx->ifindex`.
+    pub ifindex: u32,
 }
 
 impl FlowVerdictKey {
@@ -340,11 +344,13 @@ impl fmt::Debug for FlowVerdictKey {
         let dport = self.dport;
         let proto = self.protocol;
         let af = self.af;
+        let ifindex = self.ifindex;
         f.debug_struct("FlowVerdictKey")
             .field("sport", &sport)
             .field("dport", &dport)
             .field("protocol", &proto)
             .field("af", &af)
+            .field("ifindex", &ifindex)
             .finish()
     }
 }
@@ -361,6 +367,10 @@ pub struct FlowVerdict {
     pub expires_ns: u64,
     pub packets: u64,
     pub bytes: u64,
+    /// Rule that produced this verdict (0 = none / default / SNI / IPS). When
+    /// non-zero the dataplane bumps `rule_stats[rule_id]` on every cache hit so
+    /// per-rule counters stay accurate on the cached fast path.
+    pub rule_id: u64,
 }
 
 impl FlowVerdict {
@@ -379,6 +389,7 @@ impl fmt::Debug for FlowVerdict {
             .field("expires_ns", &self.expires_ns)
             .field("packets", &self.packets)
             .field("bytes", &self.bytes)
+            .field("rule_id", &self.rule_id)
             .finish()
     }
 }
@@ -2132,6 +2143,7 @@ mod tests {
                 expires_ns: 99999,
                 packets: 5,
                 bytes: 500,
+                rule_id: 0,
             };
             let s = format!("{:?}", v);
             assert!(s.contains("12345"));

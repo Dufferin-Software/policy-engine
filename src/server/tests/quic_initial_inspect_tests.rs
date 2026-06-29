@@ -138,9 +138,10 @@ fn verdict_seed_path_reaches_bpf_adaptor() {
         action: PolicyAction::Pass as u32,
         _pad: 0,
         timestamp_ns: 100,
-        expires_ns: 100 + 60_000_000_000, // 60 s — matches QUIC_VERDICT_TTL_NS
+        expires_ns: 100 + 600_000_000_000, // 10 min — matches QUIC_VERDICT_TTL_NS
         packets: 0,
         bytes: 0,
+        rule_id: 0,
     };
 
     mock.update_flow_verdict(&key, &verdict, Direction::Ingress)

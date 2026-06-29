@@ -100,9 +100,16 @@ struct {
  * and future inspectors.
  * Always compiled in so the cache is available even without the Suricata
  * feature.
+ *
+ * LRU_HASH (not plain HASH): the plain policy fast path now seeds a verdict for
+ * every flow, and those never expire on time (POLICY_VERDICT_EXPIRES_NS == 0),
+ * so on a busy host a plain HASH would fill and reject new inserts.
+ * LRU lets the kernel evict the least-recently-used entry under pressure; an
+ * evicted entry just costs one more two-level LPM walk when its flow reappears,
+ * so correctness is preserved (the LPM walk is the authoritative fallback).
  */
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, MAX_FLOW_VERDICTS);
   __type(key, struct flow_verdict_key);
   __type(value, struct flow_verdict);
@@ -128,7 +135,7 @@ struct {
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, MAX_FLOWS_TO_INSPECT);
-  __type(key, struct flow_verdict_key);
+  __type(key, struct flow_inspect_key);
   __type(value, __u64); /* expiry timestamp in ns */
 } flows_to_inspect SEC(".maps");
 #endif /* SURICATA_IPS */
@@ -484,7 +491,7 @@ struct {
  */
 static __always_inline void
 flow_verdict_key_from_flow(struct flow_verdict_key *fv_key,
-                           const struct flow_key *flow) {
+                           const struct flow_key *flow, __u32 ifindex) {
   if (flow->af == AF_INET) {
     fv_key->saddr4 = flow->saddr4;
     fv_key->daddr4 = flow->daddr4;
@@ -496,16 +503,44 @@ flow_verdict_key_from_flow(struct flow_verdict_key *fv_key,
   fv_key->dport = flow->dport;
   fv_key->protocol = flow->protocol;
   fv_key->af = flow->af;
+  fv_key->ifindex = ifindex;
 }
 
 static __always_inline void
-xdp_sni_write_verdict(const struct flow_key *flow, __u32 action, __u64 now_ns) {
+xdp_sni_write_verdict(const struct flow_key *flow, __u32 action, __u64 now_ns,
+                      __u32 ifindex) {
   struct flow_verdict_key fv_key = {};
-  flow_verdict_key_from_flow(&fv_key, flow);
+  flow_verdict_key_from_flow(&fv_key, flow, ifindex);
 
   struct flow_verdict v = {};
   v.action = action;
   v.expires_ns = now_ns + SNI_VERDICT_TTL_NS;
+  bpf_map_update_elem(&flow_verdict_cache, &fv_key, &v, BPF_ANY);
+}
+
+/*
+ * Seed flow_verdict_cache from the plain policy fast path (the two-level LPM
+ * result — L3 prefix + L4 port/proto — or the default action; no SNI / IPS).
+ * After the first packet of a flow walks the trie, the resulting PASS/DROP is
+ * cached so every subsequent packet on the same 5-tuple short-circuits at the
+ * verdict-cache check in xdp_policy_main, skipping the O(ancestors^2) walk.
+ * These verdicts never expire on time (POLICY_VERDICT_EXPIRES_NS == 0): they are
+ * flushed on rule change and reclaimed by LRU under pressure.  rule_id (0 for
+ * the default-action path) is stored so cache hits keep rule_stats accurate.
+ * Callers must only invoke this for cacheable flows (pure PASS/DROP — see
+ * process_rule_actions' cacheable flag).
+ */
+static __always_inline void
+xdp_policy_write_verdict(const struct flow_key *flow, __u32 action,
+                         __u64 rule_id, __u64 now_ns, __u32 ifindex) {
+  struct flow_verdict_key fv_key = {};
+  flow_verdict_key_from_flow(&fv_key, flow, ifindex);
+
+  struct flow_verdict v = {};
+  v.action = action;
+  v.rule_id = rule_id;
+  v.timestamp_ns = now_ns;
+  v.expires_ns = POLICY_VERDICT_EXPIRES_NS;
   bpf_map_update_elem(&flow_verdict_cache, &fv_key, &v, BPF_ANY);
 }
 
@@ -548,7 +583,8 @@ int xdp_sni_inspect(struct xdp_md *ctx) {
      * before the real CH arrives. */
     __u64 sni_now = bpf_ktime_get_ns();
     if (meta->sni_seen)
-      xdp_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now);
+      xdp_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now,
+                            ctx->ingress_ifindex);
     XDP_RECORD_TIMING_AT(meta->t0, sni_now);
     FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, XDP_PASS);
   }
@@ -625,10 +661,12 @@ int xdp_sni_inspect(struct xdp_md *ctx) {
             bpf_map_lookup_elem(&inspect_config, &cfg_key);
         if (!cfg || cfg->mode == INSPECT_MODE_DISABLED)
           break;
-        struct flow_verdict_key fv_key = {};
-        flow_verdict_key_from_flow(&fv_key, &meta->flow);
+        struct flow_inspect_key fi_key = {};
+        flow_inspect_key_from_flow(&fi_key, &meta->flow);
         __u64 expiry = sni_now + INSPECT_CLONE_TTL_NS;
-        bpf_map_update_elem(&flows_to_inspect, &fv_key, &expiry, BPF_ANY);
+        bpf_map_update_elem(&flows_to_inspect, &fi_key, &expiry, BPF_ANY);
+        struct flow_verdict_key fv_key = {};
+        flow_verdict_key_from_flow(&fv_key, &meta->flow, ctx->ingress_ifindex);
         struct flow_verdict pass_v = {};
         pass_v.action = ACTION_PASS;
         pass_v.expires_ns = sni_now + INSPECT_PASS_VERDICT_TTL_NS;
@@ -663,7 +701,8 @@ int xdp_sni_inspect(struct xdp_md *ctx) {
     update_action_stats(gs, final_action);
 
     if (final_verdict == XDP_DROP) {
-      xdp_sni_write_verdict(&meta->flow, ACTION_DROP, sni_now);
+      xdp_sni_write_verdict(&meta->flow, ACTION_DROP, sni_now,
+                            ctx->ingress_ifindex);
       XDP_RECORD_TIMING_AT(meta->t0, sni_now);
       FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, rule_id, ACTION_DROP, XDP_DROP);
     }
@@ -681,7 +720,8 @@ next_rule:
   {
     __u64 sni_now = bpf_ktime_get_ns();
     if (meta->sni_seen)
-      xdp_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now);
+      xdp_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now,
+                            ctx->ingress_ifindex);
     XDP_RECORD_TIMING_AT(meta->t0, sni_now);
   }
   FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, XDP_PASS);
@@ -851,6 +891,16 @@ check_flow_verdict_cache(struct global_stats *stats,
       stats->verdict_drop_packets++;
       stats->verdict_drop_bytes += pkt_len;
     }
+    /* A rule-derived verdict (rule_id != 0) counts as a policy match on every
+     * packet, mirroring the cache-miss LPM path, so policy_matches stays
+     * consistent with policy_drops/policy_pass (which already count per packet
+     * here).  Also keep per-rule stats accurate.  rule_id is 0 for default /
+     * SNI / IPS verdicts — no rule matched, so no bump. */
+    if (fv->rule_id) {
+      update_rule_stats(fv->rule_id, pkt_len, now);
+      if (stats)
+        stats->policy_matches++;
+    }
     /* Reuse 'now' already read above — avoids an extra clock call */
     XDP_RECORD_TIMING_AT(t0, now);
     return XDP_DROP;
@@ -863,6 +913,11 @@ check_flow_verdict_cache(struct global_stats *stats,
     if (stats) {
       stats->verdict_pass_packets++;
       stats->verdict_pass_bytes += pkt_len;
+    }
+    if (fv->rule_id) {
+      update_rule_stats(fv->rule_id, pkt_len, now);
+      if (stats)
+        stats->policy_matches++;
     }
     XDP_RECORD_TIMING_AT(t0, now);
     return XDP_PASS;
@@ -888,7 +943,7 @@ xdp_apply_l4_rules(struct xdp_md *ctx, struct global_stats *stats,
                    struct dst_lpm_value *policy, struct flow_key *flow_key,
                    __u64 t0, __u32 pkt_len, const __u8 *pkt_src_mac,
                    const __u8 *pkt_dst_mac, struct pkt_meta *meta,
-                   __u64 *fc_rule_id
+                   __u64 *fc_rule_id, __u8 *cacheable
 #ifdef SURICATA_IPS
                    ,
                    struct flow_verdict_key *fv_key
@@ -913,7 +968,8 @@ xdp_apply_l4_rules(struct xdp_md *ctx, struct global_stats *stats,
           update_rule_stats(rule->rule_id, pkt_len, t0);
           if (*fc_rule_id == 0)
             *fc_rule_id = rule->rule_id;
-          __u32 v = process_rule_actions(ctx, stats, rule, flow_key, t0
+          __u32 v = process_rule_actions(ctx, stats, rule, flow_key, t0,
+                                         cacheable
 #ifdef SURICATA_IPS
                                          ,
                                          fv_key
@@ -1073,7 +1129,7 @@ int xdp_policy_main(struct xdp_md *ctx) {
    * source.  A hit short-circuits the policy lookup at XDP line rate.
    * fv_key remains in scope for reuse by the INSPECT action below. */
   struct flow_verdict_key fv_key = {};
-  flow_verdict_key_from_flow(&fv_key, &flow_key);
+  flow_verdict_key_from_flow(&fv_key, &flow_key, ctx->ingress_ifindex);
 
   int cached_verdict = check_flow_verdict_cache(stats, &fv_key, pkt_len, t0);
   if (cached_verdict >= 0)
@@ -1099,9 +1155,12 @@ int xdp_policy_main(struct xdp_md *ctx) {
     if (meta)
       meta->sni_count = 0;
 
+    /* Cleared by xdp_apply_l4_rules if any matched rule carries a LOG / INSPECT
+     * / TAIL_CALL action; gates the policy verdict seed below. */
+    __u8 cacheable = 1;
     __u32 final_verdict = xdp_apply_l4_rules(ctx, stats, policy, &flow_key, t0,
                                              pkt_len, pkt_src_mac, pkt_dst_mac,
-                                             meta, &fc_rule_id
+                                             meta, &fc_rule_id, &cacheable
 #ifdef SURICATA_IPS
                                              ,
                                              &fv_key
@@ -1136,6 +1195,13 @@ int xdp_policy_main(struct xdp_md *ctx) {
     }
 
     XDP_RECORD_TIMING(t0);
+    /* Seed the policy verdict cache so every subsequent packet on this 5-tuple
+     * short-circuits at the verdict-cache check above instead of re-walking the
+     * two-level LPM trie.  Only for cacheable flows (pure PASS/DROP); LOG /
+     * INSPECT / SNI flows are excluded so they keep re-evaluating. */
+    if (cacheable)
+      xdp_policy_write_verdict(&flow_key, dropped ? ACTION_DROP : ACTION_PASS,
+                               fc_rule_id, t0, ctx->ingress_ifindex);
     if (final_verdict == XDP_PASS)
       goto fib_and_pass;
     FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, fc_rule_id, ACTION_DROP, final_verdict);
@@ -1146,6 +1212,12 @@ int xdp_policy_main(struct xdp_md *ctx) {
     __u32 *def_action = bpf_map_lookup_elem(&default_action, &ifidx);
     __u32 action = def_action ? *def_action : ACTION_PASS;
     update_action_stats(stats, action);
+
+    /* Seed the default verdict (rule_id 0) so unmatched flows also skip the LPM
+     * walk on subsequent packets.  Flushed on any rule change. */
+    xdp_policy_write_verdict(&flow_key,
+                             action == ACTION_DROP ? ACTION_DROP : ACTION_PASS,
+                             0, t0, ctx->ingress_ifindex);
 
     /* Return appropriate XDP verdict */
     XDP_RECORD_TIMING(t0);

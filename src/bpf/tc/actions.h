@@ -5,13 +5,18 @@
 
 /*
  * Process all actions for a matched rule in priority order
- * Returns the final TC verdict (TC_ACT_SHOT or TC_ACT_OK)
+ * Returns the final TC verdict (TC_ACT_SHOT or TC_ACT_OK).
+ *
+ * *cacheable is cleared to 0 if this rule carries any action that must run on
+ * every packet (LOG / INSPECT / TAIL_CALL); the caller only seeds the
+ * policy verdict cache when *cacheable survives all matched rules.  Mirrors
+ * process_rule_actions in src/bpf/xdp/actions.h.  Caller initialises it to 1.
  */
 static __always_inline int tc_process_rule_actions(struct __sk_buff *ctx,
                                                    struct global_stats *gs,
                                                    struct l4_rule *policy,
                                                    struct flow_key *flow_key,
-                                                   __u64 now_ns
+                                                   __u64 now_ns, __u8 *cacheable
 #ifdef SURICATA_IPS
                                                    ,
                                                    struct inspect_config *icfg
@@ -34,6 +39,8 @@ static __always_inline int tc_process_rule_actions(struct __sk_buff *ctx,
       stop_actions = 1; /* DROP stops further action processing */
       break;
     case ACTION_LOG: {
+      /* LOG rules must re-evaluate per packet — not cacheable. */
+      *cacheable = 0;
       __u64 param = policy->actions[i].param; /* rate-limit interval in ns */
       if (param > 0) {
         /* Rate limiting via tc_rule_stats.last_log_ns (no extra map needed).
@@ -59,6 +66,7 @@ static __always_inline int tc_process_rule_actions(struct __sk_buff *ctx,
         final_verdict = TC_ACT_OK;
       break;
     case ACTION_TAIL_CALL:
+      *cacheable = 0;
       if (policy->tail_call_idx < MAX_DISPATCHER_PROGS) {
         if (gs)
           gs->tail_calls++;
@@ -68,6 +76,8 @@ static __always_inline int tc_process_rule_actions(struct __sk_buff *ctx,
       break;
 #ifdef SURICATA_IPS
     case ACTION_INSPECT: {
+      /* INSPECT manages its own verdict lifecycle (IPS) — not policy-cacheable. */
+      *cacheable = 0;
       /* Egress INSPECT: mirror this flow to Suricata.
        *
        * The egress direction is client→server.  flows_to_inspect stores keys
@@ -88,23 +98,13 @@ static __always_inline int tc_process_rule_actions(struct __sk_buff *ctx,
       if (gs)
         gs->inspect_redirects++;
 
-      /* Reversed key (server→client) for flows_to_inspect */
-      struct flow_verdict_key fv_key = {};
-      if (flow_key->af == AF_INET) {
-        fv_key.saddr4 = flow_key->daddr4;
-        fv_key.daddr4 = flow_key->saddr4;
-      } else {
-        __builtin_memcpy(fv_key.saddr6, flow_key->daddr6, 16);
-        __builtin_memcpy(fv_key.daddr6, flow_key->saddr6, 16);
-      }
-      fv_key.sport = flow_key->dport;
-      fv_key.dport = flow_key->sport;
-      fv_key.protocol = flow_key->protocol;
-      fv_key.af = flow_key->af;
+      /* Reversed (server→client) ifindex-less key for flows_to_inspect */
+      struct flow_inspect_key fi_key = {};
+      flow_inspect_key_from_flow_reversed(&fi_key, flow_key);
 
       /* Single clock read for the expiry timestamp */
       __u64 expiry = bpf_ktime_get_ns() + INSPECT_CLONE_TTL_NS;
-      bpf_map_update_elem(&flows_to_inspect, &fv_key, &expiry, BPF_ANY);
+      bpf_map_update_elem(&flows_to_inspect, &fi_key, &expiry, BPF_ANY);
 
       /* Clone this egress packet to the mirror interface now */
       if (icfg->mirror_ifindex != 0)

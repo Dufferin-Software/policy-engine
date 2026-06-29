@@ -1015,6 +1015,10 @@ impl PolicyService {
             self.emit_rule_event("activated", rule_id, direction, None);
         }
 
+        // The rule is now live in the BPF maps; drop any cached policy verdicts
+        // for this direction so existing flows re-evaluate against the new rule.
+        self.invalidate_flow_verdicts(direction);
+
         Ok(OperationResult::success(format!(
             "Added rule {} with {} action(s)",
             rule_id, num_actions
@@ -1124,6 +1128,7 @@ impl PolicyService {
                                 rule_id, e
                             );
                         }
+                        self.invalidate_flow_verdicts(direction);
                     }
                     self.emit_rule_event(
                         "expired",
@@ -1150,6 +1155,7 @@ impl PolicyService {
                                 if let Some(m) = self.rule_registry.get_mut(rule_id) {
                                     m.state = RuleState::Inactive;
                                 }
+                                self.invalidate_flow_verdicts(direction);
                                 self.emit_rule_event(
                                     "deactivated",
                                     rule_id,
@@ -1172,6 +1178,7 @@ impl PolicyService {
                                 if let Some(m) = self.rule_registry.get_mut(rule_id) {
                                     m.state = RuleState::Active;
                                 }
+                                self.invalidate_flow_verdicts(direction);
                                 self.emit_rule_event(
                                     "activated",
                                     rule_id,
@@ -1259,6 +1266,13 @@ impl PolicyService {
                     });
                 }
             }
+        }
+
+        // Flush the verdict cache once for the whole batch (rather than per rule
+        // inside add_rule_inner) so existing flows re-evaluate against the new
+        // rules without paying the sweep cost on every inserted rule.
+        if results.iter().any(|r| r.success) {
+            self.invalidate_flow_verdicts(direction);
         }
 
         results
@@ -1649,6 +1663,7 @@ impl PolicyService {
                     // Remove from managed registry if present and cancel timer.
                     self.rule_registry.remove(rule_id);
                     self.send_timer_remove(rule_id);
+                    self.invalidate_flow_verdicts(direction);
                     self.emit_rule_event("deleted", rule_id, direction, None);
                     return Ok(OperationResult::success(format!(
                         "Deleted rule {}",
@@ -1676,6 +1691,7 @@ impl PolicyService {
                     // Remove from managed registry if present and cancel timer.
                     self.rule_registry.remove(rule_id);
                     self.send_timer_remove(rule_id);
+                    self.invalidate_flow_verdicts(direction);
                     self.emit_rule_event("deleted", rule_id, direction, None);
                     return Ok(OperationResult::success(format!(
                         "Deleted rule {}",
@@ -1755,6 +1771,9 @@ impl PolicyService {
                 }
             }
 
+            if deleted > 0 {
+                self.invalidate_flow_verdicts(direction);
+            }
             return Ok(OperationResult::success(format!(
                 "Deleted {} rule(s)",
                 deleted
@@ -1826,6 +1845,12 @@ impl PolicyService {
             self.emit_rule_event("deleted", rule_id, direction, Some("flush".into()));
         }
 
+        // Policy maps changed — drop cached (never-expiring) policy verdicts for
+        // this direction so flushed flows re-evaluate against the new map state.
+        if count > 0 {
+            self.invalidate_flow_verdicts(direction);
+        }
+
         info!(
             "Flushed {} {} rules on ifindex {}",
             count, direction, ifindex
@@ -1849,6 +1874,13 @@ impl PolicyService {
 
         self.bpf_ops
             .set_default_action(action, direction, ifindex)?;
+
+        // The plain policy fast path seeds a flow verdict for the default-action
+        // path too (rule_id 0; never time-expires). Changing the default action
+        // must therefore flush the verdict cache, exactly like a rule mutation —
+        // otherwise flows that hit the old default keep their cached verdict
+        // (e.g. a default DROP→PASS reset would leave stale DROP verdicts).
+        self.invalidate_flow_verdicts(direction);
 
         if let Err(e) = self
             .state_store
@@ -2233,6 +2265,29 @@ impl PolicyService {
         self.bpf_ops.get_flow_verdict_count(direction)
     }
 
+    /// Flush the BPF flow-verdict cache for `direction` after a policy change.
+    ///
+    /// The plain policy fast path caches PASS/DROP verdicts that never expire on
+    /// time (POLICY_VERDICT_EXPIRES_NS), so a stale entry would otherwise outlive
+    /// the rule set that produced it.  Every rule mutation that touches the BPF maps
+    /// (`add_rule`, `add_rules_batch`, `delete_rule`, schedule/TTL transitions in
+    /// `handle_timer_expiry`) calls this *after* the map write so packets
+    /// re-evaluate against the new policy.  Best-effort: a failure is logged, not
+    /// propagated, since the rule change itself already succeeded.
+    ///
+    /// Note: this iterates and deletes the whole per-direction cache (up to
+    /// MAX_FLOW_VERDICTS entries).  Fine for interactive single edits; a
+    /// per-rule-set generation counter checked in BPF would avoid the sweep if
+    /// bulk runtime edits over a hot cache ever become a bottleneck.
+    fn invalidate_flow_verdicts(&mut self, direction: Direction) {
+        if let Err(e) = self.clear_flow_verdicts(direction) {
+            warn!(
+                "failed to flush flow-verdict cache for {:?} after policy change: {:#}",
+                direction, e
+            );
+        }
+    }
+
     /// Clear all flow verdicts for a direction
     pub fn clear_flow_verdicts(&mut self, direction: Direction) -> Result<OperationResult> {
         self.ensure_direction_loaded(direction)?;
@@ -2332,6 +2387,11 @@ mod tests {
         #[cfg(feature = "suricata")]
         mock.expect_get_inspect_config()
             .returning(|_| Ok(InspectConfig::default()));
+        // Rule mutations now flush the flow-verdict cache (invalidate_flow_verdicts
+        // → clear_flow_verdicts). Default to an empty cache so the sweep is a
+        // no-op; tests that assert on cache contents set their own expectations.
+        mock.expect_list_flow_verdicts().returning(|_| Ok(vec![]));
+        mock.expect_delete_flow_verdict().returning(|_, _| Ok(()));
         mock
     }
 
@@ -3812,6 +3872,33 @@ mod tests {
         }
 
         #[test]
+        fn set_default_action_flushes_verdict_cache() {
+            // Changing the default action seeds/changes the default-path verdict
+            // (rule_id 0, never time-expires), so the cache MUST be flushed —
+            // otherwise a DROP→PASS reset leaves stale DROP verdicts in place.
+            // Build the mock by hand so we can assert the flush actually happens.
+            let mut mock = MockBpfOperations::new();
+            mock.expect_load_programs().returning(|| Ok(()));
+            #[cfg(feature = "suricata")]
+            mock.expect_get_inspect_config()
+                .returning(|_| Ok(InspectConfig::default()));
+            mock.expect_set_default_action()
+                .times(1)
+                .returning(|_, _, _| Ok(()));
+            // The flush: list then delete each verdict for the direction.
+            mock.expect_list_flow_verdicts()
+                .times(1)
+                .withf(|dir| *dir == Direction::Ingress)
+                .returning(|_| Ok(vec![]));
+            mock.expect_delete_flow_verdict().returning(|_, _| Ok(()));
+
+            let mut service = PolicyService::new(Box::new(mock));
+            let result =
+                service.set_default_action(PolicyAction::Pass, Direction::Ingress, 1, "lo");
+            assert!(result.is_ok());
+        }
+
+        #[test]
         fn test_register_tail_call_content_inspect_ingress() {
             let mut mock = create_mock_with_loaded_programs();
 
@@ -4559,7 +4646,15 @@ mod tests {
             // Duplicate-match check lists existing rules before each install.
             mock.expect_list_policy_rules_v4().returning(|_| Ok(vec![]));
             mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
+            expect_verdict_flush(&mut mock);
             mock
+        }
+
+        /// Rule mutations flush the flow-verdict cache (invalidate_flow_verdicts).
+        /// Add no-op expectations (empty cache) so inline mocks tolerate the sweep.
+        fn expect_verdict_flush(mock: &mut MockBpfOperations) {
+            mock.expect_list_flow_verdicts().returning(|_| Ok(vec![]));
+            mock.expect_delete_flow_verdict().returning(|_, _| Ok(()));
         }
 
         /// Helper: build a schedule window for "Mon 09:00–Mon 17:00 UTC".
@@ -4735,6 +4830,7 @@ mod tests {
                 .expect_delete_policy_rule_v4()
                 .returning(|_, _, _, _| Ok(()));
             mock2.expect_clear_rule_stats().returning(|_, _| Ok(()));
+            expect_verdict_flush(&mut mock2);
 
             // Mon 08:00 UTC — outside Mon 09:00–17:00
             let now = Utc.with_ymd_and_hms(2024, 1, 8, 8, 0, 0).unwrap();
@@ -4808,6 +4904,7 @@ mod tests {
             mock.expect_clear_rule_stats()
                 .times(1)
                 .returning(|_, _| Ok(()));
+            expect_verdict_flush(&mut mock);
 
             let now = Utc.with_ymd_and_hms(2024, 1, 8, 12, 0, 0).unwrap();
             let (tx, mut rx) = tokio::sync::broadcast::channel(16);
@@ -4869,6 +4966,7 @@ mod tests {
             // Out-of-window deactivation during add:
             mock.expect_list_policy_rules_v4().returning(|_| Ok(vec![]));
             mock.expect_list_policy_rules_v6().returning(|_| Ok(vec![]));
+            expect_verdict_flush(&mut mock);
 
             // Mon 08:00 UTC — outside Mon 09:00–17:00, so rule starts Inactive.
             let now = Utc.with_ymd_and_hms(2024, 1, 8, 8, 0, 0).unwrap();
@@ -4948,6 +5046,7 @@ mod tests {
                 .times(1)
                 .returning(|_, _, _, _| Ok(()));
             mock.expect_clear_rule_stats().returning(|_, _| Ok(()));
+            expect_verdict_flush(&mut mock);
 
             let now = Utc.with_ymd_and_hms(2024, 1, 8, 12, 0, 0).unwrap();
             let mut service =
@@ -5036,6 +5135,7 @@ mod tests {
             mock.expect_delete_policy_rule_v4()
                 .returning(|_, _, _, _| Ok(()));
             mock.expect_clear_rule_stats().returning(|_, _| Ok(()));
+            expect_verdict_flush(&mut mock);
 
             let now = Utc.with_ymd_and_hms(2024, 1, 8, 12, 0, 0).unwrap();
             let (tx, mut rx) = tokio::sync::broadcast::channel(16);

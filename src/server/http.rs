@@ -346,20 +346,39 @@ fn spawn_ips_enforcement_loop(state: Arc<AppState>) {
                                     expires_ns: now_ns + verdict_ttl_ns,
                                     packets: 0,
                                     bytes: 0,
+                                    rule_id: 0,
                                 };
-                                // Block the server→client direction (ingress).
-                                service
-                                    .update_flow_verdict(&key, &verdict, Direction::Ingress)
-                                    .ok();
-                                // Also block the client→server direction (egress).
+                                // The verdict cache is scoped per-interface
+                                // (flow_verdict_key.ifindex), but a Suricata alert
+                                // carries no ifindex. Install the DROP on every
+                                // attached interface for the matching direction so
+                                // the flow is blocked wherever it ingresses/egresses.
+                                // The interface set is tiny and stale entries are
+                                // LRU-reclaimed, so the spray is cheap.
+                                let interfaces = service.get_interfaces();
+                                // Ingress key blocks the server→client direction;
+                                // the reversed key blocks client→server on egress.
                                 let mut egress_key = key;
                                 egress_key.saddr.copy_from_slice(&key.daddr);
                                 egress_key.daddr.copy_from_slice(&key.saddr);
                                 egress_key.sport = key.dport;
                                 egress_key.dport = key.sport;
-                                service
-                                    .update_flow_verdict(&egress_key, &verdict, Direction::Egress)
-                                    .ok();
+                                for iface in &interfaces {
+                                    let ifindex = iface.ifindex as u32;
+                                    if iface.direction.eq_ignore_ascii_case("ingress") {
+                                        let mut k = key;
+                                        k.ifindex = ifindex;
+                                        service
+                                            .update_flow_verdict(&k, &verdict, Direction::Ingress)
+                                            .ok();
+                                    } else if iface.direction.eq_ignore_ascii_case("egress") {
+                                        let mut k = egress_key;
+                                        k.ifindex = ifindex;
+                                        service
+                                            .update_flow_verdict(&k, &verdict, Direction::Egress)
+                                            .ok();
+                                    }
+                                }
                             }
                         }
                     }

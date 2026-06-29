@@ -97,8 +97,8 @@ Parse L3 (IPv4 / IPv6) → update per-L3 stats
 Parse L4 (TCP / UDP / ICMP / QUIC detection)
     │
     ▼
-Check flow_verdict_cache (SNI fast-path + Suricata IPS/IDS)
-    │ Cache hit → apply cached verdict (PASS or DROP)
+Check flow_verdict_cache (per-flow fast-path: plain L4, SNI, Suricata IPS/IDS)
+    │ Cache hit → apply cached verdict (PASS or DROP), bump rule_stats, return
     │ Cache miss ↓
     ▼
 Two-level LPM lookup:
@@ -192,33 +192,84 @@ cached.
 
 ### Verdict cache
 
-After matching, the final action is written to `flow_verdict_cache` (XDP) /
-`tc_flow_verdict_cache` (TC), keyed by the captured 5-tuple:
+The cache is the per-flow fast path for **every** verdict source, not just the
+heavy matchers. After the first packet of a flow resolves its verdict, the
+action is written to `flow_verdict_cache` (XDP) / `tc_flow_verdict_cache` (TC),
+keyed by the captured 5-tuple:
 
 ```
 key       = FlowVerdictKey from the captured 5-tuple
-action    = final action after walking the rule's actions[]
+action    = final action (PASS / DROP)
+rule_id   = matched rule (0 for the default-action path / SNI / IPS)
 expires   = now + TTL
 direction = Ingress (XDP) or Egress (TC)
 ```
 
-Subsequent packets on the same flow hit the cache at the top of the pipeline
-and short-circuit straight to the cached verdict, so heavy matchers (SNI/QUIC,
-Suricata) run at most once per flow. TTLs:
+Three classes of writer populate it:
+
+1. **Plain policy (L3 prefix + L4 port)** — `xdp_policy_write_verdict` /
+   `tc_policy_write_verdict` seed the PASS/DROP from the two-level LPM walk (and
+   the per-interface default action) so that the **O(ancestors²) trie walk runs
+   at most once per flow**. This is the common case and the reason the cache
+   exists in non-IPS builds. Only *cacheable* flows are seeded — a rule carrying
+   a `LOG`, `INSPECT`, or `TAIL_CALL` action clears the `cacheable` flag in
+   `process_rule_actions` so those flows keep re-evaluating every packet
+   (per-packet logging, IPS mirroring). SNI rules go through the tail-call path
+   and are seeded there.
+2. **SNI inspectors** — `xdp_sni_inspect` / `tc_sni_inspect` (TCP) and
+   `process_quic_sample` (UDP/QUIC) after the ClientHello is matched.
+3. **Suricata IPS** — the EVE consumer writes DROP verdicts; the `INSPECT`
+   action seeds a short PASS so the flow isn't re-mirrored on every packet.
+
+On a hit the dataplane bumps the per-verdict `packets`/`bytes`, the global
+`verdict_pass`/`verdict_drop` and `policy_pass`/`policy_drops` counters, and —
+when `rule_id != 0` — `rule_stats[rule_id]` and the global `policy_matches`
+counter. So per-rule and per-action counters stay accurate per packet even
+though rule evaluation is skipped; a cached hit counts identically to a fresh
+LPM match. (`rule_id == 0` — the default-action path, or SNI/IPS verdicts —
+does not bump `rule_stats`/`policy_matches`, since no policy rule matched.)
+
+TTLs:
 
 | State | TTL | Set by |
 |-------|-----|--------|
-| SNI flow verdict (PASS / DROP, both transports) | 60 s | TCP: `tc_sni_inspect` action loop; UDP: `process_quic_sample` |
+| Plain policy verdict (PASS / DROP, incl. default action) | **never** (0) | `POLICY_VERDICT_EXPIRES_NS` |
+| SNI flow verdict (PASS / DROP, both transports) | 10 min | `SNI_VERDICT_TTL_NS` / `QUIC_VERDICT_TTL_NS` |
 | Suricata INSPECT initial PASS verdict | 30 s | `INSPECT_PASS_VERDICT_TTL_NS` |
 | Suricata flow entry in `flows_to_inspect` | 5 min | `INSPECT_CLONE_TTL_NS` |
 
-BPF HASH maps don't auto-expire, so the dataplane treats an expired hit as a
-miss and re-evaluates, but the stale entry persists until userspace deletes it.
-`FlowVerdictManager` (`flow_verdict_manager.rs`) is the evictor: a background
+Plain policy verdicts **never expire on time**: a PASS/DROP is a deterministic
+function of the 5-tuple and the current rule set, which is flushed from the cache
+the moment it changes (see below), and capacity is bounded by LRU eviction — so
+there is no time-based reason to drop them. SNI/QUIC verdicts *do* expire (10
+min) because they are keyed by the 5-tuple but decided by the SNI hostname, which
+is **not** part of the key: a reused 5-tuple (ephemeral-port reuse to a CDN /
+SAN-shared IP) can carry a different hostname on a later connection, and
+rule-change flushing does not cover that (the rules didn't change, the connection
+did). IPS/IDS verdicts keep short TTLs so Suricata re-inspects periodically.
+
+The cache maps are **`LRU_HASH`** (not plain `HASH`). With every flow seeded and
+plain policy verdicts never expiring, a plain hash would fill to
+`MAX_FLOW_VERDICTS` and reject new inserts; LRU instead evicts the
+least-recently-used entry under pressure (dead flows, which aren't being hit, go
+first). Eviction is always safe — an evicted flow simply pays one more LPM walk
+on its next packet, and the walk is the authoritative fallback.
+
+BPF maps don't auto-expire on time, so the dataplane still treats an expired hit
+as a miss and re-evaluates, and the stale entry persists until userspace deletes
+it. `FlowVerdictManager` (`flow_verdict_manager.rs`) is the evictor: a background
 sweep started in `http.rs` removes expired entries from both directions every
 30 s, using `CLOCK_MONOTONIC` to match the `bpf_ktime_get_ns()` `expires_ns`.
-It runs in **every build** — SNI/QUIC matching populates the cache even without
-the IPS (`suricata`) feature, so the cache always needs an evictor.
+It runs in **every build**.
+
+**Invalidation on rule change.** Because non-IPS verdicts are long-lived, any
+rule mutation must flush them or a stale verdict would outlive the rule set that
+produced it. `PolicyService::invalidate_flow_verdicts` (→ `clear_flow_verdicts`)
+is called after every BPF-map policy change — `add_rule`, `add_rules_batch`,
+`delete_rule`, and the TTL/schedule transitions in `handle_timer_expiry` — for
+the affected direction. (It sweeps the whole per-direction cache; a per-rule-set
+generation counter checked in BPF would avoid the sweep if bulk runtime edits
+over a hot cache ever become a bottleneck.)
 
 #### Inspecting the cache
 

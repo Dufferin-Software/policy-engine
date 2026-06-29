@@ -31,6 +31,7 @@ fn make_drop_verdict() -> FlowVerdict {
         expires_ns: 0,
         packets: 0,
         bytes: 0,
+        rule_id: 0,
     }
 }
 
