@@ -4,6 +4,7 @@
 import { useState } from 'react'
 import { useQuery, gql } from '@apollo/client'
 import { fmtBytes, fmtCount } from './types.ts'
+import { getProtocolName } from './protocolMappings.ts'
 
 // The flow verdict cache is live BPF state, so this query triggers an on-demand
 // request to the node's agent (not a read of the periodic metrics snapshot).
@@ -121,7 +122,7 @@ export default function NodeVerdictCache({ nodeId }: Props) {
                 >
                   <td className="px-3 py-0.5 text-gray-300 font-mono">{v.srcIp}:{v.srcPort}</td>
                   <td className="px-3 py-0.5 text-gray-300 font-mono">{v.dstIp}:{v.dstPort}</td>
-                  <td className="px-3 py-0.5 text-gray-400 uppercase">{v.protocol}</td>
+                  <td className="px-3 py-0.5 text-gray-400 uppercase">{getProtocolName(v.protocol)}</td>
                   <td className="px-3 py-0.5">
                     <span
                       className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${

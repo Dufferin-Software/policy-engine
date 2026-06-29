@@ -3,6 +3,7 @@
 
 import { useMutation, useQuery, gql } from '@apollo/client'
 import { RuleOutput, OperationResult, fmtBytes, fmtCount } from './types.ts'
+import { getProtocolName } from './protocolMappings.ts'
 
 const DELETE_RULE = gql`
   mutation DeleteRule($ruleId: ID!) {
@@ -228,7 +229,7 @@ export default function RuleList({ rules, direction, nodeId, interfaceName, onRe
               <td className="px-2 py-1 text-gray-400">
                 {r.srcPort ?? '*'}:{r.dstPort ?? '*'}
               </td>
-              <td className="px-2 py-1 text-gray-400">{r.protocol}</td>
+              <td className="px-2 py-1 text-gray-400 uppercase">{getProtocolName(r.protocol)}</td>
               <td className="px-2 py-1 text-gray-400">{r.sniPattern ?? '—'}</td>
               <td className="px-2 py-1 text-gray-500">
                 {r.srcMac || r.dstMac

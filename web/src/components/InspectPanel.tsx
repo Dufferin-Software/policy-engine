@@ -3,6 +3,7 @@
 
 import { useState, useRef, useEffect } from 'react'
 import { gql, useQuery, useMutation } from '@apollo/client'
+import { getProtocolName } from './protocolMappings'
 
 function Tooltip({ children, content }: { children: React.ReactNode; content: string }) {
   const [visible, setVisible] = useState(false)
@@ -905,7 +906,7 @@ export function InspectPanel() {
                       <td className="py-1 pr-3 text-blue-300">{v.dstIp}</td>
                       <td className="py-1 pr-3 text-gray-300">{v.srcPort}</td>
                       <td className="py-1 pr-3 text-gray-300">{v.dstPort}</td>
-                      <td className="py-1 pr-3 text-gray-300">{v.protocol}</td>
+                      <td className="py-1 pr-3 text-gray-300">{getProtocolName(v.protocol)}</td>
                       <td className="py-1 pr-3">
                         <span
                           className={`px-1.5 py-0.5 rounded text-xs font-semibold ${

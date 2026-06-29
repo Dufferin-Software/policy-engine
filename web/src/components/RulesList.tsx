@@ -6,6 +6,7 @@ import { useState } from 'react'
 import { getPortName } from './portMappings'
 import { isMulticast } from './netUtils'
 import { getIcmpTypeName, getIcmpCodeName } from './icmpMappings'
+import { getProtocolName } from './protocolMappings'
 
 const GET_RULES = gql`
   query GetRules($direction: GqlDirection!) {
@@ -242,7 +243,7 @@ function RuleRow({
         {rule.dstPrefix}
         {dstIsMc && <span title="Multicast" className="ml-1 text-xs text-yellow-400 font-bold">M</span>}
       </td>
-      <td className="py-2 px-2">{rule.protocol}</td>
+      <td className="py-2 px-2 uppercase">{getProtocolName(rule.protocol)}</td>
       <td className="py-2 px-2">
         {showPortNames ? (
           <>
