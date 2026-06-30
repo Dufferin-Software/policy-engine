@@ -111,7 +111,7 @@ impl ControllerClient {
         let q = r#"
             query ListNodes($status: String) {
                 nodes(status: $status) {
-                    id status label dmiUuid tpmBacked agentVersion lastSeen enrolledAt
+                    id status label hostname dmiUuid tpmBacked agentVersion lastSeen enrolledAt
                 }
             }
         "#;

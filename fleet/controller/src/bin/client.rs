@@ -935,13 +935,13 @@ fn print_table_nodes(nodes: &[Node]) {
 
     println!(
         "{:<65} {:<14} {:<20} {:<8} LAST-SEEN",
-        "ID", "STATUS", "LABEL", "TPM"
+        "ID", "STATUS", "HOSTNAME", "TPM"
     );
     println!("{}", &"-".repeat(120));
 
     for n in nodes {
         let status = n.status.as_deref().unwrap_or("?");
-        let label = n.label.as_deref().unwrap_or("—");
+        let hostname = n.hostname.as_deref().unwrap_or("—");
         let tpm = if n.tpm_backed.unwrap_or(false) {
             "yes"
         } else {
@@ -950,7 +950,7 @@ fn print_table_nodes(nodes: &[Node]) {
         let last_seen = n.last_seen.as_deref().unwrap_or("never");
         println!(
             "{:<65} {:<14} {:<20} {:<8} {}",
-            n.id, status, label, tpm, last_seen
+            n.id, status, hostname, tpm, last_seen
         );
     }
 }
@@ -990,25 +990,21 @@ fn print_table_rules(rules: &[Rule]) {
     }
 
     println!(
-        "{:<22} {:<20} {:<10} {:<8} {:<8} {:<18} {:<18} ACTIONS",
-        "ID", "INTERFACE", "DIRECTION", "PROTO", "DST-PORT", "SRC-CIDR", "DST-CIDR"
+        "{:<22} {:<20} {:<10} {:<26} CRITERIA",
+        "ID", "INTERFACE", "DIRECTION", "ACTIONS"
     );
     println!("{}", &"-".repeat(140));
 
     for r in rules {
         let iface = r.interface_name.as_deref().unwrap_or("?");
         let dir = r.direction.as_deref().unwrap_or("?");
-        let proto = r.protocol.as_deref().unwrap_or("any");
-        let dst_port = r
-            .dst_port
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "—".to_string());
-        let src_cidr = r.src_cidr.as_deref().unwrap_or("—");
-        let dst_cidr = r.dst_cidr.as_deref().unwrap_or("—");
-        let actions = r.actions_json.as_deref().unwrap_or("[]");
         println!(
-            "{:<22} {:<20} {:<10} {:<8} {:<8} {:<18} {:<18} {}",
-            r.id, iface, dir, proto, dst_port, src_cidr, dst_cidr, actions
+            "{:<22} {:<20} {:<10} {:<26} {}",
+            r.id,
+            iface,
+            dir,
+            r.actions_summary(),
+            r.criteria()
         );
     }
 }

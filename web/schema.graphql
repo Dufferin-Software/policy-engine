@@ -220,6 +220,39 @@ type BatchRuleResult {
 }
 
 """
+Input for configuring IPFIX flow export
+"""
+input ConfigureFlowExportInput {
+	"""
+	Enable or disable IPFIX flow export
+	"""
+	enabled: Boolean!
+	"""
+	Collector hostname or IP address (default: "127.0.0.1")
+	"""
+	collectorHost: String = null
+	"""
+	Collector UDP port (default: 4739)
+	"""
+	collectorPort: Int = null
+	"""
+	Idle timeout in seconds: export a flow after this many seconds of inactivity (default: 15)
+	"""
+	idleTimeoutS: Int = null
+	"""
+	Active timeout in seconds: export a long-running flow after this many seconds (default: 60)
+	"""
+	activeTimeoutS: Int = null
+}
+
+"""
+Input for configuring inspect mode
+"""
+input ConfigureInspectInput {
+	mode: GqlInspectMode!
+}
+
+"""
 Input for configuring the stop-behavior setting.
 """
 input ConfigureStopBehaviorInput {
@@ -257,6 +290,18 @@ type CpuAffinityStatus {
 }
 
 """
+A custom Suricata rules file deployed to the policy-engine rules directory
+"""
+type CustomRuleFileOutput {
+	filename: String!
+	ruleCount: Int!
+	"""
+	Individual rule lines (non-empty, non-comment lines)
+	"""
+	rules: [String!]!
+}
+
+"""
 Config input for default action
 """
 input DefaultActionInput {
@@ -269,6 +314,14 @@ input DefaultActionInput {
 	Traffic direction: INGRESS or EGRESS
 	"""
 	direction: GqlDirection!
+}
+
+"""
+Input for deleting custom Suricata rules by SID
+"""
+input DeleteCustomRulesInput {
+	filename: String!
+	sids: [Int!]!
 }
 
 """
@@ -286,27 +339,15 @@ input DeleteRuleInput {
 	"""
 	Rule ID to delete (ID scalar accepts string or int)
 	"""
-	id: ID
-	"""
-	Source IP/CIDR
-	"""
-	src: String
-	"""
-	Destination IP/CIDR
-	"""
-	dst: String
-	"""
-	Source port
-	"""
-	sport: Int
-	"""
-	Destination port
-	"""
-	dport: Int
-	"""
-	Protocol
-	"""
-	protocol: String
+	id: ID!
+}
+
+"""
+Input for deploying Suricata rules
+"""
+input DeploySuricataRulesInput {
+	rules: String!
+	filename: String! = "custom.rules"
 }
 
 """
@@ -342,29 +383,22 @@ type FibForwardingEntry {
 }
 
 """
-uRPF (unicast Reverse Path Forwarding) mode for an interface. uRPF is
-ingress-only (XDP); it can never be enabled on egress.
+IPFIX flow export status
 """
-enum UrpfMode {
-	OFF
-	LOOSE
-	STRICT
-}
-
-"""
-Input for setting the uRPF mode on a single ingress interface.
-"""
-input SetUrpfInput {
-	interface: String!
-	mode: UrpfMode!
-}
-
-"""
-uRPF mode for a single interface (only interfaces with uRPF enabled).
-"""
-type UrpfEntry {
-	interface: String!
-	mode: UrpfMode!
+type FlowExportStatus {
+	enabled: Boolean!
+	collectorHost: String!
+	collectorPort: Int!
+	idleTimeoutS: Int!
+	activeTimeoutS: Int!
+	"""
+	Total number of flows exported since the server started
+	"""
+	flowsExportedTotal: Int!
+	"""
+	Current number of entries in the XDP + TC flow cache maps
+	"""
+	activeFlowCount: Int!
 }
 
 """
@@ -455,6 +489,18 @@ enum GqlDirection {
 }
 
 """
+Inspect mode for GraphQL
+"""
+enum GqlInspectMode {
+	DISABLED
+	IPS
+	"""
+	IDS: clone traffic to Suricata for alerting; no DROP verdicts installed
+	"""
+	IDS
+}
+
+"""
 Policy action enum for GraphQL
 """
 enum GqlPolicyAction {
@@ -465,6 +511,10 @@ enum GqlPolicyAction {
 	Internal action: triggers a tail call for further processing
 	"""
 	TAIL_CALL
+	"""
+	Inspect action: mirrors packet to Suricata for IPS analysis
+	"""
+	INSPECT
 }
 
 """
@@ -475,6 +525,36 @@ enum GqlProtocol {
 	TCP
 	UDP
 	ICMP
+}
+
+"""
+Inspect status output
+"""
+type InspectStatusOutput {
+	mode: GqlInspectMode!
+	suricataRunning: Boolean!
+	"""
+	Local veth endpoint (pe-inspect0) — XDP redirects packets here
+	"""
+	mirrorInterface: String
+	mirrorIfindex: Int
+	"""
+	Peer veth endpoint (pe-inspect1) — Suricata listens on this via AF-XDP
+	"""
+	peerInterface: String
+	flowVerdictCount: Int!
+	"""
+	Suricata binary version string
+	"""
+	suricataVersion: String
+	"""
+	Ruleset version/timestamp from suricata-update
+	"""
+	rulesetVersion: String
+	"""
+	Custom rule files deployed to the policy-engine rules directory
+	"""
+	customRuleFiles: [CustomRuleFileOutput!]!
 }
 
 """
@@ -595,9 +675,7 @@ type MutationRoot {
 	"""
 	deleteRules(rules: [DeleteRuleInput!]!): BatchDeleteRulesResult!
 	"""
-	Delete a policy rule
-	
-	Can delete by ID or by source CIDR
+	Delete a policy rule by ID.
 	"""
 	deleteRule(input: DeleteRuleInput!): OperationResult!
 	"""
@@ -616,16 +694,25 @@ type MutationRoot {
 	Enable or disable XDP FIB forwarding (line-rate packet forwarding via bpf_fib_lookup)
 	"""
 	setFibForwarding(input: SetFibForwardingInput!): OperationResult!
+	"""
+	Set the uRPF (unicast Reverse Path Forwarding) mode on a single ingress
+	interface. uRPF is ingress-only (XDP); enabling it on an interface
+	without XDP attached (e.g. a TC egress interface) is rejected.
+	"""
 	setUrpf(input: SetUrpfInput!): OperationResult!
 	"""
 	Set the stop behavior for the policy engine daemon.
 	
 	`input.stop_behavior` must be "clear-state" or "preserve-state".
-	"clear-state": detach all BPF programs and remove pinned maps on shutdown.
-	"preserve-state" (default): leave programs attached and maps in the kernel (traffic
+	"clear-state" (default): detach all BPF programs and remove pinned maps on shutdown.
+	"preserve-state": leave programs attached and maps in the kernel (traffic
 	enforcement continues while the daemon is not running).
 	"""
 	configureStopBehavior(input: ConfigureStopBehaviorInput!): OperationResult!
+	"""
+	Enable or disable IPFIX flow export and set collector parameters
+	"""
+	configureFlowExport(input: ConfigureFlowExportInput!): OperationResult!
 	"""
 	Clear global statistics for an interface
 	"""
@@ -651,9 +738,56 @@ type MutationRoot {
 	"""
 	clearAllStats: OperationResult!
 	"""
+	Configure inspect/IPS mode
+	"""
+	configureInspect(input: ConfigureInspectInput!): OperationResult!
+	"""
+	Disable inspect/IPS mode
+	"""
+	disableInspect: OperationResult!
+	"""
+	Deploy Suricata rules to the rules directory
+	"""
+	deploySuricataRules(input: DeploySuricataRulesInput!): OperationResult!
+	"""
+	Reload Suricata rules
+	"""
+	reloadSuricataRules: OperationResult!
+	"""
+	Write the AF-XDP Suricata config and systemd drop-in, then restart
+	
+	Derives the interface from the current veth pair (pe-inspect1).
+	Requires that the veth pair already exists (call configureInspect first).
+	"""
+	applySuricataConfig: OperationResult!
+	"""
+	Start the Suricata systemd service
+	"""
+	startSuricata: OperationResult!
+	"""
+	Stop the Suricata systemd service
+	"""
+	stopSuricata: OperationResult!
+	"""
 	Clear flow verdicts for a direction
 	"""
 	clearFlowVerdicts(direction: GqlDirection!): OperationResult!
+	"""
+	Add a single custom Suricata rule to a rules file
+	"""
+	addCustomRule(filename: String!, rule: String!): OperationResult!
+	"""
+	Delete custom Suricata rules by SID from a rules file
+	"""
+	deleteCustomRules(input: DeleteCustomRulesInput!): OperationResult!
+	"""
+	Delete an entire custom Suricata rules file
+	"""
+	deleteRuleFile(filename: String!): OperationResult!
+	"""
+	Delete all custom Suricata rule files from the policy-engine rules directory
+	"""
+	deleteAllCustomRules: OperationResult!
 }
 
 """
@@ -728,7 +862,15 @@ type QueryRoot {
 	List per-interface XDP FIB forwarding state.
 	"""
 	fibForwarding: [FibForwardingEntry!]!
+	"""
+	List per-interface uRPF (unicast Reverse Path Forwarding) mode.
+	Only interfaces with uRPF enabled are returned.
+	"""
 	urpf: [UrpfEntry!]!
+	"""
+	IPFIX flow export status and configuration
+	"""
+	flowExportStatus: FlowExportStatus!
 	"""
 	List all attached interfaces
 	"""
@@ -772,17 +914,25 @@ type QueryRoot {
 	"""
 	managedRules(direction: GqlDirection!): [ManagedRuleOutput!]!
 	"""
+	Get inspect/IPS status
+	"""
+	inspectStatus: InspectStatusOutput!
+	"""
 	Get flow verdict statistics for a direction
 	"""
 	flowVerdicts(direction: GqlDirection!): FlowVerdictStatsOutput!
 	"""
 	List individual flow verdict entries for a direction.
-
+	
 	Entries are returned soonest-expiring first and capped at `limit`
 	(default 1000) to bound the response — the cache can hold tens of
 	thousands of entries per direction.
 	"""
 	flowVerdictList(direction: GqlDirection!, limit: Int): [FlowVerdictOutput!]!
+	"""
+	Get Suricata service status
+	"""
+	suricataStatus: OperationResult!
 	"""
 	Get performance statistics (timing histogram, per-protocol stats, bandwidth)
 	"""
@@ -907,6 +1057,14 @@ input SetFibForwardingInput {
 }
 
 """
+Input for setting the uRPF mode on a single ingress interface.
+"""
+input SetUrpfInput {
+	interface: String!
+	mode: UrpfMode!
+}
+
+"""
 Output type for the current stop-behavior setting.
 """
 type StopBehavior {
@@ -938,6 +1096,24 @@ type TimingStatsOutput {
 	p999Ns: Int!
 	totalSamples: Int!
 	buckets: [Int!]!
+}
+
+"""
+uRPF mode for a single interface (only interfaces with uRPF enabled).
+"""
+type UrpfEntry {
+	interface: String!
+	mode: UrpfMode!
+}
+
+"""
+uRPF (unicast Reverse Path Forwarding) mode for an interface.
+uRPF is ingress-only (XDP); it can never be enabled on egress.
+"""
+enum UrpfMode {
+	OFF
+	LOOSE
+	STRICT
 }
 
 """

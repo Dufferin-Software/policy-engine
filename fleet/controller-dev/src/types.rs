@@ -47,6 +47,125 @@ pub struct Rule {
     pub created_by: Option<String>,
 }
 
+impl Rule {
+    /// A `Display`-able, compact summary of this rule's match criteria,
+    /// e.g. `tcp dst:443 sni:*.example.com`. Catch-all CIDRs (`0.0.0.0/0`,
+    /// `::/0`) are omitted since they match anything.
+    pub fn criteria(&self) -> RuleCriteria<'_> {
+        RuleCriteria(self)
+    }
+
+    /// A human-readable rendering of this rule's actions, ordered by
+    /// priority, e.g. `log, drop` or `log(rate:500ms), drop`. Falls back to
+    /// the raw JSON if it cannot be parsed.
+    pub fn actions_summary(&self) -> String {
+        let raw = match self.actions_json.as_deref() {
+            Some(s) => s,
+            None => return "—".to_string(),
+        };
+        let mut actions: Vec<RuleActionJson> = match serde_json::from_str(raw) {
+            Ok(a) => a,
+            Err(_) => return raw.to_string(),
+        };
+        if actions.is_empty() {
+            return "—".to_string();
+        }
+        actions.sort_by_key(|a| a.priority);
+        actions
+            .iter()
+            .map(RuleActionJson::summary)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// One entry in a rule's `actions_json` array.
+#[derive(Debug, Clone, Deserialize)]
+struct RuleActionJson {
+    action: String,
+    #[serde(default)]
+    param: i64,
+    #[serde(default)]
+    priority: i64,
+}
+
+impl RuleActionJson {
+    fn summary(&self) -> String {
+        let name = self.action.to_ascii_lowercase();
+        // For LOG, `param` is the rate-limit interval in milliseconds
+        // (0 = unlimited); surface it so operators can see throttling.
+        if name == "log" && self.param > 0 {
+            format!("log(rate:{}ms)", self.param)
+        } else {
+            name
+        }
+    }
+}
+
+/// Borrowed view over a [`Rule`]'s match criteria, rendered by its
+/// [`Display`](std::fmt::Display) impl as a compact human-readable summary.
+pub struct RuleCriteria<'a>(&'a Rule);
+
+impl std::fmt::Display for RuleCriteria<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let r = self.0;
+        let mut parts: Vec<String> = Vec::new();
+
+        if let Some(proto) = r.protocol.as_deref() {
+            if !proto.is_empty() && !proto.eq_ignore_ascii_case("any") {
+                parts.push(proto.to_ascii_lowercase());
+            }
+        }
+        if let Some(cidr) = r.src_cidr.as_deref() {
+            if !is_any_cidr(cidr) {
+                parts.push(format!("src:{cidr}"));
+            }
+        }
+        if let Some(cidr) = r.dst_cidr.as_deref() {
+            if !is_any_cidr(cidr) {
+                parts.push(format!("dst:{cidr}"));
+            }
+        }
+        if let Some(p) = r.src_port {
+            parts.push(format!("sport:{p}"));
+        }
+        if let Some(p) = r.dst_port {
+            parts.push(format!("dport:{p}"));
+        }
+        if let Some(sni) = r.sni_pattern.as_deref() {
+            if !sni.is_empty() {
+                parts.push(format!("sni:{sni}"));
+            }
+        }
+        if let Some(q) = r.quic_version.as_deref() {
+            if !q.is_empty() {
+                parts.push(format!("quic:{q}"));
+            }
+        }
+        if let Some(m) = r.src_mac.as_deref() {
+            if !m.is_empty() {
+                parts.push(format!("smac:{m}"));
+            }
+        }
+        if let Some(m) = r.dst_mac.as_deref() {
+            if !m.is_empty() {
+                parts.push(format!("dmac:{m}"));
+            }
+        }
+
+        if parts.is_empty() {
+            write!(f, "any")
+        } else {
+            write!(f, "{}", parts.join(" "))
+        }
+    }
+}
+
+/// Whether `cidr` matches every address (`0.0.0.0/0` or `::/0`).
+fn is_any_cidr(cidr: &str) -> bool {
+    matches!(cidr.trim(), "0.0.0.0/0" | "::/0")
+}
+
 /// A network interface discovered on a node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -171,4 +290,82 @@ pub struct CreateRuleMultiNodeInput {
     pub quic_version: Option<String>,
     pub src_mac: Option<String>,
     pub dst_mac: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blank_rule() -> Rule {
+        Rule {
+            id: "1".into(),
+            node_id: None,
+            interface_name: None,
+            direction: None,
+            protocol: None,
+            src_cidr: None,
+            dst_cidr: None,
+            src_port: None,
+            dst_port: None,
+            sni_pattern: None,
+            quic_version: None,
+            src_mac: None,
+            dst_mac: None,
+            actions_json: None,
+            created_at: None,
+            created_by: None,
+        }
+    }
+
+    #[test]
+    fn criteria_omits_catch_all_cidrs_and_any_proto() {
+        let mut r = blank_rule();
+        r.protocol = Some("tcp".into());
+        r.src_cidr = Some("0.0.0.0/0".into());
+        r.dst_cidr = Some("::/0".into());
+        r.dst_port = Some(443);
+        assert_eq!(r.criteria().to_string(), "tcp dport:443");
+
+        r.protocol = Some("any".into());
+        r.dst_port = None;
+        r.src_cidr = None;
+        r.dst_cidr = None;
+        assert_eq!(r.criteria().to_string(), "any");
+    }
+
+    #[test]
+    fn criteria_includes_sni_and_specific_cidr() {
+        let mut r = blank_rule();
+        r.protocol = Some("TCP".into());
+        r.dst_port = Some(443);
+        r.sni_pattern = Some("*.example.com".into());
+        r.dst_cidr = Some("10.0.0.0/8".into());
+        assert_eq!(
+            r.criteria().to_string(),
+            "tcp dst:10.0.0.0/8 dport:443 sni:*.example.com"
+        );
+    }
+
+    #[test]
+    fn actions_summary_orders_by_priority_and_shows_log_rate() {
+        let mut r = blank_rule();
+        r.actions_json = Some(
+            r#"[{"action":"drop","param":0,"priority":1},{"action":"log","param":500,"priority":0}]"#
+                .into(),
+        );
+        assert_eq!(r.actions_summary(), "log(rate:500ms), drop");
+    }
+
+    #[test]
+    fn actions_summary_handles_empty_and_invalid() {
+        let mut r = blank_rule();
+        r.actions_json = Some("[]".into());
+        assert_eq!(r.actions_summary(), "—");
+
+        r.actions_json = None;
+        assert_eq!(r.actions_summary(), "—");
+
+        r.actions_json = Some("not json".into());
+        assert_eq!(r.actions_summary(), "not json");
+    }
 }

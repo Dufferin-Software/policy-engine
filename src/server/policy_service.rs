@@ -197,11 +197,9 @@ pub struct AddRuleParams {
 #[derive(Debug, Clone)]
 pub struct DeleteRuleParams {
     pub direction: Direction,
-    /// Interface index the rule is scoped to. Required for delete-by-src; for
-    /// delete-by-id the ifindex is rediscovered from the stored src_key.
-    pub ifindex: u32,
-    pub id: Option<u64>,
-    pub src: Option<String>,
+    /// ID of the rule to delete.  Rules are deleted by ID only; the interface
+    /// the rule is scoped to is rediscovered from the stored src_key.
+    pub id: u64,
 }
 
 /// Result for a single rule in a batch operation
@@ -302,6 +300,12 @@ impl PolicyService {
             timer_tx: None,
             forwarding: default_forwarding_control(),
         }
+    }
+
+    /// Borrow the underlying state store (test-only, for asserting persistence).
+    #[cfg(test)]
+    pub(crate) fn state_store_for_test(&self) -> &dyn StateStore {
+        self.state_store.as_ref()
     }
 
     /// Restore attachments, default actions, and rules from the state store.
@@ -1637,150 +1641,92 @@ impl PolicyService {
         Ok(None)
     }
 
-    /// Delete a policy rule by ID or source CIDR
+    /// Delete a policy rule by ID.
     pub fn delete_rule(&mut self, params: DeleteRuleParams) -> Result<OperationResult> {
         let direction = params.direction;
+        let rule_id = params.id;
         self.ensure_direction_loaded(direction)?;
 
-        // Delete by ID - find the rule and delete it
-        if let Some(rule_id) = params.id {
-            // Search IPv4 rules
-            let v4_rules = self.bpf_ops.list_policy_rules_v4(direction)?;
+        // Search IPv4 rules
+        let v4_rules = self.bpf_ops.list_policy_rules_v4(direction)?;
 
-            for (src_key, dst_key, rule) in &v4_rules {
-                if rule.rule_id == rule_id {
-                    self.bpf_ops
-                        .delete_policy_rule_v4(src_key, dst_key, rule_id, direction)?;
-                    if rule.sni_match_type != crate::types::SNI_MATCH_NONE {
-                        let _ = self.bpf_ops.delete_sni_rule(rule_id, direction);
-                    }
-                    if rule.mac_match_flags != 0 {
-                        let _ = self.bpf_ops.delete_mac_rule(rule_id, direction);
-                    }
-                    if let Err(e) = self.bpf_ops.clear_rule_stats(rule_id, direction) {
-                        warn!("Failed to clear rule {} stats on delete: {:#}", rule_id, e);
-                    }
-                    // Remove from managed registry if present and cancel timer.
-                    self.rule_registry.remove(rule_id);
-                    self.send_timer_remove(rule_id);
-                    self.invalidate_flow_verdicts(direction);
-                    self.emit_rule_event("deleted", rule_id, direction, None);
-                    return Ok(OperationResult::success(format!(
-                        "Deleted rule {}",
-                        rule_id
-                    )));
+        for (src_key, dst_key, rule) in &v4_rules {
+            if rule.rule_id == rule_id {
+                self.bpf_ops
+                    .delete_policy_rule_v4(src_key, dst_key, rule_id, direction)?;
+                if rule.sni_match_type != crate::types::SNI_MATCH_NONE {
+                    let _ = self.bpf_ops.delete_sni_rule(rule_id, direction);
                 }
-            }
-
-            // Search IPv6 rules
-            let v6_rules = self.bpf_ops.list_policy_rules_v6(direction)?;
-
-            for (src_key, dst_key, rule) in &v6_rules {
-                if rule.rule_id == rule_id {
-                    self.bpf_ops
-                        .delete_policy_rule_v6(src_key, dst_key, rule_id, direction)?;
-                    if rule.sni_match_type != crate::types::SNI_MATCH_NONE {
-                        let _ = self.bpf_ops.delete_sni_rule(rule_id, direction);
-                    }
-                    if rule.mac_match_flags != 0 {
-                        let _ = self.bpf_ops.delete_mac_rule(rule_id, direction);
-                    }
-                    if let Err(e) = self.bpf_ops.clear_rule_stats(rule_id, direction) {
-                        warn!("Failed to clear rule {} stats on delete: {:#}", rule_id, e);
-                    }
-                    // Remove from managed registry if present and cancel timer.
-                    self.rule_registry.remove(rule_id);
-                    self.send_timer_remove(rule_id);
-                    self.invalidate_flow_verdicts(direction);
-                    self.emit_rule_event("deleted", rule_id, direction, None);
-                    return Ok(OperationResult::success(format!(
-                        "Deleted rule {}",
-                        rule_id
-                    )));
+                if rule.mac_match_flags != 0 {
+                    let _ = self.bpf_ops.delete_mac_rule(rule_id, direction);
                 }
-            }
-
-            // The rule might be in the registry but currently inactive (not in BPF maps).
-            if self.rule_registry.remove(rule_id).is_some() {
+                if let Err(e) = self.bpf_ops.clear_rule_stats(rule_id, direction) {
+                    warn!("Failed to clear rule {} stats on delete: {:#}", rule_id, e);
+                }
+                // Drop the persisted copy so the rule does not reappear
+                // after a restart.
+                if let Err(e) = self.state_store.delete_rule(rule_id) {
+                    warn!("state_store: failed to remove rule {}: {:#}", rule_id, e);
+                }
+                // Remove from managed registry if present and cancel timer.
+                self.rule_registry.remove(rule_id);
                 self.send_timer_remove(rule_id);
+                self.invalidate_flow_verdicts(direction);
                 self.emit_rule_event("deleted", rule_id, direction, None);
                 return Ok(OperationResult::success(format!(
                     "Deleted rule {}",
                     rule_id
                 )));
             }
-
-            return Err(anyhow!("Rule {} not found", rule_id));
         }
 
-        // Delete by source CIDR - delete all rules sharing that source prefix
-        if let Some(src_str) = params.src {
-            let src_net: ipnetwork::IpNetwork = src_str
-                .parse()
-                .map_err(|e| anyhow!("Invalid source CIDR: {}", e))?;
+        // Search IPv6 rules
+        let v6_rules = self.bpf_ops.list_policy_rules_v6(direction)?;
 
-            let mut deleted = 0u32;
-            match src_net {
-                ipnetwork::IpNetwork::V4(s) => {
-                    let target = SrcLpmKeyV4::new(params.ifindex, s.network(), s.prefix());
-                    let rules = self.bpf_ops.list_policy_rules_v4(direction)?;
-                    for (src_key, dst_key, rule) in rules {
-                        if src_key.ifindex == target.ifindex
-                            && src_key.prefixlen == target.prefixlen
-                            && src_key.addr == target.addr
-                        {
-                            let rid = rule.rule_id;
-                            self.bpf_ops
-                                .delete_policy_rule_v4(&src_key, &dst_key, rid, direction)?;
-                            if rule.sni_match_type != crate::types::SNI_MATCH_NONE {
-                                let _ = self.bpf_ops.delete_sni_rule(rid, direction);
-                            }
-                            if rule.mac_match_flags != 0 {
-                                let _ = self.bpf_ops.delete_mac_rule(rid, direction);
-                            }
-                            if let Err(e) = self.bpf_ops.clear_rule_stats(rid, direction) {
-                                warn!("Failed to clear rule {} stats on delete: {:#}", rid, e);
-                            }
-                            deleted += 1;
-                        }
-                    }
+        for (src_key, dst_key, rule) in &v6_rules {
+            if rule.rule_id == rule_id {
+                self.bpf_ops
+                    .delete_policy_rule_v6(src_key, dst_key, rule_id, direction)?;
+                if rule.sni_match_type != crate::types::SNI_MATCH_NONE {
+                    let _ = self.bpf_ops.delete_sni_rule(rule_id, direction);
                 }
-                ipnetwork::IpNetwork::V6(s) => {
-                    let target = SrcLpmKeyV6::new(params.ifindex, s.network(), s.prefix());
-                    let rules = self.bpf_ops.list_policy_rules_v6(direction)?;
-                    for (src_key, dst_key, rule) in rules {
-                        if src_key.ifindex == target.ifindex
-                            && src_key.prefixlen == target.prefixlen
-                            && src_key.addr == target.addr
-                        {
-                            let rid = rule.rule_id;
-                            self.bpf_ops
-                                .delete_policy_rule_v6(&src_key, &dst_key, rid, direction)?;
-                            if rule.sni_match_type != crate::types::SNI_MATCH_NONE {
-                                let _ = self.bpf_ops.delete_sni_rule(rid, direction);
-                            }
-                            if rule.mac_match_flags != 0 {
-                                let _ = self.bpf_ops.delete_mac_rule(rid, direction);
-                            }
-                            if let Err(e) = self.bpf_ops.clear_rule_stats(rid, direction) {
-                                warn!("Failed to clear rule {} stats on delete: {:#}", rid, e);
-                            }
-                            deleted += 1;
-                        }
-                    }
+                if rule.mac_match_flags != 0 {
+                    let _ = self.bpf_ops.delete_mac_rule(rule_id, direction);
                 }
-            }
-
-            if deleted > 0 {
+                if let Err(e) = self.bpf_ops.clear_rule_stats(rule_id, direction) {
+                    warn!("Failed to clear rule {} stats on delete: {:#}", rule_id, e);
+                }
+                // Drop the persisted copy so the rule does not reappear
+                // after a restart.
+                if let Err(e) = self.state_store.delete_rule(rule_id) {
+                    warn!("state_store: failed to remove rule {}: {:#}", rule_id, e);
+                }
+                // Remove from managed registry if present and cancel timer.
+                self.rule_registry.remove(rule_id);
+                self.send_timer_remove(rule_id);
                 self.invalidate_flow_verdicts(direction);
+                self.emit_rule_event("deleted", rule_id, direction, None);
+                return Ok(OperationResult::success(format!(
+                    "Deleted rule {}",
+                    rule_id
+                )));
             }
+        }
+
+        // The rule might be in the registry but currently inactive (not in BPF maps).
+        if self.rule_registry.remove(rule_id).is_some() {
+            self.send_timer_remove(rule_id);
+            if let Err(e) = self.state_store.delete_rule(rule_id) {
+                warn!("state_store: failed to remove rule {}: {:#}", rule_id, e);
+            }
+            self.emit_rule_event("deleted", rule_id, direction, None);
             return Ok(OperationResult::success(format!(
-                "Deleted {} rule(s)",
-                deleted
+                "Deleted rule {}",
+                rule_id
             )));
         }
 
-        Err(anyhow!("Must specify either id or src"))
+        Err(anyhow!("Rule {} not found", rule_id))
     }
 
     /// Flush all rules scoped to a single interface+direction.
@@ -3467,10 +3413,8 @@ mod tests {
             let mut service = PolicyService::new(Box::new(mock));
 
             let params = DeleteRuleParams {
-                ifindex: 0,
                 direction: Direction::Ingress,
-                id: Some(12345),
-                src: None,
+                id: 12345,
             };
 
             let result = service.delete_rule(params);
@@ -3479,6 +3423,65 @@ mod tests {
             let op_result = result.unwrap();
             assert!(op_result.success);
             assert!(op_result.message.contains("12345"));
+        }
+
+        #[test]
+        fn test_delete_rule_by_id_removes_persisted_state() {
+            use crate::server::state_store::InMemoryStateStore;
+
+            let mut mock = create_mock_with_loaded_programs();
+
+            let key = SrcLpmKeyV4::new(0, "192.168.1.0".parse::<Ipv4Addr>().unwrap(), 24);
+            let entry = create_test_lpm_entry(12345, PolicyAction::Drop);
+
+            mock.expect_list_policy_rules_v4()
+                .times(1)
+                .return_once(move |_| Ok(vec![(key, LpmKeyV4::any(), entry)]));
+            mock.expect_delete_policy_rule_v4()
+                .times(1)
+                .returning(|_, _, _, _| Ok(()));
+            mock.expect_clear_rule_stats()
+                .times(1)
+                .returning(|_, _| Ok(()));
+
+            // Seed the persisted state with the rule we are about to delete.
+            let store = InMemoryStateStore::new();
+            let params = AddRuleParams {
+                ifindex: 0,
+                direction: Direction::Ingress,
+                id: Some(12345),
+                src: Some("192.168.1.0/24".to_string()),
+                dst: Some("10.0.0.0/8".to_string()),
+                sport: 0,
+                dport: 80,
+                protocol: "tcp".to_string(),
+                actions: vec![(PolicyAction::Drop, 0, ActionParams::None)],
+                sni: None,
+                quic_version: 0,
+                src_mac: None,
+                dst_mac: None,
+                expires_after_secs: None,
+                schedule: None,
+            };
+            store.save_rule(12345, &params).unwrap();
+            assert_eq!(store.load_rules().unwrap().len(), 1);
+
+            let mut service =
+                PolicyService::new_with_state(Box::new(mock), Box::new(store), false, false);
+
+            let result = service.delete_rule(DeleteRuleParams {
+                direction: Direction::Ingress,
+                id: 12345,
+            });
+            assert!(result.is_ok());
+
+            // The persisted copy must be removed so the rule does not reappear
+            // after a daemon restart (regression: delete_rule used to skip this).
+            assert!(service
+                .state_store_for_test()
+                .load_rules()
+                .unwrap()
+                .is_empty());
         }
 
         #[test]
@@ -3506,10 +3509,8 @@ mod tests {
             let mut service = PolicyService::new(Box::new(mock));
 
             let params = DeleteRuleParams {
-                ifindex: 0,
                 direction: Direction::Egress,
-                id: Some(67890),
-                src: None,
+                id: 67890,
             };
 
             let result = service.delete_rule(params);
@@ -3532,50 +3533,14 @@ mod tests {
             let mut service = PolicyService::new(Box::new(mock));
 
             let params = DeleteRuleParams {
-                ifindex: 0,
                 direction: Direction::Ingress,
-                id: Some(99999),
-                src: None,
+                id: 99999,
             };
 
             let result = service.delete_rule(params);
 
             assert!(result.is_err());
             assert!(result.unwrap_err().to_string().contains("not found"));
-        }
-
-        #[test]
-        fn test_delete_rule_by_src() {
-            let mut mock = create_mock_with_loaded_programs();
-
-            let key = SrcLpmKeyV4::new(0, "192.168.1.0".parse::<Ipv4Addr>().unwrap(), 24);
-            let entry = create_test_lpm_entry(12345, PolicyAction::Drop);
-
-            mock.expect_list_policy_rules_v4()
-                .times(1)
-                .return_once(move |_| Ok(vec![(key, LpmKeyV4::any(), entry)]));
-
-            mock.expect_delete_policy_rule_v4()
-                .times(1)
-                .returning(|_, _, _, _| Ok(()));
-
-            mock.expect_clear_rule_stats()
-                .times(1)
-                .withf(|&rule_id, dir| rule_id == 12345 && *dir == Direction::Ingress)
-                .returning(|_, _| Ok(()));
-
-            let mut service = PolicyService::new(Box::new(mock));
-
-            let params = DeleteRuleParams {
-                ifindex: 0,
-                direction: Direction::Ingress,
-                id: None,
-                src: Some("192.168.1.0/24".to_string()),
-            };
-
-            let result = service.delete_rule(params);
-
-            assert!(result.is_ok());
         }
 
         #[test]
@@ -4047,10 +4012,8 @@ mod tests {
             let mut service = PolicyService::new(Box::new(mock));
 
             let params = DeleteRuleParams {
-                ifindex: 0,
                 direction: Direction::Ingress,
-                id: Some(77777),
-                src: None,
+                id: 77777,
             };
 
             let result = service.delete_rule(params);
@@ -5057,10 +5020,8 @@ mod tests {
             assert_eq!(service.list_managed_rules().len(), 1);
 
             let del_result = service.delete_rule(DeleteRuleParams {
-                ifindex: 0,
                 direction: Direction::Ingress,
-                id: Some(rule_id),
-                src: None,
+                id: rule_id,
             });
             assert!(del_result.is_ok());
             assert!(
@@ -5150,10 +5111,8 @@ mod tests {
             let rule_id = service.list_managed_rules()[0].rule_id;
             service
                 .delete_rule(DeleteRuleParams {
-                    ifindex: 0,
                     direction: Direction::Ingress,
-                    id: Some(rule_id),
-                    src: None,
+                    id: rule_id,
                 })
                 .unwrap();
 

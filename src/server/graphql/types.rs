@@ -480,17 +480,7 @@ pub struct DeleteRuleInput {
     /// Traffic direction: INGRESS or EGRESS
     pub direction: GqlDirection,
     /// Rule ID to delete (ID scalar accepts string or int)
-    pub id: Option<ID>,
-    /// Source IP/CIDR
-    pub src: Option<String>,
-    /// Destination IP/CIDR
-    pub dst: Option<String>,
-    /// Source port
-    pub sport: Option<u16>,
-    /// Destination port
-    pub dport: Option<u16>,
-    /// Protocol
-    pub protocol: Option<String>,
+    pub id: ID,
 }
 
 /// Generic operation result

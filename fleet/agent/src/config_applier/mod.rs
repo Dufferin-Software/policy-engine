@@ -157,12 +157,7 @@ impl LocalPolicyClient for SpawnBlockingLocalClient {
         let input = policy_engine_dev::DeleteRuleInput {
             interface: interface.to_string(),
             direction: dir,
-            id: Some(rule_id.to_string()),
-            src: None,
-            dst: None,
-            sport: None,
-            dport: None,
-            protocol: None,
+            id: rule_id.to_string(),
         };
         tokio::task::spawn_blocking(move || client.delete_rule(input))
             .await

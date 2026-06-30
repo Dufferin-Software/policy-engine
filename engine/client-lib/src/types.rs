@@ -353,12 +353,8 @@ pub struct DeleteRuleInput {
     /// Network interface name the rule is scoped to.
     pub interface: String,
     pub direction: GqlDirection,
-    pub id: Option<String>,
-    pub src: Option<String>,
-    pub dst: Option<String>,
-    pub sport: Option<u16>,
-    pub dport: Option<u16>,
-    pub protocol: Option<String>,
+    /// ID of the rule to delete.
+    pub id: String,
 }
 
 /// Generic operation result

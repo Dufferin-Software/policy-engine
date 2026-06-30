@@ -862,12 +862,7 @@ impl PolicyClient {
             "input": {
                 "interface": input.interface,
                 "direction": input.direction,
-                "id": input.id,
-                "src": input.src,
-                "dst": input.dst,
-                "sport": input.sport,
-                "dport": input.dport,
-                "protocol": input.protocol
+                "id": input.id
             }
         });
 

@@ -269,7 +269,7 @@ enum RuleCommands {
         schedule_windows: Vec<String>,
     },
 
-    /// Delete a policy rule
+    /// Delete a policy rule by ID
     Delete {
         /// Network interface the rule is scoped to
         #[arg(long)]
@@ -281,27 +281,7 @@ enum RuleCommands {
 
         /// Rule ID to delete
         #[arg(long)]
-        id: Option<u64>,
-
-        /// Source IP/CIDR (must match rule exactly)
-        #[arg(long)]
-        src: Option<String>,
-
-        /// Destination IP/CIDR (must match rule exactly)
-        #[arg(long)]
-        dst: Option<String>,
-
-        /// Source port (must match rule exactly)
-        #[arg(long)]
-        sport: Option<u16>,
-
-        /// Destination port (must match rule exactly)
-        #[arg(long)]
-        dport: Option<u16>,
-
-        /// Protocol (must match rule exactly)
-        #[arg(long)]
-        proto: Option<String>,
+        id: u64,
     },
 
     /// List all policy rules
@@ -865,23 +845,13 @@ fn handle_rule(client: &PolicyClient, cmd: RuleCommands, json_output: bool) -> R
             interface,
             direction,
             id,
-            src,
-            dst,
-            sport,
-            dport,
-            proto,
         } => {
             let dir = parse_direction(&direction)?;
 
             let input = DeleteRuleInput {
                 interface,
                 direction: dir,
-                id: id.map(|v| v.to_string()),
-                src,
-                dst,
-                sport,
-                dport,
-                protocol: proto,
+                id: id.to_string(),
             };
             handle_operation(|| client.delete_rule(input.clone()), json_output)?;
         }
@@ -2296,12 +2266,7 @@ mod tests {
         let input = DeleteRuleInput {
             interface: "lo".to_string(),
             direction: GqlDirection::Ingress,
-            id: Some("42".to_string()),
-            src: None,
-            dst: None,
-            sport: None,
-            dport: None,
-            protocol: None,
+            id: "42".to_string(),
         };
 
         let json = serde_json::to_string_pretty(&input).unwrap();

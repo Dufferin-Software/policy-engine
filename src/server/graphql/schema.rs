@@ -1247,39 +1247,23 @@ impl MutationRoot {
         let mut failed = 0u32;
 
         for (index, input) in rules.into_iter().enumerate() {
-            let id = match input.id.as_ref().map(|id| id.to_string().parse::<u64>()) {
-                Some(Ok(v)) => Some(v),
-                Some(Err(e)) => {
-                    failed += 1;
-                    results.push(BatchRuleResult {
-                        index: index as u32,
-                        rule_id: input.id.clone(),
-                        success: false,
-                        error: Some(format!("Invalid rule ID: {}", e)),
-                    });
-                    continue;
-                }
-                None => None,
-            };
-
-            let ifindex = match get_ifindex(&input.interface) {
+            let id = match input.id.to_string().parse::<u64>() {
                 Ok(v) => v,
                 Err(e) => {
                     failed += 1;
                     results.push(BatchRuleResult {
                         index: index as u32,
-                        rule_id: input.id.clone(),
+                        rule_id: Some(input.id.clone()),
                         success: false,
-                        error: Some(e.message),
+                        error: Some(format!("Invalid rule ID: {}", e)),
                     });
                     continue;
                 }
             };
+
             let params = DeleteRuleParams {
                 direction: input.direction.into(),
-                ifindex,
                 id,
-                src: input.src.clone(),
             };
 
             match service.delete_rule(params) {
@@ -1287,7 +1271,7 @@ impl MutationRoot {
                     succeeded += 1;
                     results.push(BatchRuleResult {
                         index: index as u32,
-                        rule_id: input.id,
+                        rule_id: Some(input.id),
                         success: true,
                         error: None,
                     });
@@ -1296,7 +1280,7 @@ impl MutationRoot {
                     failed += 1;
                     results.push(BatchRuleResult {
                         index: index as u32,
-                        rule_id: input.id,
+                        rule_id: Some(input.id),
                         success: false,
                         error: Some(format!("{}", e)),
                     });
@@ -1328,9 +1312,7 @@ impl MutationRoot {
         })
     }
 
-    /// Delete a policy rule
-    ///
-    /// Can delete by ID or by source CIDR
+    /// Delete a policy rule by ID.
     async fn delete_rule<'ctx>(
         &self,
         ctx: &Context<'ctx>,
@@ -1343,19 +1325,13 @@ impl MutationRoot {
         let input_json = serde_json::to_value(&input).unwrap_or(serde_json::Value::Null);
         let id = input
             .id
-            .map(|id| {
-                id.to_string()
-                    .parse::<u64>()
-                    .map_err(|e| async_graphql::Error::new(format!("Invalid rule ID: {}", e)))
-            })
-            .transpose()?;
+            .to_string()
+            .parse::<u64>()
+            .map_err(|e| async_graphql::Error::new(format!("Invalid rule ID: {}", e)))?;
 
-        let ifindex = get_ifindex(&input.interface)?;
         let params = DeleteRuleParams {
             direction: input.direction.into(),
-            ifindex,
             id,
-            src: input.src,
         };
 
         let op = service
