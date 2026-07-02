@@ -43,6 +43,17 @@ actix-web = { version = "4", features = ["rustls-0_23"] }
 # `ring` enabled explicitly so `rustls::crypto::ring` is available regardless of
 # workspace feature unification; the provider is installed in bin/server.rs.
 rustls = { version = "0.23", features = ["ring"] }
+# Security pin (RUSTSEC-2026-0104 / GHSA-82j2-j2ch-gfr8): force the transitive
+# rustls-webpki (pulled by rustls 0.23) to a fixed release. Not used directly;
+# present only to keep the resolver off the vulnerable <0.103.13 range across the
+# workspace's shared lockfile.
+#
+# The older 0.101.x/0.102.x lines (which carried RUSTSEC-2026-0098/0099/0104/0049
+# with no backported fix) were eliminated by moving reqwest to 0.12 and
+# tokio-tungstenite to 0.26 — both now ride rustls 0.23, so only this pinned
+# 0.103.x tree remains. Keep those two off the pre-0.23 rustls lines to avoid
+# reintroducing them.
+rustls-webpki = "0.103.13"
 rustls-pemfile = "2"
 actix-rt = "2"
 actix-cors = "0.7"

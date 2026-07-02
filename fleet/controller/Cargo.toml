@@ -47,7 +47,7 @@ ipnetwork = "0.20"
 globset = "0.4"
 
 # Alert dispatcher: HTTP client for the webhook + Alertmanager providers.
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Alert dispatcher: SMTP for the email provider.
 lettre = { version = "0.11", default-features = false, features = [

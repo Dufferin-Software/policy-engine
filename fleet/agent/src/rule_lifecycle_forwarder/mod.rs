@@ -50,10 +50,10 @@ async fn run_once(
         match msg {
             Err(e) => return Err(e.into()),
             Ok(Message::Text(text)) => {
-                forward_event(text.into_bytes(), node_id, tx).await?;
+                forward_event(text.as_bytes().to_vec(), node_id, tx).await?;
             }
             Ok(Message::Binary(bytes)) => {
-                forward_event(bytes, node_id, tx).await?;
+                forward_event(bytes.to_vec(), node_id, tx).await?;
             }
             Ok(_) => {} // Ping / Pong / Close frames — ignore
         }

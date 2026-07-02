@@ -58,13 +58,13 @@ async fn run_once(
                     None => return Ok(()), // server closed the connection
                     Some(Err(e)) => return Err(e.into()),
                     Some(Ok(Message::Text(text))) => {
-                        batch.push(text.into_bytes());
+                        batch.push(text.as_bytes().to_vec());
                         if batch.len() >= BATCH_MAX {
                             flush_batch(&mut batch, node_id, tx).await?;
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
-                        batch.push(bytes);
+                        batch.push(bytes.to_vec());
                         if batch.len() >= BATCH_MAX {
                             flush_batch(&mut batch, node_id, tx).await?;
                         }
