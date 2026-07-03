@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+# Create the policy-engine system user and group before any package files
+# are installed. Must happen here (preinst) so the user exists when the
+# service unit is started by postinst.
+if ! getent group policy-engine >/dev/null 2>&1; then
+    addgroup --system --quiet policy-engine
+fi
+if ! getent passwd policy-engine >/dev/null 2>&1; then
+    adduser --system --quiet --ingroup policy-engine \
+        --no-create-home --shell /usr/sbin/nologin policy-engine
+fi
+
+#DEBHELPER#

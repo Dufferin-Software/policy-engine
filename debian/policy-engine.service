@@ -30,7 +30,11 @@ StateDirectory=policy-engine
 # Hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=-/etc/suricata -/etc/systemd/system/suricata.service.d /etc/default /sys/fs/bpf
+# ReadWritePaths only lifts the ProtectSystem=strict read-only remount;
+# regular file permissions still apply.  The policy-engine-ips postinst
+# grants the policy-engine group write access to the suricata paths, and a
+# polkit rule (usr/share/polkit-1/rules.d) allows the systemctl calls.
+ReadWritePaths=-/etc/suricata -/etc/systemd/system/suricata.service.d /sys/fs/bpf
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=false

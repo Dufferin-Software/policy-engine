@@ -12,16 +12,9 @@
  * policy verdict cache when *cacheable survives all matched rules.  Mirrors
  * process_rule_actions in src/bpf/xdp/actions.h.  Caller initialises it to 1.
  */
-static __always_inline int tc_process_rule_actions(struct __sk_buff *ctx,
-                                                   struct global_stats *gs,
-                                                   struct l4_rule *policy,
-                                                   struct flow_key *flow_key,
-                                                   __u64 now_ns, __u8 *cacheable
-#ifdef SURICATA_IPS
-                                                   ,
-                                                   struct inspect_config *icfg
-#endif
-) {
+static __always_inline int tc_process_rule_actions(
+    struct __sk_buff *ctx, struct global_stats *gs, struct l4_rule *policy,
+    struct flow_key *flow_key, __u64 now_ns, __u8 *cacheable) {
   int final_verdict = TC_ACT_OK;
   __u32 should_log = 0;
   __u8 stop_actions = 0;
@@ -91,7 +84,14 @@ static __always_inline int tc_process_rule_actions(struct __sk_buff *ctx,
        * before the policy lookup, so subsequent egress packets are also cloned
        * automatically without triggering the policy engine again.
        *
-       * icfg is hoisted by the caller to avoid a redundant map lookup. */
+       * The inspect config is looked up here rather than hoisted by the
+       * caller: a map-value-or-NULL pointer held live across the main
+       * program's LPM walk forks verifier states and blows the processed-insn
+       * budget (see the note in tc_policy_egress).  INSPECT rules are rare,
+       * so the extra lookup is off the hot path. */
+      __u32 icfg_key = 0;
+      const struct inspect_config *icfg =
+          bpf_map_lookup_elem(&tc_inspect_config, &icfg_key);
       if (!icfg || icfg->mode == INSPECT_MODE_DISABLED)
         break;
 

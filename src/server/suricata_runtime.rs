@@ -82,12 +82,29 @@ impl DefaultSuricataRuntime {
     }
 
     fn env_path(&self) -> PathBuf {
-        self.root.join("etc/default/suricata-policy-engine")
+        // Lives under /etc/suricata (not /etc/default) so the unprivileged
+        // policy-engine user can create and remove it — the -ips postinst
+        // grants group write on /etc/suricata only.
+        self.root.join("etc/suricata/suricata-policy-engine.env")
     }
 
     fn dropin_path(&self) -> PathBuf {
         self.root
             .join("etc/systemd/system/suricata.service.d/policy-engine.conf")
+    }
+
+    /// Reload systemd unit definitions so a freshly written or removed
+    /// drop-in takes effect on the next start/restart.  Best-effort: a
+    /// failure here should not mask the outcome of the start itself.
+    fn daemon_reload() {
+        match Command::new("systemctl").arg("daemon-reload").output() {
+            Ok(o) if !o.status.success() => log::warn!(
+                "systemctl daemon-reload failed: {}",
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(e) => log::warn!("Failed to run systemctl daemon-reload: {}", e),
+            _ => {}
+        }
     }
 }
 
@@ -107,6 +124,7 @@ impl SuricataRuntime for DefaultSuricataRuntime {
     }
 
     fn start(&self) -> Result<()> {
+        Self::daemon_reload();
         let out = Command::new("systemctl")
             .args(["start", "suricata"])
             .output()
@@ -194,6 +212,7 @@ impl SuricataRuntime for DefaultSuricataRuntime {
     }
 
     fn restart_service(&self) -> Result<()> {
+        Self::daemon_reload();
         let out = Command::new("systemctl")
             .args(["restart", "suricata"])
             .output()
@@ -276,10 +295,21 @@ impl SuricataRuntime for DefaultSuricataRuntime {
             }
         }
 
-        if let Some(pid) = self.get_pid() {
-            info!("Sending SIGUSR2 to Suricata (pid={})", pid);
-            unsafe {
-                libc::kill(pid as i32, libc::SIGUSR2);
+        if self.is_running() {
+            // Signal via systemd rather than kill(2): the daemon runs as the
+            // unprivileged policy-engine user, which may not signal the
+            // root-owned Suricata process directly.  systemctl kill goes
+            // through polkit, where the -ips package grants access.
+            info!("Sending SIGUSR2 to Suricata via systemctl kill");
+            let out = Command::new("systemctl")
+                .args(["kill", "--signal=SIGUSR2", "--kill-who=main", "suricata"])
+                .output()
+                .context("Failed to run systemctl kill suricata")?;
+            if !out.status.success() {
+                anyhow::bail!(
+                    "systemctl kill -s SIGUSR2 suricata failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
             }
             return Ok(());
         }

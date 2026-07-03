@@ -1828,8 +1828,19 @@ impl MutationRoot {
                 }
             }
             // Suricata monitors pe-inspect1 via AF-packet; TC ingress sends clones there.
+            // Config-write failures are fatal: without policy-engine.yaml Suricata
+            // inspects nothing while the mode reports enabled.  Restart failures
+            // stay warn-only inside apply_config (Suricata may not be installed).
             if let Err(e) = state.suricata_coordinator.apply_config("pe-inspect1") {
-                log::warn!("Failed to apply Suricata config: {}", e);
+                let msg = format!("Failed to apply Suricata config: {:#}", e);
+                state.audit_logger.log_event(
+                    "configure_inspect",
+                    serde_json::to_value(&input).unwrap_or(serde_json::Value::Null),
+                    "error",
+                    &msg,
+                    &source_ip,
+                );
+                return Err(async_graphql::Error::new(msg));
             }
             if let Err(e) = state.suricata_coordinator.enable_update_timer() {
                 log::warn!("Failed to enable Suricata update timer: {}", e);
@@ -3423,6 +3434,58 @@ mod tests {
             .execute("mutation { configureInspect(input: { mode: DISABLED }) { success } }")
             .await;
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
+    }
+
+    #[cfg(feature = "suricata")]
+    #[tokio::test]
+    async fn configure_inspect_errors_when_suricata_config_write_fails() {
+        let mut mock_bpf = MockBpfOperations::new();
+        mock_bpf
+            .expect_set_inspect_config()
+            .times(2)
+            .returning(|_, _| Ok(()));
+        // Enabling INSPECT ensures TC is attached wherever XDP is; no interfaces
+        // are attached in this test.
+        mock_bpf
+            .expect_get_attached_interfaces()
+            .returning(Vec::new);
+
+        let mut veth_ops = MockVethOps::new();
+        veth_ops.expect_interface_exists().returning(|_| true); // pair already exists
+        veth_ops.expect_get_ifindex().returning(|_| Ok(55));
+
+        let mut rt = MockSuricataRuntime::new();
+        rt.expect_is_running().returning(|| false);
+        rt.expect_get_version().returning(|| None);
+        rt.expect_get_ruleset_version().returning(|| None);
+        // Config write fails (e.g. EACCES on /etc/suricata) — the mutation must
+        // surface this instead of reporting the mode as enabled.
+        rt.expect_write_systemd_env()
+            .times(1)
+            .returning(|_| Err(anyhow::anyhow!("Failed to write policy-engine.yaml")));
+        rt.expect_restart_service().times(0);
+        rt.expect_enable_update_timer().times(0);
+
+        let schema = build_schema(make_state_custom(mock_bpf, veth_ops, rt));
+        let resp = schema
+            .execute("mutation { configureInspect(input: { mode: IPS }) { success } }")
+            .await;
+        assert!(
+            !resp.errors.is_empty(),
+            "config-write failure should produce a GraphQL error"
+        );
+        assert!(
+            resp.errors[0]
+                .message
+                .contains("Failed to apply Suricata config"),
+            "unexpected error message: {}",
+            resp.errors[0].message
+        );
+        assert!(
+            resp.errors[0].message.contains("policy-engine.yaml"),
+            "error should include the underlying cause: {}",
+            resp.errors[0].message
+        );
     }
 
     // -------------------------------------------------------------------------

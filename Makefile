@@ -53,6 +53,11 @@ deb:
 # bpftool prog loadall to run the kernel verifier without attaching to any
 # interface.  Requires sudo (CAP_BPF only; CAP_NET_ADMIN is not needed).
 #
+# Both the base build and the -DSURICATA_IPS build are verified: the IPS
+# variant adds code to the main programs (INSPECT action, ingress cloning)
+# and has its own verifier cost, so verifying only the base build can miss
+# an IPS-only rejection (e.g. the 1M processed-insn limit).
+#
 # Usage: make verify-bpf
 verify-bpf:
 	@mkdir -p $(BPF_VERIFY_TMP)
@@ -60,14 +65,20 @@ verify-bpf:
 	$(CLANG) $(BPF_VERIFY_CFLAGS) -c src/bpf/xdp/xdp_policy.bpf.c -o $(BPF_VERIFY_TMP)/xdp_policy.bpf.o
 	@echo "Compiling TC BPF program..."
 	$(CLANG) $(BPF_VERIFY_CFLAGS) -c src/bpf/tc/tc_policy.bpf.c  -o $(BPF_VERIFY_TMP)/tc_policy.bpf.o
+	@echo "Compiling XDP BPF program (SURICATA_IPS)..."
+	$(CLANG) $(BPF_VERIFY_CFLAGS) -DSURICATA_IPS -c src/bpf/xdp/xdp_policy.bpf.c -o $(BPF_VERIFY_TMP)/xdp_policy_ips.bpf.o
+	@echo "Compiling TC BPF program (SURICATA_IPS)..."
+	$(CLANG) $(BPF_VERIFY_CFLAGS) -DSURICATA_IPS -c src/bpf/tc/tc_policy.bpf.c  -o $(BPF_VERIFY_TMP)/tc_policy_ips.bpf.o
 	@echo "Running programs through kernel BPF verifier (requires sudo)..."
 	@sudo rm -rf $(BPF_VERIFY_PIN)
 	@sudo mkdir -p $(BPF_VERIFY_PIN)
 	sudo $(BPFTOOL) prog loadall $(BPF_VERIFY_TMP)/xdp_policy.bpf.o $(BPF_VERIFY_PIN)/xdp
 	sudo $(BPFTOOL) prog loadall $(BPF_VERIFY_TMP)/tc_policy.bpf.o  $(BPF_VERIFY_PIN)/tc
+	sudo $(BPFTOOL) prog loadall $(BPF_VERIFY_TMP)/xdp_policy_ips.bpf.o $(BPF_VERIFY_PIN)/xdp_ips
+	sudo $(BPFTOOL) prog loadall $(BPF_VERIFY_TMP)/tc_policy_ips.bpf.o  $(BPF_VERIFY_PIN)/tc_ips
 	@sudo rm -rf $(BPF_VERIFY_PIN)
 	@rm -rf $(BPF_VERIFY_TMP)
-	@echo "BPF verifier: all programs accepted."
+	@echo "BPF verifier: all programs accepted (base + SURICATA_IPS)."
 
 # Run all linters
 lint: lint-rust lint-bpf

@@ -3,11 +3,25 @@ set -e
 
 #DEBHELPER#
 
-# Ensure directories that policy-engine.service lists in ReadWritePaths exist
-# before systemd tries to set up the mount namespace.  The suricata drop-in
-# directory is only created by suricata's own postinst, so it may be absent on
-# a fresh install.
-mkdir -p /etc/systemd/system/suricata.service.d
+# The daemon runs as the unprivileged policy-engine user (see
+# policy-engine.service).  ReadWritePaths= in the unit only lifts the
+# ProtectSystem=strict read-only remount — regular file permissions still
+# apply — so grant the policy-engine group write access to the paths the
+# Suricata integration manages:
+#   /etc/suricata                        — policy-engine.yaml + env file
+#   /etc/suricata/rules/policy-engine    — deployed detection rules
+#   /etc/systemd/system/suricata.service.d — generated drop-in
+# This must run after the debhelper token above (never spell it out here —
+# dh_installdeb expands it anywhere in the file, comments included): its
+# sysusers.d snippet creates the policy-engine group on a fresh install.
+mkdir -p /etc/systemd/system/suricata.service.d /etc/suricata/rules
+chgrp policy-engine /etc/suricata /etc/suricata/rules /etc/systemd/system/suricata.service.d
+chmod g+w /etc/suricata /etc/suricata/rules /etc/systemd/system/suricata.service.d
+install -d -o policy-engine -g policy-engine -m 0755 /etc/suricata/rules/policy-engine
+
+# The generated Suricata env file used to live in /etc/default; it now lives
+# in /etc/suricata where the policy-engine user can manage it.
+rm -f /etc/default/suricata-policy-engine
 
 # Suricata is a runtime dependency but must NOT run until the operator
 # explicitly enables IPS/IDS via the configureInspect GraphQL mutation.

@@ -363,6 +363,44 @@ struct {
 #include "lookup.h"
 // clang-format on
 
+#ifdef SURICATA_IPS
+/*
+ * Clone this egress packet to the Suricata mirror interface if its flow is
+ * marked for inspection.
+ *
+ * flows_to_inspect is keyed by the ingress direction (src=server, dst=client),
+ * so the parsed egress 5-tuple is reversed for the lookup.  Cloning outgoing
+ * client→server packets too gives Suricata the full bidirectional stream and
+ * lets request-based rules (e.g. http.host) fire before the server responds.
+ *
+ * Marked __noinline: the inspect-config and expiry branches would otherwise
+ * fork verifier states ahead of the (huge) inlined LPM walk in
+ * tc_policy_egress; as a subprogram the states re-converge at the call
+ * boundary.  Cold path — only flows already under inspection reach the map
+ * lookup, and the extra BPF-to-BPF call is dwarfed by the clone itself.
+ */
+static __noinline void tc_clone_inspected_flow(struct __sk_buff *ctx,
+                                               const struct flow_key *flow) {
+  __u32 zero = 0;
+  const struct inspect_config *icfg =
+      bpf_map_lookup_elem(&tc_inspect_config, &zero);
+  if (!icfg || icfg->mode == INSPECT_MODE_DISABLED ||
+      icfg->mirror_ifindex == 0)
+    return;
+
+  struct flow_inspect_key fi_key = {};
+  flow_inspect_key_from_flow_reversed(&fi_key, flow);
+
+  const __u64 *expiry = bpf_map_lookup_elem(&flows_to_inspect, &fi_key);
+  if (!expiry)
+    return;
+
+  __u64 now = bpf_ktime_get_ns();
+  if (*expiry == 0 || now < *expiry)
+    bpf_clone_redirect(ctx, icfg->mirror_ifindex, 0);
+}
+#endif /* SURICATA_IPS */
+
 /*
  * Build a tc_flow_verdict_cache key from a parsed flow_key.  Shared by the
  * verdict-cache lookup in tc_policy_egress and the verdict writer below so the
@@ -397,7 +435,7 @@ tc_flow_verdict_key_from_flow(struct flow_verdict_key *fv_key,
  * cacheable (pure PASS/DROP) flows.  Defined here (before tc_policy_egress)
  * since the main program calls it.
  */
-static __always_inline void
+static __noinline void
 tc_policy_write_verdict(const struct flow_key *flow, __u32 action,
                         __u64 rule_id, __u64 now_ns, __u32 ifindex) {
   struct flow_verdict_key fv_key = {};
@@ -473,6 +511,24 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
 }
 
 /*
+ * Build the flow_verdict_key and check the verdict cache (egress).
+ *
+ * Marked __noinline so the 64-byte key lives in this subprogram's frame
+ * instead of tc_policy_egress's: main's frame plus its deepest callee must
+ * fit the 512-byte combined stack limit, and main is the frame every callee
+ * stacks onto.  The lookup/branch state also re-converges at the call
+ * boundary instead of forking across the LPM walk.
+ */
+static __noinline int
+tc_flow_verdict_cache_check(struct global_stats *gs,
+                            const struct flow_key *flow, __u32 ifindex,
+                            __u32 pkt_len, __u64 t0) {
+  struct flow_verdict_key fv_key = {};
+  tc_flow_verdict_key_from_flow(&fv_key, flow, ifindex);
+  return tc_check_flow_verdict_cache(gs, &fv_key, pkt_len, t0);
+}
+
+/*
  * Apply the L4 rules in a matched dst-prefix entry (egress).
  *
  * rules[] is sorted by priority.  Non-SNI rules are evaluated immediately;
@@ -489,12 +545,7 @@ tc_apply_l4_rules(struct __sk_buff *ctx, struct global_stats *gs,
                   struct dst_lpm_value *policy, struct flow_key *flow_key,
                   __u64 t0, __u32 pkt_len, const __u8 *pkt_src_mac,
                   const __u8 *pkt_dst_mac, struct tc_pkt_meta *meta,
-                  __u64 *fc_rule_id, __u8 *cacheable
-#ifdef SURICATA_IPS
-                  ,
-                  struct inspect_config *icfg
-#endif
-) {
+                  __u64 *fc_rule_id, __u8 *cacheable) {
   __u8 cnt = policy->count;
   if (cnt > MAX_L4_RULES)
     cnt = MAX_L4_RULES;
@@ -513,12 +564,8 @@ tc_apply_l4_rules(struct __sk_buff *ctx, struct global_stats *gs,
           tc_update_rule_stats(rule->rule_id, pkt_len, t0);
           if (*fc_rule_id == 0)
             *fc_rule_id = rule->rule_id;
-          int v = tc_process_rule_actions(ctx, gs, rule, flow_key, t0, cacheable
-#ifdef SURICATA_IPS
-                                          ,
-                                          icfg
-#endif
-          );
+          int v =
+              tc_process_rule_actions(ctx, gs, rule, flow_key, t0, cacheable);
           if (v == TC_ACT_SHOT) {
             *fc_rule_id = rule->rule_id; /* override with DROP rule */
             dropped = 1;
@@ -569,18 +616,25 @@ int tc_policy_egress(struct __sk_buff *ctx) {
   __u64 t0 = bpf_ktime_get_ns();
   __u64 tc_fc_rule_id = 0; /* rule_id for flow cache: first matching rule */
 
-  /* Hoist both hot pointers — one lookup each for the whole path */
+  /* Hoist the stats pointer — one lookup for the whole path.  The inspect
+   * config is deliberately NOT hoisted: a map-value-or-NULL pointer held live
+   * across the whole program forks the verifier state ahead of the (huge)
+   * inlined LPM walk and doubles its exploration, which is what pushed
+   * tc_policy_egress past the 1M processed-insn limit.  The SURICATA_IPS
+   * consumers look it up locally instead (see tc_clone_inspected_flow and
+   * the ACTION_INSPECT case in tc/actions.h, mirroring the XDP side). */
   __u32 gs_key = ctx->ifindex % MAX_INTERFACES;
   struct global_stats *gs = bpf_map_lookup_elem(&tc_global_stats, &gs_key);
-#ifdef SURICATA_IPS
-  struct inspect_config *icfg = bpf_map_lookup_elem(&tc_inspect_config, &zero);
-#endif
+  /* Unreachable at runtime: PERCPU_ARRAY lookup with an in-bounds key (the
+   * modulo above) never fails.  The early return teaches the verifier gs is
+   * non-NULL, so every downstream `if (gs)` prunes instead of forking states
+   * that are carried across the inlined LPM walk. */
+  if (!gs)
+    return TC_ACT_OK;
 
   /* Count ALL egress packets (including non-IP) */
-  if (gs) {
-    gs->tx_packets++;
-    gs->tx_bytes += pkt_len;
-  }
+  gs->tx_packets++;
+  gs->tx_bytes += pkt_len;
 
   /* Extract source/destination MAC for per-rule L2 matching */
   __u8 pkt_src_mac[6] = {};
@@ -639,34 +693,15 @@ int tc_policy_egress(struct __sk_buff *ctx) {
   /* Check flow verdict cache.  Writers are the Suricata EVE consumer and the
    * QUIC SNI inspector; a hit short-circuits the policy lookup. */
   {
-    struct flow_verdict_key fv_key = {};
-    tc_flow_verdict_key_from_flow(&fv_key, &flow_key, ctx->ifindex);
-
-    int cached_verdict = tc_check_flow_verdict_cache(gs, &fv_key, pkt_len, t0);
+    int cached_verdict =
+        tc_flow_verdict_cache_check(gs, &flow_key, ctx->ifindex, pkt_len, t0);
     if (cached_verdict >= 0)
       return cached_verdict;
   }
 
 #ifdef SURICATA_IPS
-  /* Clone egress packets belonging to flows being inspected on ingress.
-   * flows_to_inspect is keyed by the ingress direction (src=server,
-   * dst=client). Reverse the 5-tuple so that outgoing client→server packets are
-   * also sent to Suricata, giving it the full bidirectional stream and allowing
-   * request-based rules (e.g. http.host) to fire before the server responds. */
-  {
-    if (icfg && icfg->mode != INSPECT_MODE_DISABLED &&
-        icfg->mirror_ifindex != 0) {
-      struct flow_inspect_key fi_key = {};
-      flow_inspect_key_from_flow_reversed(&fi_key, &flow_key);
-
-      const __u64 *expiry = bpf_map_lookup_elem(&flows_to_inspect, &fi_key);
-      if (expiry) {
-        __u64 now = bpf_ktime_get_ns();
-        if (*expiry == 0 || now < *expiry)
-          bpf_clone_redirect(ctx, icfg->mirror_ifindex, 0);
-      }
-    }
-  }
+  /* Clone egress packets belonging to flows being inspected on ingress. */
+  tc_clone_inspected_flow(ctx, &flow_key);
 #endif /* SURICATA_IPS */
 
   /* Lookup policy (two-level LPM: src prefix → dst prefix → L4 rules).
@@ -686,20 +721,18 @@ int tc_policy_egress(struct __sk_buff *ctx) {
      * flow memcpy and the scalar field writes, which TC_FLOW_CACHE_TAIL_CALL
      * would overwrite anyway. */
     struct tc_pkt_meta *meta = bpf_map_lookup_elem(&tc_pkt_scratch, &zero);
-    if (meta)
-      meta->sni_count = 0;
+    /* Unreachable at runtime (PERCPU_ARRAY, key 0) — early return teaches the
+     * verifier meta is non-NULL so the rule loop's meta checks prune. */
+    if (!meta)
+      return TC_ACT_OK;
+    meta->sni_count = 0;
 
     /* Cleared by tc_apply_l4_rules if any matched rule carries a LOG / INSPECT
      * / TAIL_CALL action; gates the policy verdict seed below. */
     __u8 cacheable = 1;
     int final_verdict = tc_apply_l4_rules(ctx, gs, policy, &flow_key, t0,
                                           pkt_len, pkt_src_mac, pkt_dst_mac,
-                                          meta, &tc_fc_rule_id, &cacheable
-#ifdef SURICATA_IPS
-                                          ,
-                                          icfg
-#endif
-    );
+                                          meta, &tc_fc_rule_id, &cacheable);
     __u8 dropped = (final_verdict == TC_ACT_SHOT);
 
     if (!dropped && meta && meta->sni_count > 0) {

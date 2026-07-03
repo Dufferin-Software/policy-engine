@@ -39,7 +39,7 @@ Description: XDP policy-based packet processing engine
 Package: policy-engine-ips
 Build-Profiles: <pkg.policy-engine.suricata !pkg.policy-engine.ipfix>
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libbpf1, suricata
+Depends: ${shlibs:Depends}, ${misc:Depends}, libbpf1, suricata, polkitd | policykit-1
 Provides: policy-engine
 Conflicts: policy-engine, policy-engine-ipfix, policy-engine-ips-ipfix
 Suggests: grafana, prometheus, policy-engine-web
@@ -87,7 +87,7 @@ Description: XDP policy-based packet processing engine with IPFIX flow export
 Package: policy-engine-ips-ipfix
 Build-Profiles: <pkg.policy-engine.suricata pkg.policy-engine.ipfix>
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libbpf1, suricata
+Depends: ${shlibs:Depends}, ${misc:Depends}, libbpf1, suricata, polkitd | policykit-1
 Provides: policy-engine, policy-engine-ips, policy-engine-ipfix
 Conflicts: policy-engine, policy-engine-ips, policy-engine-ipfix
 Suggests: grafana, prometheus, policy-engine-web

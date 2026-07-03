@@ -3,6 +3,72 @@
 
 #pragma once
 
+#ifdef SURICATA_IPS
+/*
+ * ACTION_INSPECT body, outlined from process_rule_actions as two flat
+ * __noinline helpers.
+ *
+ * Outlined for two reasons: (a) the fi_key / fv_key / pass_v stack buffers
+ * otherwise land in xdp_policy_main's frame (via the unrolled action loop),
+ * and main's frame plus its deepest callee must fit the 512-byte combined
+ * stack limit; (b) the inspect-config branches fork verifier states that
+ * re-converge at the call boundary instead of being carried through the rest
+ * of the rule loop.  Two sibling helpers rather than one (or a nested chain)
+ * so no single frame stacked on main holds all three structs at once.
+ * INSPECT is off the hot path (first packet of a flow only), so the extra
+ * BPF-to-BPF calls are irrelevant.
+ *
+ * xdp_mark_flow_for_inspect marks the flow for TC ingress cloning to
+ * Suricata.  flows_to_inspect is keyed by the ifindex-less flow_inspect_key
+ * (shared with the TC skeleton).  TC ingress reads flows_to_inspect and
+ * calls bpf_clone_redirect to mirror each packet on this flow to pe-inspect0
+ * while the original continues to the application.  Suricata receives the
+ * full TCP stream on pe-inspect1 (the veth peer) and fires alerts via EVE
+ * JSON.  The EveConsumer writes DROP verdicts to flow_verdict_cache; the
+ * next packet on this flow is then dropped at the XDP verdict-cache check.
+ *
+ * Returns 1 if inspection is enabled (caller must then also write the
+ * temporary PASS verdict via xdp_write_inspect_pass_verdict), 0 if disabled.
+ */
+static __noinline int xdp_mark_flow_for_inspect(struct global_stats *gs,
+                                                const struct flow_key *flow_key,
+                                                __u64 now_ns) {
+  __u32 cfg_key = 0;
+  const struct inspect_config *cfg =
+      bpf_map_lookup_elem(&inspect_config, &cfg_key);
+  if (!cfg || cfg->mode == INSPECT_MODE_DISABLED)
+    return 0;
+
+  if (gs)
+    gs->inspect_redirects++;
+
+  struct flow_inspect_key fi_key = {};
+  flow_inspect_key_from_flow(&fi_key, flow_key);
+  __u64 expiry = now_ns + INSPECT_CLONE_TTL_NS;
+  bpf_map_update_elem(&flows_to_inspect, &fi_key, &expiry, BPF_ANY);
+  return 1;
+}
+
+/*
+ * Write a temporary PASS verdict so the EveConsumer can overwrite it
+ * with DROP when Suricata alerts.  BPF_NOEXIST prevents overwriting an
+ * existing DROP verdict if an alert arrived between packets.
+ * Uses now_ns (CLOCK_MONOTONIC) — userspace must also use
+ * CLOCK_MONOTONIC when writing or comparing expires_ns.
+ */
+static __noinline void
+xdp_write_inspect_pass_verdict(const struct flow_key *flow_key, __u32 ifindex,
+                               __u64 now_ns) {
+  struct flow_verdict_key fv_key = {};
+  flow_verdict_key_from_flow(&fv_key, flow_key, ifindex);
+
+  struct flow_verdict pass_v = {};
+  pass_v.action = ACTION_PASS;
+  pass_v.expires_ns = now_ns + INSPECT_PASS_VERDICT_TTL_NS;
+  bpf_map_update_elem(&flow_verdict_cache, &fv_key, &pass_v, BPF_NOEXIST);
+}
+#endif /* SURICATA_IPS */
+
 /*
  * Process all actions for a matched rule in priority order
  * Returns the final XDP verdict (drop or pass).
@@ -16,12 +82,7 @@
  */
 static __always_inline __u32 process_rule_actions(
     struct xdp_md *ctx, struct global_stats *gs, struct l4_rule *policy,
-    struct flow_key *flow_key, __u64 now_ns, __u8 *cacheable
-#ifdef SURICATA_IPS
-    ,
-    const struct flow_verdict_key *fv_key
-#endif
-) {
+    struct flow_key *flow_key, __u64 now_ns, __u8 *cacheable) {
   __u32 final_verdict = XDP_PASS;
   __u32 should_log = 0;
   __u8 stop_actions = 0;
@@ -85,40 +146,8 @@ static __always_inline __u32 process_rule_actions(
        * and is overwritten with a DROP by the EVE consumer; never seed a
        * non-expiring policy verdict over it. */
       *cacheable = 0;
-      __u32 cfg_key = 0;
-      const struct inspect_config *cfg =
-          bpf_map_lookup_elem(&inspect_config, &cfg_key);
-      if (!cfg || cfg->mode == INSPECT_MODE_DISABLED)
-        break;
-
-      if (gs)
-        gs->inspect_redirects++;
-
-      /* Mark this flow for TC ingress cloning to Suricata.
-       * flows_to_inspect is keyed by the ifindex-less flow_inspect_key (shared
-       * with the TC skeleton), so build that from the flow rather than reusing
-       * fv_key (which now carries an ifindex for the verdict cache).
-       * TC ingress reads flows_to_inspect and calls bpf_clone_redirect to
-       * mirror each packet on this flow to pe-inspect0 while the original
-       * continues to the application.  Suricata receives the full TCP stream
-       * on pe-inspect1 (the veth peer) and fires alerts via EVE JSON.
-       * The EveConsumer writes DROP verdicts to flow_verdict_cache; the next
-       * packet on this flow is then dropped at the XDP verdict-cache check. */
-      struct flow_inspect_key fi_key = {};
-      flow_inspect_key_from_flow(&fi_key, flow_key);
-      __u64 expiry = now_ns + INSPECT_CLONE_TTL_NS;
-      bpf_map_update_elem(&flows_to_inspect, &fi_key, &expiry, BPF_ANY);
-
-      /* Write a temporary PASS verdict so the EveConsumer can overwrite it
-       * with DROP when Suricata alerts.  BPF_NOEXIST prevents overwriting an
-       * existing DROP verdict if an alert arrived between packets.
-       * Uses now_ns (CLOCK_MONOTONIC) — userspace must also use
-       * CLOCK_MONOTONIC when writing or comparing expires_ns. */
-      struct flow_verdict pass_v = {};
-      pass_v.action = ACTION_PASS;
-      pass_v.expires_ns = now_ns + INSPECT_PASS_VERDICT_TTL_NS;
-      bpf_map_update_elem(&flow_verdict_cache, fv_key, &pass_v, BPF_NOEXIST);
-
+      if (xdp_mark_flow_for_inspect(gs, flow_key, now_ns))
+        xdp_write_inspect_pass_verdict(flow_key, ctx->ingress_ifindex, now_ns);
       if (final_verdict != XDP_DROP)
         final_verdict = XDP_PASS;
       break;

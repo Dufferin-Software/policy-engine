@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
+//
+// Allow the unprivileged policy-engine service user to manage the Suricata
+// service and the suricata-update timer via systemd.  Without this, every
+// systemctl call from the daemon fails with "Interactive authentication
+// required" (the daemon's ambient capabilities do not apply to polkit).
+//
+// Installed only by the policy-engine-ips / policy-engine-ips-ipfix packages.
+polkit.addRule(function (action, subject) {
+    if (subject.user != "policy-engine")
+        return polkit.Result.NOT_HANDLED;
+
+    // start / stop / restart / kill — systemd passes the unit name, so
+    // these can be scoped to exactly the units the daemon manages.
+    if (action.id == "org.freedesktop.systemd1.manage-units") {
+        var unit = action.lookup("unit");
+        if (unit == "suricata.service" ||
+            unit == "policy-engine-suricata-update.timer" ||
+            unit == "policy-engine-suricata-update.service")
+            return polkit.Result.YES;
+        return polkit.Result.NOT_HANDLED;
+    }
+
+    // systemctl enable/disable (manage-unit-files) carries no per-unit
+    // detail, and daemon-reload is global by nature, so these are granted
+    // per-user rather than per-unit.  The daemon needs them for
+    // `systemctl enable --now policy-engine-suricata-update.timer` and to
+    // reload units after writing the suricata.service drop-in.
+    if (action.id == "org.freedesktop.systemd1.manage-unit-files" ||
+        action.id == "org.freedesktop.systemd1.reload-daemon")
+        return polkit.Result.YES;
+
+    return polkit.Result.NOT_HANDLED;
+});

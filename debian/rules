@@ -42,6 +42,8 @@ override_dh_auto_install:
 ifneq (,$(filter pkg.policy-engine.suricata,$(DEB_BUILD_PROFILES)))
 	install -D -m 644 debian/policy-engine-suricata-update.service $(CURDIR)/debian/$(INSTALL_PKG)/usr/lib/systemd/system/policy-engine-suricata-update.service
 	install -D -m 644 debian/policy-engine-suricata-update.timer $(CURDIR)/debian/$(INSTALL_PKG)/usr/lib/systemd/system/policy-engine-suricata-update.timer
+	# polkit rule letting the policy-engine user drive suricata via systemctl
+	install -D -m 644 debian/policy-engine-ips.polkit.rules $(CURDIR)/debian/$(INSTALL_PKG)/usr/share/polkit-1/rules.d/50-policy-engine-ips.rules
 endif
 	# Grafana dashboard + provisioning config → $(INSTALL_PKG) package
 	install -D -m 644 grafana/engine-data-plane.json $(CURDIR)/debian/$(INSTALL_PKG)/usr/share/policy-engine/grafana/policy-engine.json

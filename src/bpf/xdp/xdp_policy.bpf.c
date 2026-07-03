@@ -411,6 +411,30 @@ struct {
       (*__h)++;                                                       \
   } while (0)
 
+/*
+ * Build a flow_verdict_cache key from a parsed flow_key.  Shared by the
+ * verdict-cache lookup in xdp_policy_main, the verdict writers below, and the
+ * INSPECT pass-verdict writer in actions.h (hence defined before the include
+ * block) so all stay in sync on field layout (address family, addresses,
+ * ports, proto).
+ */
+static __always_inline void
+flow_verdict_key_from_flow(struct flow_verdict_key *fv_key,
+                           const struct flow_key *flow, __u32 ifindex) {
+  if (flow->af == AF_INET) {
+    fv_key->saddr4 = flow->saddr4;
+    fv_key->daddr4 = flow->daddr4;
+  } else {
+    __builtin_memcpy(fv_key->saddr6, flow->saddr6, 16);
+    __builtin_memcpy(fv_key->daddr6, flow->daddr6, 16);
+  }
+  fv_key->sport = flow->sport;
+  fv_key->dport = flow->dport;
+  fv_key->protocol = flow->protocol;
+  fv_key->af = flow->af;
+  fv_key->ifindex = ifindex;
+}
+
 // clang-format off
 #include "parse.h"
 #include "stats.h"
@@ -484,28 +508,6 @@ struct {
  * BPF_ANY so a DROP from a later rule in the chain overwrites an earlier
  * PASS seeded by an exhausted no-match probe on the same flow.
  */
-/*
- * Build a flow_verdict_cache key from a parsed flow_key.  Shared by the
- * verdict-cache lookup in xdp_policy_main and the verdict writer below so the
- * two stay in sync on field layout (address family, addresses, ports, proto).
- */
-static __always_inline void
-flow_verdict_key_from_flow(struct flow_verdict_key *fv_key,
-                           const struct flow_key *flow, __u32 ifindex) {
-  if (flow->af == AF_INET) {
-    fv_key->saddr4 = flow->saddr4;
-    fv_key->daddr4 = flow->daddr4;
-  } else {
-    __builtin_memcpy(fv_key->saddr6, flow->saddr6, 16);
-    __builtin_memcpy(fv_key->daddr6, flow->daddr6, 16);
-  }
-  fv_key->sport = flow->sport;
-  fv_key->dport = flow->dport;
-  fv_key->protocol = flow->protocol;
-  fv_key->af = flow->af;
-  fv_key->ifindex = ifindex;
-}
-
 static __always_inline void
 xdp_sni_write_verdict(const struct flow_key *flow, __u32 action, __u64 now_ns,
                       __u32 ifindex) {
@@ -530,7 +532,7 @@ xdp_sni_write_verdict(const struct flow_key *flow, __u32 action, __u64 now_ns,
  * Callers must only invoke this for cacheable flows (pure PASS/DROP — see
  * process_rule_actions' cacheable flag).
  */
-static __always_inline void
+static __noinline void
 xdp_policy_write_verdict(const struct flow_key *flow, __u32 action,
                          __u64 rule_id, __u64 now_ns, __u32 ifindex) {
   struct flow_verdict_key fv_key = {};
@@ -927,6 +929,24 @@ check_flow_verdict_cache(struct global_stats *stats,
 }
 
 /*
+ * Build the flow_verdict_key and check the verdict cache.
+ *
+ * Marked __noinline so the 64-byte key lives in this subprogram's frame
+ * instead of xdp_policy_main's: main's frame plus its deepest callee must fit
+ * the 512-byte combined stack limit, and main is the frame every callee
+ * stacks onto.  The lookup/branch state also re-converges at the call
+ * boundary instead of forking across the LPM walk.
+ */
+static __noinline int
+xdp_flow_verdict_cache_check(struct global_stats *stats,
+                             const struct flow_key *flow, __u32 ifindex,
+                             __u32 pkt_len, __u64 t0) {
+  struct flow_verdict_key fv_key = {};
+  flow_verdict_key_from_flow(&fv_key, flow, ifindex);
+  return check_flow_verdict_cache(stats, &fv_key, pkt_len, t0);
+}
+
+/*
  * Apply the L4 rules in a matched dst-prefix entry.
  *
  * rules[] is sorted by priority.  Non-SNI rules are evaluated immediately;
@@ -943,12 +963,7 @@ xdp_apply_l4_rules(struct xdp_md *ctx, struct global_stats *stats,
                    struct dst_lpm_value *policy, struct flow_key *flow_key,
                    __u64 t0, __u32 pkt_len, const __u8 *pkt_src_mac,
                    const __u8 *pkt_dst_mac, struct pkt_meta *meta,
-                   __u64 *fc_rule_id, __u8 *cacheable
-#ifdef SURICATA_IPS
-                   ,
-                   struct flow_verdict_key *fv_key
-#endif
-) {
+                   __u64 *fc_rule_id, __u8 *cacheable) {
   __u8 cnt = policy->count;
   if (cnt > MAX_L4_RULES)
     cnt = MAX_L4_RULES;
@@ -968,13 +983,8 @@ xdp_apply_l4_rules(struct xdp_md *ctx, struct global_stats *stats,
           update_rule_stats(rule->rule_id, pkt_len, t0);
           if (*fc_rule_id == 0)
             *fc_rule_id = rule->rule_id;
-          __u32 v = process_rule_actions(ctx, stats, rule, flow_key, t0,
-                                         cacheable
-#ifdef SURICATA_IPS
-                                         ,
-                                         fv_key
-#endif
-          );
+          __u32 v =
+              process_rule_actions(ctx, stats, rule, flow_key, t0, cacheable);
           if (v == XDP_DROP) {
             *fc_rule_id = rule->rule_id; /* override with the DROP rule */
             dropped = 1;
@@ -1037,10 +1047,16 @@ int xdp_policy_main(struct xdp_md *ctx) {
   /* Count ALL ingress packets (including non-IP, BUM, malformed) */
   __u32 ifindex = ctx->ingress_ifindex % MAX_INTERFACES;
   struct global_stats *stats = bpf_map_lookup_elem(&global_stats, &ifindex);
-  if (stats) {
-    stats->rx_packets++;
-    stats->rx_bytes += pkt_len;
-  }
+  /* Unreachable at runtime: PERCPU_ARRAY lookup with an in-bounds key (the
+   * modulo above) never fails.  The early return teaches the verifier stats
+   * is non-NULL, so every downstream `if (stats)` prunes instead of forking
+   * verifier states that are carried across the inlined LPM walk (a NULL /
+   * non-NULL map-value pointer held live across the program doubles its
+   * exploration and risks the 1M processed-insn limit). */
+  if (!stats)
+    return XDP_PASS;
+  stats->rx_packets++;
+  stats->rx_bytes += pkt_len;
 
   /* Check Ethernet header for BUM traffic classification and MAC matching */
   struct ethhdr *eth = data;
@@ -1126,12 +1142,9 @@ int xdp_policy_main(struct xdp_md *ctx) {
 
   /* Check flow verdict cache.  Writers are the Suricata EVE consumer (IPS
    * DROP verdicts), the QUIC SNI inspector, and any future flow-verdict
-   * source.  A hit short-circuits the policy lookup at XDP line rate.
-   * fv_key remains in scope for reuse by the INSPECT action below. */
-  struct flow_verdict_key fv_key = {};
-  flow_verdict_key_from_flow(&fv_key, &flow_key, ctx->ingress_ifindex);
-
-  int cached_verdict = check_flow_verdict_cache(stats, &fv_key, pkt_len, t0);
+   * source.  A hit short-circuits the policy lookup at XDP line rate. */
+  int cached_verdict = xdp_flow_verdict_cache_check(
+      stats, &flow_key, ctx->ingress_ifindex, pkt_len, t0);
   if (cached_verdict >= 0)
     return cached_verdict;
 
@@ -1152,20 +1165,18 @@ int xdp_policy_main(struct xdp_md *ctx) {
      * majority of packets — free of the 40-byte flow memcpy and the scalar
      * field writes, which FLOW_CACHE_TAIL_CALL would overwrite anyway. */
     struct pkt_meta *meta = bpf_map_lookup_elem(&pkt_scratch, &zero);
-    if (meta)
-      meta->sni_count = 0;
+    /* Unreachable at runtime (PERCPU_ARRAY, key 0) — early return teaches the
+     * verifier meta is non-NULL so the rule loop's meta checks prune. */
+    if (!meta)
+      return XDP_PASS;
+    meta->sni_count = 0;
 
     /* Cleared by xdp_apply_l4_rules if any matched rule carries a LOG / INSPECT
      * / TAIL_CALL action; gates the policy verdict seed below. */
     __u8 cacheable = 1;
     __u32 final_verdict = xdp_apply_l4_rules(ctx, stats, policy, &flow_key, t0,
                                              pkt_len, pkt_src_mac, pkt_dst_mac,
-                                             meta, &fc_rule_id, &cacheable
-#ifdef SURICATA_IPS
-                                             ,
-                                             &fv_key
-#endif
-    );
+                                             meta, &fc_rule_id, &cacheable);
     __u8 dropped = (final_verdict == XDP_DROP);
 
     /* If any SNI rules were queued (and no DROP already), tail-call to the

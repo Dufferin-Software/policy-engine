@@ -35,7 +35,7 @@ fn write_systemd_env_creates_files() {
         .expect("write_systemd_env failed");
 
     let policy = root.join("etc/suricata/policy-engine.yaml");
-    let env = root.join("etc/default/suricata-policy-engine");
+    let env = root.join("etc/suricata/suricata-policy-engine.env");
     let dropin = root.join("etc/systemd/system/suricata.service.d/policy-engine.conf");
 
     assert!(policy.exists(), "policy-engine.yaml should exist");
@@ -58,7 +58,7 @@ fn remove_systemd_env_removes_files() {
     rt.remove_systemd_env().expect("remove_systemd_env failed");
 
     let _policy = root.join("etc/suricata/policy-engine.yaml");
-    let env = root.join("etc/default/suricata-policy-engine");
+    let env = root.join("etc/suricata/suricata-policy-engine.env");
     let dropin = root.join("etc/systemd/system/suricata.service.d/policy-engine.conf");
 
     assert!(!env.exists(), "suricata env file should be removed");
@@ -120,7 +120,7 @@ fn write_systemd_env_yaml_has_af_packet_section() {
 #[test]
 fn write_systemd_env_env_file_contains_iface() {
     let (root, _rt) = setup_written_env("env_iface");
-    let env_path = root.join("etc/default/suricata-policy-engine");
+    let env_path = root.join("etc/suricata/suricata-policy-engine.env");
     let content = std::fs::read_to_string(&env_path).unwrap();
     assert!(
         content.contains("pe-test1"),
@@ -153,7 +153,7 @@ fn write_systemd_env_dropin_references_env_file() {
 fn write_then_remove_leaves_no_env_or_dropin() {
     let (root, rt) = setup_written_env("write_remove_cycle");
     rt.remove_systemd_env().unwrap();
-    let env = root.join("etc/default/suricata-policy-engine");
+    let env = root.join("etc/suricata/suricata-policy-engine.env");
     let dropin = root.join("etc/systemd/system/suricata.service.d/policy-engine.conf");
     assert!(!env.exists());
     assert!(!dropin.exists());
@@ -317,7 +317,8 @@ fn write_systemd_env_yaml_has_default_rule_path() {
 #[test]
 fn write_systemd_env_env_file_has_config_path() {
     let (root, _rt) = setup_written_env("env_config_path");
-    let content = std::fs::read_to_string(root.join("etc/default/suricata-policy-engine")).unwrap();
+    let content =
+        std::fs::read_to_string(root.join("etc/suricata/suricata-policy-engine.env")).unwrap();
     // The -c flag followed by the config path
     assert!(content.contains("-c "), "Env file should pass -c flag");
     assert!(
@@ -330,7 +331,8 @@ fn write_systemd_env_env_file_has_config_path() {
 #[test]
 fn write_systemd_env_env_file_has_pidfile() {
     let (root, _rt) = setup_written_env("env_pidfile");
-    let content = std::fs::read_to_string(root.join("etc/default/suricata-policy-engine")).unwrap();
+    let content =
+        std::fs::read_to_string(root.join("etc/suricata/suricata-policy-engine.env")).unwrap();
     assert!(content.contains("pidfile"), "Env file should set pidfile");
     let _ = std::fs::remove_dir_all(root);
 }
@@ -338,7 +340,8 @@ fn write_systemd_env_env_file_has_pidfile() {
 #[test]
 fn write_systemd_env_env_file_has_daemonize_flag() {
     let (root, _rt) = setup_written_env("env_daemon");
-    let content = std::fs::read_to_string(root.join("etc/default/suricata-policy-engine")).unwrap();
+    let content =
+        std::fs::read_to_string(root.join("etc/suricata/suricata-policy-engine.env")).unwrap();
     // -D flag makes Suricata daemonize
     assert!(
         content.contains("-D"),
