@@ -16,6 +16,20 @@ pub struct TaggedEventBatch {
     pub events_json: Vec<Vec<u8>>,
 }
 
+/// A Suricata EVE alert batch received from one node.
+///
+/// Kept on its own broadcast channel (not folded into the BPF event stream):
+/// alerts have a different schema (signature/category/severity), a dedicated
+/// persister/table, and their own operator WebSocket endpoint.
+#[derive(Clone, Debug)]
+pub struct TaggedSuricataAlertBatch {
+    pub node_id: String,
+    pub tenant_id: String,
+    pub timestamp_ns: u64,
+    /// Each entry is one JSON-encoded engine `SuricataAlert`.
+    pub alerts_json: Vec<Vec<u8>>,
+}
+
 /// Fan-out bus for BPF events arriving from all agents.
 ///
 /// The gRPC management handler calls `publish()` for every `EventBatch` it
@@ -24,18 +38,24 @@ pub struct TaggedEventBatch {
 #[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<TaggedEventBatch>,
+    suricata_tx: broadcast::Sender<TaggedSuricataAlertBatch>,
     /// Set to `true` on server shutdown so long-lived subscribers (the
-    /// `/ws/events` and `/ws/rule-events` WebSocket tasks) can close their
-    /// sessions promptly instead of holding connections open until the HTTP
-    /// server's `shutdown_timeout` elapses.
+    /// `/ws/events`, `/ws/rule-events` and `/ws/alerts` WebSocket tasks) can
+    /// close their sessions promptly instead of holding connections open
+    /// until the HTTP server's `shutdown_timeout` elapses.
     shutdown_tx: watch::Sender<bool>,
 }
 
 impl Default for EventBus {
     fn default() -> Self {
         let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
+        let (suricata_tx, _) = broadcast::channel(CHANNEL_CAPACITY);
         let (shutdown_tx, _) = watch::channel(false);
-        Self { tx, shutdown_tx }
+        Self {
+            tx,
+            suricata_tx,
+            shutdown_tx,
+        }
     }
 }
 
@@ -58,6 +78,17 @@ impl EventBus {
     /// responsibility).
     pub fn subscribe(&self) -> broadcast::Receiver<TaggedEventBatch> {
         self.tx.subscribe()
+    }
+
+    /// Publish a batch of Suricata alerts from a node.
+    pub fn publish_suricata_alerts(&self, batch: TaggedSuricataAlertBatch) {
+        let _ = self.suricata_tx.send(batch);
+    }
+
+    /// Subscribe to the Suricata alert stream (same lag semantics as
+    /// [`EventBus::subscribe`]).
+    pub fn subscribe_suricata_alerts(&self) -> broadcast::Receiver<TaggedSuricataAlertBatch> {
+        self.suricata_tx.subscribe()
     }
 
     /// Subscribe to the shutdown signal.
@@ -123,6 +154,26 @@ mod tests {
 
         assert_eq!(rx1.recv().await.unwrap().node_id, "n1");
         assert_eq!(rx2.recv().await.unwrap().node_id, "n1");
+    }
+
+    #[tokio::test]
+    async fn test_suricata_alerts_channel_is_independent() {
+        let bus = EventBus::new();
+        let mut alerts = bus.subscribe_suricata_alerts();
+        let mut events = bus.subscribe();
+
+        bus.publish_suricata_alerts(TaggedSuricataAlertBatch {
+            node_id: "n1".to_string(),
+            tenant_id: "default".to_string(),
+            timestamp_ns: 7,
+            alerts_json: vec![b"{}".to_vec()],
+        });
+
+        let got = alerts.recv().await.unwrap();
+        assert_eq!(got.node_id, "n1");
+        assert_eq!(got.tenant_id, "default");
+        // The BPF event channel must NOT receive alert batches.
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]

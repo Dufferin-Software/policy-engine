@@ -601,6 +601,279 @@ impl ControllerClient {
         Ok(r.set_urpf)
     }
 
+    /// Set the node-global Suricata inspect mode ("disabled", "ips", or "ids").
+    /// Rejected for nodes without the "suricata" capability.
+    pub fn set_inspect_mode(&self, node_id: &str, mode: &str) -> Result<OperationResult> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "setInspectMode")]
+            set_inspect_mode: OperationResult,
+        }
+        let q = r#"
+            mutation SetInspectMode($nodeId: ID!, $mode: String!) {
+                setInspectMode(nodeId: $nodeId, mode: $mode) {
+                    success message
+                }
+            }
+        "#;
+        let r: Response = self.execute(q, Some(json!({ "nodeId": node_id, "mode": mode })))?;
+        Ok(r.set_inspect_mode)
+    }
+
+    /// Enable or disable Suricata inspection on a single interface.
+    pub fn set_inspect_interface(
+        &self,
+        node_id: &str,
+        name: &str,
+        enabled: bool,
+    ) -> Result<OperationResult> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "setInspectInterface")]
+            set_inspect_interface: OperationResult,
+        }
+        let q = r#"
+            mutation SetInspectInterface($nodeId: ID!, $interfaceName: String!, $enabled: Boolean!) {
+                setInspectInterface(nodeId: $nodeId, interfaceName: $interfaceName, enabled: $enabled) {
+                    success message
+                }
+            }
+        "#;
+        let r: Response = self.execute(
+            q,
+            Some(json!({ "nodeId": node_id, "interfaceName": name, "enabled": enabled })),
+        )?;
+        Ok(r.set_inspect_interface)
+    }
+
+    /// Inspect status for a node.
+    pub fn node_inspect_status(&self, node_id: &str) -> Result<NodeInspectStatus> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct IfaceRow {
+            name: String,
+            inspect_enabled: bool,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct NodeRow {
+            inspect_mode: String,
+            capabilities: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Response {
+            node: Option<NodeRow>,
+            node_interfaces: Vec<IfaceRow>,
+        }
+        let q = r#"
+            query NodeInspectStatus($nodeId: ID!) {
+                node(id: $nodeId) { inspectMode capabilities }
+                nodeInterfaces(nodeId: $nodeId) { name inspectEnabled }
+            }
+        "#;
+        let r: Response = self.execute(q, Some(json!({ "nodeId": node_id })))?;
+        let node = r
+            .node
+            .ok_or_else(|| anyhow::anyhow!("Node '{}' not found", node_id))?;
+        Ok(NodeInspectStatus {
+            inspect_mode: node.inspect_mode,
+            capabilities: node.capabilities,
+            interfaces: r
+                .node_interfaces
+                .into_iter()
+                .map(|i| (i.name, i.inspect_enabled))
+                .collect(),
+        })
+    }
+
+    /// Query Suricata alerts (newest first), optionally filtered.
+    pub fn list_suricata_alerts(
+        &self,
+        node_id: Option<&str>,
+        min_severity: Option<i32>,
+        signature_id: Option<i32>,
+        limit: i32,
+    ) -> Result<Vec<SuricataAlert>> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "suricataAlerts")]
+            suricata_alerts: Vec<SuricataAlert>,
+        }
+        let q = r#"
+            query SuricataAlerts($filter: SuricataAlertFilterInput, $limit: Int) {
+                suricataAlerts(filter: $filter, limit: $limit) {
+                    id nodeId timestamp srcIp srcPort destIp destPort
+                    protocol action signatureId signature category severity
+                }
+            }
+        "#;
+        let mut filter = serde_json::Map::new();
+        if let Some(n) = node_id {
+            filter.insert("nodeId".into(), json!(n));
+        }
+        if let Some(s) = min_severity {
+            filter.insert("minSeverity".into(), json!(s));
+        }
+        if let Some(sid) = signature_id {
+            filter.insert("signatureId".into(), json!(sid));
+        }
+        let r: Response = self.execute(q, Some(json!({ "filter": filter, "limit": limit })))?;
+        Ok(r.suricata_alerts)
+    }
+
+    /// Create a fleet-managed Suricata ruleset from raw rule content.
+    pub fn create_suricata_ruleset(
+        &self,
+        name: &str,
+        content: &str,
+    ) -> Result<SuricataRulesetInfo> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "createSuricataRuleset")]
+            create_suricata_ruleset: SuricataRulesetInfo,
+        }
+        let q = r#"
+            mutation CreateSuricataRuleset($name: String!, $content: String!) {
+                createSuricataRuleset(name: $name, content: $content) {
+                    id name filename sha256 ruleCount assignedNodeIds
+                }
+            }
+        "#;
+        let r: Response = self.execute(q, Some(json!({ "name": name, "content": content })))?;
+        Ok(r.create_suricata_ruleset)
+    }
+
+    /// Replace a ruleset's content.
+    pub fn update_suricata_ruleset(&self, id: &str, content: &str) -> Result<SuricataRulesetInfo> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "updateSuricataRuleset")]
+            update_suricata_ruleset: SuricataRulesetInfo,
+        }
+        let q = r#"
+            mutation UpdateSuricataRuleset($id: ID!, $content: String!) {
+                updateSuricataRuleset(id: $id, content: $content) {
+                    id name filename sha256 ruleCount assignedNodeIds
+                }
+            }
+        "#;
+        let r: Response = self.execute(q, Some(json!({ "id": id, "content": content })))?;
+        Ok(r.update_suricata_ruleset)
+    }
+
+    /// Delete a ruleset (unassigns it everywhere).
+    pub fn delete_suricata_ruleset(&self, id: &str) -> Result<OperationResult> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "deleteSuricataRuleset")]
+            delete_suricata_ruleset: OperationResult,
+        }
+        let q = r#"
+            mutation DeleteSuricataRuleset($id: ID!) {
+                deleteSuricataRuleset(id: $id) { success message }
+            }
+        "#;
+        let r: Response = self.execute(q, Some(json!({ "id": id })))?;
+        Ok(r.delete_suricata_ruleset)
+    }
+
+    /// List rulesets (without content).
+    pub fn list_suricata_rulesets(&self) -> Result<Vec<SuricataRulesetInfo>> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "suricataRulesets")]
+            suricata_rulesets: Vec<SuricataRulesetInfo>,
+        }
+        let q = r#"
+            query {
+                suricataRulesets { id name filename sha256 ruleCount assignedNodeIds }
+            }
+        "#;
+        let r: Response = self.execute(q, None)?;
+        Ok(r.suricata_rulesets)
+    }
+
+    /// Fetch one ruleset with its content.
+    pub fn get_suricata_ruleset(&self, id: &str) -> Result<Option<SuricataRulesetDetail>> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "suricataRuleset")]
+            suricata_ruleset: Option<SuricataRulesetDetail>,
+        }
+        let q = r#"
+            query GetSuricataRuleset($id: ID!) {
+                suricataRuleset(id: $id) {
+                    id name filename sha256 ruleCount content assignedNodeIds
+                }
+            }
+        "#;
+        let r: Response = self.execute(q, Some(json!({ "id": id })))?;
+        Ok(r.suricata_ruleset)
+    }
+
+    /// Assign a ruleset to a node.
+    pub fn assign_suricata_ruleset(
+        &self,
+        node_id: &str,
+        ruleset_id: &str,
+    ) -> Result<OperationResult> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "assignSuricataRuleset")]
+            assign_suricata_ruleset: OperationResult,
+        }
+        let q = r#"
+            mutation AssignSuricataRuleset($nodeId: ID!, $rulesetId: ID!) {
+                assignSuricataRuleset(nodeId: $nodeId, rulesetId: $rulesetId) { success message }
+            }
+        "#;
+        let r: Response = self.execute(
+            q,
+            Some(json!({ "nodeId": node_id, "rulesetId": ruleset_id })),
+        )?;
+        Ok(r.assign_suricata_ruleset)
+    }
+
+    /// Unassign a ruleset from a node.
+    pub fn unassign_suricata_ruleset(
+        &self,
+        node_id: &str,
+        ruleset_id: &str,
+    ) -> Result<OperationResult> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "unassignSuricataRuleset")]
+            unassign_suricata_ruleset: OperationResult,
+        }
+        let q = r#"
+            mutation UnassignSuricataRuleset($nodeId: ID!, $rulesetId: ID!) {
+                unassignSuricataRuleset(nodeId: $nodeId, rulesetId: $rulesetId) { success message }
+            }
+        "#;
+        let r: Response = self.execute(
+            q,
+            Some(json!({ "nodeId": node_id, "rulesetId": ruleset_id })),
+        )?;
+        Ok(r.unassign_suricata_ruleset)
+    }
+
+    /// Force a gated ruleset sync of one node (waits for the agent confirm).
+    pub fn push_suricata_rulesets(&self, node_id: &str) -> Result<OperationResult> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "pushSuricataRulesets")]
+            push_suricata_rulesets: OperationResult,
+        }
+        let q = r#"
+            mutation PushSuricataRulesets($nodeId: ID!) {
+                pushSuricataRulesets(nodeId: $nodeId) { success message }
+            }
+        "#;
+        let r: Response = self.execute(q, Some(json!({ "nodeId": node_id })))?;
+        Ok(r.push_suricata_rulesets)
+    }
+
     /// Set the default action for unmatched packets on an interface+direction.
     pub fn set_interface_default_action(
         &self,

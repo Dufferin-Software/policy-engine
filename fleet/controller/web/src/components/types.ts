@@ -21,6 +21,10 @@ export interface ControlledNode {
   tenantId: string
   stopBehavior: string | null
   metricsIntervalSecs: number | null
+  /** JSON-encoded Capabilities blob from the most recent AgentHello ("{}" if unknown). */
+  capabilities: string
+  /** Node-global Suricata inspect mode: "disabled", "ips", or "ids". */
+  inspectMode: string
 }
 
 export interface RuleOutput {
@@ -58,6 +62,8 @@ export interface NodeInterfaceOutput {
   fibForwarding: boolean
   /** uRPF mode (ingress only): "off", "loose", or "strict". */
   urpfMode: string
+  /** Suricata inspection enabled on this interface (needs an active inspect mode). */
+  inspectEnabled: boolean
   ingressDefaultAction: string | null
   egressDefaultAction: string | null
 }

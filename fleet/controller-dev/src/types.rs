@@ -231,6 +231,61 @@ pub struct OperationResult {
     pub message: Option<String>,
 }
 
+/// A persisted Suricata alert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuricataAlert {
+    pub id: String,
+    pub node_id: String,
+    pub timestamp: String,
+    pub src_ip: Option<String>,
+    pub src_port: Option<i32>,
+    pub dest_ip: Option<String>,
+    pub dest_port: Option<i32>,
+    pub protocol: Option<String>,
+    pub action: Option<String>,
+    pub signature_id: Option<i32>,
+    pub signature: Option<String>,
+    pub category: Option<String>,
+    pub severity: Option<i32>,
+}
+
+/// A fleet-managed Suricata ruleset (listing form, no content).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuricataRulesetInfo {
+    pub id: String,
+    pub name: String,
+    pub filename: String,
+    pub sha256: String,
+    pub rule_count: i32,
+    pub assigned_node_ids: Vec<String>,
+}
+
+/// A fleet-managed Suricata ruleset with its full content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuricataRulesetDetail {
+    pub id: String,
+    pub name: String,
+    pub filename: String,
+    pub sha256: String,
+    pub rule_count: i32,
+    pub content: String,
+    pub assigned_node_ids: Vec<String>,
+}
+
+/// Suricata inspect status for a node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeInspectStatus {
+    /// Node-global inspect mode: "disabled", "ips", or "ids".
+    pub inspect_mode: String,
+    /// Raw JSON capabilities blob from the node's most recent AgentHello.
+    pub capabilities: String,
+    /// (interface name, inspection enabled) pairs.
+    pub interfaces: Vec<(String, bool)>,
+}
+
 /// A ZTP enrollment token as listed by the controller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

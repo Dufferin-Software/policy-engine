@@ -247,6 +247,84 @@ async fn ws_rule_events_handler(
     Ok(response)
 }
 
+// ── WebSocket Suricata alert stream ───────────────────────────────────────────
+
+/// WebSocket handler that streams Suricata EVE alerts to operator clients.
+///
+/// Subscribes to the alert channel of the `EventBus` and forwards each alert
+/// as a text frame, annotated with its `node_id`. An optional `?node=<id>`
+/// filters to a single node. Same auth/shutdown handling as `/ws/events`.
+async fn ws_alerts_handler(
+    req: HttpRequest,
+    body: web::Payload,
+    event_bus: Data<Arc<EventBus>>,
+    bearer_auth: Data<BearerAuthState>,
+    query: Query<EventsQuery>,
+) -> actix_web::Result<HttpResponse> {
+    let q = query.into_inner();
+    if let Err(resp) = authorize_ws_token(&bearer_auth, q.token.as_deref()).await {
+        return Ok(resp);
+    }
+    let (response, mut session, _msg_stream) = actix_ws::handle(&req, body)?;
+
+    let node_filter = q.node;
+    let mut rx = event_bus.subscribe_suricata_alerts();
+    let mut shutdown = event_bus.subscribe_shutdown();
+
+    actix_web::rt::spawn(async move {
+        loop {
+            let recv = tokio::select! {
+                _ = shutdown.changed() => {
+                    let _ = session.close(Some(actix_ws::CloseReason {
+                        code: actix_ws::CloseCode::Away,
+                        description: Some("server shutting down".into()),
+                    }))
+                    .await;
+                    return;
+                }
+                recv = rx.recv() => recv,
+            };
+            match recv {
+                Ok(batch) => {
+                    if let Some(ref nid) = node_filter {
+                        if &batch.node_id != nid {
+                            continue;
+                        }
+                    }
+                    // Annotate each alert with its node_id (the engine's JSON
+                    // carries none — each agent only forwards its own alerts).
+                    for alert_bytes in &batch.alerts_json {
+                        let text = match std::str::from_utf8(alert_bytes) {
+                            Ok(t) => t,
+                            Err(_) => continue,
+                        };
+                        let with_node = match serde_json::from_str::<serde_json::Value>(text) {
+                            Ok(serde_json::Value::Object(mut map)) => {
+                                map.insert(
+                                    "node_id".to_string(),
+                                    serde_json::Value::String(batch.node_id.clone()),
+                                );
+                                serde_json::to_string(&serde_json::Value::Object(map))
+                                    .unwrap_or_else(|_| text.to_string())
+                            }
+                            _ => text.to_string(),
+                        };
+                        if session.text(with_node).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("WebSocket alert subscriber lagged, dropped {} messages", n);
+                }
+            }
+        }
+    });
+
+    Ok(response)
+}
+
 // ── Prometheus metrics endpoints ──────────────────────────────────────────────
 
 /// Serve the most-recent Prometheus metrics for one node.
@@ -1051,6 +1129,7 @@ mod ws_auth_tests {
             .app_data(Data::new(state))
             .route("/ws/events", web::get().to(ws_events_handler))
             .route("/ws/rule-events", web::get().to(ws_rule_events_handler))
+            .route("/ws/alerts", web::get().to(ws_alerts_handler))
     }
 
     #[actix_web::test]
@@ -1358,6 +1437,7 @@ pub fn start_http_server(
             // /graphql and REST.
             .route("/ws/events", web::get().to(ws_events_handler))
             .route("/ws/rule-events", web::get().to(ws_rule_events_handler))
+            .route("/ws/alerts", web::get().to(ws_alerts_handler))
             // Prometheus metrics (unauthenticated — scraped by Prometheus
             // over a separate trust boundary; aggregate counters only).
             .route("/metrics", web::get().to(metrics_all_handler))

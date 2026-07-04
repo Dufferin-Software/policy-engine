@@ -17,10 +17,10 @@ import { wsUrl } from '../lib/auth'
 const GET_NODE_DETAIL = gql`
   query GetNodeDetail($id: ID!) {
     node(id: $id) {
-      id label hostname status dmiUuid certExpiry lastSeen enrolledAt tpmBacked agentVersion osPrettyName kernelVersion dmiSysVendor dmiProductName tenantId stopBehavior metricsIntervalSecs
+      id label hostname status dmiUuid certExpiry lastSeen enrolledAt tpmBacked agentVersion osPrettyName kernelVersion dmiSysVendor dmiProductName tenantId stopBehavior metricsIntervalSecs capabilities inspectMode
     }
     nodeInterfaces(nodeId: $id) {
-      nodeId name macAddress linkState addressesJson tag lastReported xdpAttached tcAttached fibForwarding urpfMode ingressDefaultAction egressDefaultAction
+      nodeId name macAddress linkState addressesJson tag lastReported xdpAttached tcAttached fibForwarding urpfMode inspectEnabled ingressDefaultAction egressDefaultAction
     }
     rules(nodeId: $id) {
       id tenantId nodeId interfaceName direction
@@ -52,6 +52,14 @@ const LOG_AUDIT_ENTRY = gql`
 const SET_DEFAULT_ACTION = gql`
   mutation SetInterfaceDefaultAction($nodeId: ID!, $interfaceName: String!, $direction: String!, $action: String!) {
     setInterfaceDefaultAction(nodeId: $nodeId, interfaceName: $interfaceName, direction: $direction, action: $action) {
+      success message
+    }
+  }
+`
+
+const SET_INSPECT_MODE = gql`
+  mutation SetInspectMode($nodeId: ID!, $mode: String!) {
+    setInspectMode(nodeId: $nodeId, mode: $mode) {
       success message
     }
   }
@@ -209,7 +217,9 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
   const [detachProgram] = useMutation(DETACH_PROGRAM)
   const [logAuditEntry] = useMutation(LOG_AUDIT_ENTRY)
   const [setNodeStopBehavior] = useMutation(SET_STOP_BEHAVIOR)
+  const [setInspectModeMutation] = useMutation(SET_INSPECT_MODE)
   const [stopBehaviorPending, setStopBehaviorPending] = useState(false)
+  const [inspectModePending, setInspectModePending] = useState(false)
   const [clearAllPolicyStats] = useMutation(CLEAR_ALL_POLICY_STATS)
   const [setNodeMetricsInterval] = useMutation(SET_METRICS_INTERVAL)
   // Mirrors the node's configured interval; empty string means "agent default".
@@ -378,6 +388,20 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
       flash(String(e).replace(/^ApolloError:\s*/, ''))
       setAttachPending((prev) => { const next = new Map(prev); next.delete(key); return next })
       handlePendingChange(false)
+    }
+  }
+
+  async function handleInspectModeChange(mode: string) {
+    setInspectModePending(true)
+    try {
+      const res = await setInspectModeMutation({ variables: { nodeId, mode } })
+      const r = res.data?.setInspectMode
+      if (!r?.success) flash(r?.message ?? 'Inspect mode update failed')
+      else refetch()
+    } catch (e) {
+      flash(String(e).replace(/^ApolloError:\s*/, ''))
+    } finally {
+      setInspectModePending(false)
     }
   }
 
@@ -553,6 +577,40 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
                         </button>
                       </span>
                     </div>
+                    {(() => {
+                      // IPS/IDS mode selector — only for nodes whose agent
+                      // advertised the "suricata" capability.
+                      let capable = false
+                      try {
+                        const caps = JSON.parse(node.capabilities || '{}')
+                        capable = Array.isArray(caps.features) && caps.features.includes('suricata')
+                      } catch { /* treat unparseable capabilities as not capable */ }
+                      if (!capable) return null
+                      const mode = node.inspectMode || 'disabled'
+                      const btn = (value: string, label: string, activeCls: string, tip: string) => (
+                        <button
+                          key={value}
+                          onClick={() => handleInspectModeChange(value)}
+                          disabled={inspectModePending}
+                          className={`px-2 py-0.5 ${mode === value ? activeCls : 'bg-gray-700 text-gray-400 hover:bg-gray-600'}`}
+                          title={tip}
+                        >
+                          {label}
+                        </button>
+                      )
+                      return (
+                        <div className="flex items-center justify-between">
+                          <span className="text-gray-500" title="Suricata inspection mode for this node. Traffic is only inspected on interfaces with inspection enabled (see the Interfaces page) and only for flows matched by INSPECT rules.">
+                            IPS/IDS mode
+                          </span>
+                          <span className={`inline-flex rounded overflow-hidden text-xs border border-gray-600 ${inspectModePending ? 'opacity-40 pointer-events-none' : ''}`}>
+                            {btn('disabled', 'off', 'bg-blue-700 text-white', 'Disable Suricata inspection on this node.')}
+                            {btn('ids', 'IDS', 'bg-yellow-700 text-white', 'Detection only: Suricata alerts are logged but traffic is never blocked.')}
+                            {btn('ips', 'IPS', 'bg-red-700 text-white', 'Prevention: Suricata alerts install DROP verdicts that block the offending flow at line rate.')}
+                          </span>
+                        </div>
+                      )
+                    })()}
                     <div className="flex items-center justify-between">
                       <span className="text-gray-500" title="How often the node's agent scrapes the local engine and forwards metrics to the controller. Empty = agent default.">
                         Metrics interval
@@ -591,6 +649,14 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
                   interfaces={interfaces}
                   rules={rules}
                   pendingGeneration={pendingGeneration}
+                  suricataCapable={(() => {
+                    try {
+                      const caps = JSON.parse(node?.capabilities || '{}')
+                      return Array.isArray(caps.features) && caps.features.includes('suricata')
+                    } catch {
+                      return false
+                    }
+                  })()}
                   onRefetch={() => refetch()}
                   onShowStats={(name) => setStatsIface((prev) => (prev === name ? null : name))}
                   onPendingChange={handlePendingChange}

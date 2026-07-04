@@ -51,6 +51,15 @@ enum Cmd {
     /// Interface management commands.
     #[command(subcommand)]
     Interfaces(InterfacesCmd),
+    /// Suricata IPS/IDS commands (nodes with the "suricata" capability).
+    #[command(subcommand)]
+    Inspect(InspectCmd),
+    /// Fleet-managed Suricata ruleset commands.
+    #[command(subcommand, name = "suricata-rules")]
+    SuricataRules(SuricataRulesCmd),
+    /// Suricata IPS/IDS alert commands.
+    #[command(subcommand)]
+    Alerts(AlertsCmd),
     /// Read a node's live flow verdict cache.
     Verdicts {
         /// Node ID.
@@ -73,6 +82,108 @@ enum Cmd {
     /// ZTP bootstrap token management.
     #[command(subcommand)]
     EnrollToken(EnrollTokenCmd),
+}
+
+// ── inspect subcommands ───────────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+enum InspectCmd {
+    /// Set the node-global inspect mode: disabled, ips, or ids.
+    SetMode {
+        /// Node ID.
+        node_id: String,
+        /// Inspect mode: disabled (off), ips, or ids.
+        mode: String,
+    },
+    /// Enable or disable inspection on a single interface.
+    Interface {
+        /// Node ID.
+        node_id: String,
+        /// Interface name (e.g. eth0).
+        name: String,
+        /// "on" to enable, "off" to disable.
+        state: String,
+    },
+    /// Show a node's inspect mode and per-interface inspection flags.
+    Status {
+        /// Node ID.
+        node_id: String,
+    },
+}
+
+// ── alerts subcommands ────────────────────────────────
+
+#[derive(Subcommand)]
+enum AlertsCmd {
+    /// List recent Suricata alerts (newest first).
+    List {
+        /// Filter to one node.
+        #[arg(long)]
+        node_id: Option<String>,
+        /// Only alerts at least this urgent (Suricata severity <= N).
+        #[arg(long)]
+        min_severity: Option<i32>,
+        /// Filter to one signature ID (sid).
+        #[arg(long)]
+        sid: Option<i32>,
+        /// Max alerts to show.
+        #[arg(long, default_value_t = 100)]
+        limit: i32,
+    },
+}
+
+// ── suricata-rules subcommands ────────────────────────────────────────────────
+
+#[derive(Subcommand)]
+enum SuricataRulesCmd {
+    /// Create a ruleset from a local rules file.
+    Create {
+        /// Ruleset name (lowercase letters, digits, '-', '_'). Materialises
+        /// on nodes as fleet-<name>.rules.
+        name: String,
+        /// Path to the Suricata rules file.
+        #[arg(long)]
+        file: String,
+    },
+    /// Replace a ruleset's content from a local rules file.
+    Update {
+        /// Ruleset ID.
+        ruleset_id: String,
+        /// Path to the Suricata rules file.
+        #[arg(long)]
+        file: String,
+    },
+    /// List all rulesets.
+    List,
+    /// Show one ruleset, including its rules.
+    Show {
+        /// Ruleset ID.
+        ruleset_id: String,
+    },
+    /// Delete a ruleset (unassigns it from all nodes).
+    Delete {
+        /// Ruleset ID.
+        ruleset_id: String,
+    },
+    /// Assign a ruleset to a node.
+    Assign {
+        /// Node ID.
+        node_id: String,
+        /// Ruleset ID.
+        ruleset_id: String,
+    },
+    /// Unassign a ruleset from a node.
+    Unassign {
+        /// Node ID.
+        node_id: String,
+        /// Ruleset ID.
+        ruleset_id: String,
+    },
+    /// Force a ruleset sync of one node and wait for the agent confirm.
+    Push {
+        /// Node ID.
+        node_id: String,
+    },
 }
 
 // ── enroll-token subcommands ──────────────────────────────────────────────────
@@ -1108,6 +1219,9 @@ fn main() -> Result<()> {
         Cmd::Nodes(cmd) => handle_nodes(&client, cmd, json),
         Cmd::Rules(cmd) => handle_rules(&client, cmd, json),
         Cmd::Interfaces(cmd) => handle_interfaces(&client, cmd, json),
+        Cmd::Inspect(cmd) => handle_inspect(&client, cmd, json),
+        Cmd::SuricataRules(cmd) => handle_suricata_rules(&client, cmd, json),
+        Cmd::Alerts(cmd) => handle_alerts(&client, cmd, json),
         Cmd::Verdicts {
             node_id,
             direction,
@@ -1118,6 +1232,215 @@ fn main() -> Result<()> {
         Cmd::CaCert => handle_ca_cert(&client, json),
         Cmd::EnrollToken(cmd) => handle_enroll_token(&client, cmd, json),
     }
+}
+
+fn handle_alerts(client: &ControllerClient, cmd: AlertsCmd, json: bool) -> Result<()> {
+    match cmd {
+        AlertsCmd::List {
+            node_id,
+            min_severity,
+            sid,
+            limit,
+        } => {
+            let alerts =
+                client.list_suricata_alerts(node_id.as_deref(), min_severity, sid, limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&alerts)?);
+            } else if alerts.is_empty() {
+                println!("No alerts.");
+            } else {
+                for a in alerts {
+                    let flow = format!(
+                        "{}:{} -> {}:{}",
+                        a.src_ip.as_deref().unwrap_or("?"),
+                        a.src_port.unwrap_or(0),
+                        a.dest_ip.as_deref().unwrap_or("?"),
+                        a.dest_port.unwrap_or(0),
+                    );
+                    println!(
+                        "{}  sev={}  sid={}  {}  {}  [{}]",
+                        a.timestamp,
+                        a.severity
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "?".into()),
+                        a.signature_id
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "?".into()),
+                        flow,
+                        a.signature.as_deref().unwrap_or("-"),
+                        a.node_id,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn handle_suricata_rules(
+    client: &ControllerClient,
+    cmd: SuricataRulesCmd,
+    json: bool,
+) -> Result<()> {
+    match cmd {
+        SuricataRulesCmd::Create { name, file } => {
+            let content =
+                std::fs::read_to_string(&file).with_context(|| format!("reading {}", file))?;
+            let rs = client.create_suricata_ruleset(&name, &content)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rs)?);
+            } else {
+                println!(
+                    "Created ruleset {} ({} rules) as {}",
+                    rs.name, rs.rule_count, rs.id
+                );
+            }
+        }
+        SuricataRulesCmd::Update { ruleset_id, file } => {
+            let content =
+                std::fs::read_to_string(&file).with_context(|| format!("reading {}", file))?;
+            let rs = client.update_suricata_ruleset(&ruleset_id, &content)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rs)?);
+            } else {
+                println!(
+                    "Updated ruleset {} ({} rules, sha256 {})",
+                    rs.name, rs.rule_count, rs.sha256
+                );
+            }
+        }
+        SuricataRulesCmd::List => {
+            let rulesets = client.list_suricata_rulesets()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rulesets)?);
+            } else if rulesets.is_empty() {
+                println!("No rulesets.");
+            } else {
+                for rs in rulesets {
+                    println!(
+                        "{}  {}  rules={}  nodes={}  {}",
+                        rs.id,
+                        rs.filename,
+                        rs.rule_count,
+                        rs.assigned_node_ids.len(),
+                        &rs.sha256[..12.min(rs.sha256.len())],
+                    );
+                }
+            }
+        }
+        SuricataRulesCmd::Show { ruleset_id } => match client.get_suricata_ruleset(&ruleset_id)? {
+            None => anyhow::bail!("Ruleset '{}' not found", ruleset_id),
+            Some(rs) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rs)?);
+                } else {
+                    println!(
+                        "# {} ({}, {} rules, sha256 {})",
+                        rs.name, rs.filename, rs.rule_count, rs.sha256
+                    );
+                    println!(
+                        "# assigned to: {}",
+                        if rs.assigned_node_ids.is_empty() {
+                            "no nodes".to_string()
+                        } else {
+                            rs.assigned_node_ids.join(", ")
+                        }
+                    );
+                    print!("{}", rs.content);
+                }
+            }
+        },
+        SuricataRulesCmd::Delete { ruleset_id } => {
+            let result = client.delete_suricata_ruleset(&ruleset_id)?;
+            print_result(&result, json);
+        }
+        SuricataRulesCmd::Assign {
+            node_id,
+            ruleset_id,
+        } => {
+            let result = client.assign_suricata_ruleset(&node_id, &ruleset_id)?;
+            print_result(&result, json);
+        }
+        SuricataRulesCmd::Unassign {
+            node_id,
+            ruleset_id,
+        } => {
+            let result = client.unassign_suricata_ruleset(&node_id, &ruleset_id)?;
+            print_result(&result, json);
+        }
+        SuricataRulesCmd::Push { node_id } => {
+            let result = client.push_suricata_rulesets(&node_id)?;
+            print_result(&result, json);
+        }
+    }
+    Ok(())
+}
+
+fn handle_inspect(client: &ControllerClient, cmd: InspectCmd, json: bool) -> Result<()> {
+    match cmd {
+        InspectCmd::SetMode { node_id, mode } => {
+            let result = client.set_inspect_mode(&node_id, &mode)?;
+            print_result(&result, json);
+        }
+        InspectCmd::Interface {
+            node_id,
+            name,
+            state,
+        } => {
+            let enabled = match state.to_lowercase().as_str() {
+                "on" | "enable" | "enabled" | "true" => true,
+                "off" | "disable" | "disabled" | "false" => false,
+                other => anyhow::bail!("Invalid state {:?}: expected \"on\" or \"off\"", other),
+            };
+            let result = client.set_inspect_interface(&node_id, &name, enabled)?;
+            print_result(&result, json);
+        }
+        InspectCmd::Status { node_id } => {
+            let status = client.node_inspect_status(&node_id)?;
+            let (mode, capabilities, interfaces) =
+                (status.inspect_mode, status.capabilities, status.interfaces);
+            let capable = serde_json::from_str::<serde_json::Value>(&capabilities)
+                .ok()
+                .and_then(|v| v.get("features").cloned())
+                .map(|f| {
+                    f.as_array()
+                        .is_some_and(|a| a.iter().any(|x| x == "suricata"))
+                })
+                .unwrap_or(false);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "nodeId": node_id,
+                        "inspectMode": mode,
+                        "suricataCapable": capable,
+                        "interfaces": interfaces
+                            .iter()
+                            .map(|(n, e)| serde_json::json!({ "name": n, "inspectEnabled": e }))
+                            .collect::<Vec<_>>(),
+                    })
+                );
+            } else {
+                println!("Inspect status for {}:", node_id);
+                println!("  Mode:             {}", mode);
+                println!("  Suricata capable: {}", capable);
+                let enabled: Vec<&str> = interfaces
+                    .iter()
+                    .filter(|(_, e)| *e)
+                    .map(|(n, _)| n.as_str())
+                    .collect();
+                println!(
+                    "  Interfaces:       {}",
+                    if enabled.is_empty() {
+                        "none".to_string()
+                    } else {
+                        enabled.join(", ")
+                    }
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

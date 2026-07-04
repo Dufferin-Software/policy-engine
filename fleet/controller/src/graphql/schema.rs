@@ -120,6 +120,10 @@ pub struct ControlledNodeOutput {
     /// doesn't churn the GraphQL schema. `"{}"` until the agent reconnects
     /// after step-6 was deployed.
     pub capabilities: String,
+    /// Node-global Suricata inspect mode: "disabled" / "ips" / "ids".
+    /// Agent-authoritative (snapshot writeback); requires the node to
+    /// advertise the "suricata" capability to be changed.
+    pub inspect_mode: String,
 }
 
 impl From<NodeRecord> for ControlledNodeOutput {
@@ -145,6 +149,7 @@ impl From<NodeRecord> for ControlledNodeOutput {
             stop_behavior: n.stop_behavior,
             metrics_interval_secs: n.metrics_interval_secs.map(|v| v as i32),
             capabilities: n.capabilities,
+            inspect_mode: n.inspect_mode,
         }
     }
 }
@@ -219,6 +224,9 @@ pub struct NodeInterfaceOutput {
     /// uRPF mode on this interface (ingress only): "off", "loose", or "strict".
     /// uRPF drops source-spoofed traffic; it is never supported on egress.
     pub urpf_mode: String,
+    /// True when Suricata inspection is enabled on this interface. Only
+    /// effective while the node's inspectMode is "ips"/"ids".
+    pub inspect_enabled: bool,
     /// Controller-set default action for unmatched ingress packets ("pass" or "drop").
     /// None means no explicit default has been set (engine default is "pass").
     pub ingress_default_action: Option<String>,
@@ -246,6 +254,7 @@ impl From<NodeInterface> for NodeInterfaceOutput {
                 2 => "strict".to_string(),
                 _ => "off".to_string(),
             },
+            inspect_enabled: i.inspect_enabled,
             ingress_default_action: i.ingress_default_action,
             egress_default_action: i.egress_default_action,
         }
@@ -556,6 +565,56 @@ impl QueryRoot {
         until: DateTime<Utc>,
     ) -> Result<Vec<AggregateBucketOutput>> {
         resolve_event_aggregate(ctx, filter, group_by, since, until).await
+    }
+
+    /// All fleet-managed Suricata rulesets for the current tenant.
+    #[graphql(guard = "Require::new(\"rule:read\")")]
+    async fn suricata_rulesets(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Vec<crate::graphql::suricata::SuricataRulesetOutput>> {
+        crate::graphql::suricata::resolve_suricata_rulesets(ctx).await
+    }
+
+    /// A single Suricata ruleset by ID (with content).
+    #[graphql(guard = "Require::new(\"rule:read\")")]
+    async fn suricata_ruleset(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+    ) -> Result<Option<crate::graphql::suricata::SuricataRulesetOutput>> {
+        crate::graphql::suricata::resolve_suricata_ruleset(ctx, id).await
+    }
+
+    /// Rulesets assigned to a node, with per-file sync state.
+    #[graphql(guard = "Require::new(\"rule:read\")")]
+    async fn node_suricata_rulesets(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+    ) -> Result<Vec<crate::graphql::suricata::AssignedRulesetOutput>> {
+        crate::graphql::suricata::resolve_node_suricata_rulesets(ctx, node_id).await
+    }
+
+    /// All agent-reported Suricata rule files on a node (fleet- and local).
+    #[graphql(guard = "Require::new(\"rule:read\")")]
+    async fn node_suricata_rule_files(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+    ) -> Result<Vec<crate::graphql::suricata::NodeRuleFileOutput>> {
+        crate::graphql::suricata::resolve_node_suricata_rule_files(ctx, node_id).await
+    }
+
+    /// Suricata IPS/IDS alerts (newest first), optionally filtered.
+    #[graphql(guard = "Require::new(\"event:read\")")]
+    async fn suricata_alerts(
+        &self,
+        ctx: &Context<'_>,
+        filter: Option<crate::graphql::suricata::SuricataAlertFilterInput>,
+        limit: Option<i32>,
+    ) -> Result<Vec<crate::graphql::suricata::SuricataAlertOutput>> {
+        crate::graphql::suricata::resolve_suricata_alerts(ctx, filter, limit).await
     }
 
     /// All configured alert rules for the current tenant.
@@ -1895,6 +1954,189 @@ impl MutationRoot {
         }
     }
 
+    /// Set the node-global Suricata inspect mode ("disabled", "ips", or
+    /// "ids"). Which interfaces are actually inspected is controlled
+    /// separately via setInspectInterface. Rejected for nodes that do not
+    /// advertise the "suricata" capability (engine built without the
+    /// feature, or an agent too old to run it) — an un-gated push would
+    /// otherwise strand the pending generation until its deadline.
+    #[graphql(guard = "Require::new(\"node:write\")")]
+    async fn set_inspect_mode(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+        mode: String,
+    ) -> Result<OperationResult> {
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        let pending = ctx.data::<Arc<PendingRegistry>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+        if let Err(msg) = require_node_feature(store, &node_id, "suricata").await {
+            return Ok(OperationResult::err(msg));
+        }
+
+        let mode_val: u32 = match mode.to_lowercase().as_str() {
+            "off" | "disabled" | "0" => 0,
+            "ips" | "1" => 1,
+            "ids" | "2" => 2,
+            other => {
+                return Ok(OperationResult::err(format!(
+                    "Invalid inspect mode '{}'; expected disabled, ips, or ids",
+                    other
+                )))
+            }
+        };
+
+        match drive_pending(
+            PendingOp::SetInspectMode {
+                node_id: node_id.0.clone(),
+                mode: mode_val,
+            },
+            pending,
+            sessions,
+            store,
+        )
+        .await
+        {
+            Ok(()) => Ok(OperationResult::ok()),
+            Err(e) => Ok(OperationResult::err(e.message)),
+        }
+    }
+
+    /// Enable or disable Suricata inspection on a single interface of a
+    /// node. Only takes effect while the node's inspect mode is active.
+    /// Rejected for nodes without the "suricata" capability.
+    #[graphql(guard = "Require::new(\"interface:write\")")]
+    async fn set_inspect_interface(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+        interface_name: String,
+        enabled: bool,
+    ) -> Result<OperationResult> {
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        let pending = ctx.data::<Arc<PendingRegistry>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+        if let Err(msg) = require_node_feature(store, &node_id, "suricata").await {
+            return Ok(OperationResult::err(msg));
+        }
+
+        match drive_pending(
+            PendingOp::SetInspectInterface {
+                node_id: node_id.0.clone(),
+                interface_name,
+                enabled,
+            },
+            pending,
+            sessions,
+            store,
+        )
+        .await
+        {
+            Ok(()) => Ok(OperationResult::ok()),
+            Err(e) => Ok(OperationResult::err(e.message)),
+        }
+    }
+
+    /// Create a fleet-managed Suricata ruleset.
+    #[graphql(guard = "Require::new(\"rule:write\")")]
+    async fn create_suricata_ruleset(
+        &self,
+        ctx: &Context<'_>,
+        name: String,
+        content: String,
+    ) -> Result<crate::graphql::suricata::SuricataRulesetOutput> {
+        crate::graphql::suricata::resolve_create_suricata_ruleset(ctx, name, content).await
+    }
+
+    /// Replace a ruleset's content and sync assigned online nodes.
+    #[graphql(guard = "Require::new(\"rule:write\")")]
+    async fn update_suricata_ruleset(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+        content: String,
+    ) -> Result<crate::graphql::suricata::SuricataRulesetOutput> {
+        crate::graphql::suricata::resolve_update_suricata_ruleset(ctx, id, content).await
+    }
+
+    /// Delete a ruleset, unassigning it everywhere and removing its file
+    /// from online nodes.
+    #[graphql(guard = "Require::new(\"rule:write\")")]
+    async fn delete_suricata_ruleset(&self, ctx: &Context<'_>, id: ID) -> Result<OperationResult> {
+        crate::graphql::suricata::resolve_delete_suricata_ruleset(ctx, id).await
+    }
+
+    /// Assign a ruleset to a node (requires the node's "suricata" capability).
+    #[graphql(guard = "Require::new(\"rule:write\")")]
+    async fn assign_suricata_ruleset(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+        ruleset_id: ID,
+    ) -> Result<OperationResult> {
+        crate::graphql::suricata::resolve_assign_suricata_ruleset(ctx, node_id, ruleset_id).await
+    }
+
+    /// Unassign a ruleset from a node (its fleet file is removed on sync).
+    #[graphql(guard = "Require::new(\"rule:write\")")]
+    async fn unassign_suricata_ruleset(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+        ruleset_id: ID,
+    ) -> Result<OperationResult> {
+        crate::graphql::suricata::resolve_unassign_suricata_ruleset(ctx, node_id, ruleset_id).await
+    }
+
+    /// Force a gated ruleset sync of one node and wait for the agent's
+    /// confirm. Returns success with a note when the node is already in sync.
+    #[graphql(guard = "Require::new(\"node:write\")")]
+    async fn push_suricata_rulesets(
+        &self,
+        ctx: &Context<'_>,
+        node_id: ID,
+    ) -> Result<OperationResult> {
+        let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+        let sessions = ctx.data::<Arc<NodeSessionManager>>()?;
+        let pending = ctx.data::<Arc<PendingRegistry>>()?;
+        let principal = ctx.data::<Arc<crate::rbac::Principal>>()?;
+        ensure_node_in_tenant(store, &node_id, &principal.tenant_slug).await?;
+        if let Err(msg) = require_node_feature(store, &node_id, "suricata").await {
+            return Ok(OperationResult::err(msg));
+        }
+
+        let desired = store.list_suricata_rulesets_for_node(&node_id.0).await?;
+        let reported = store
+            .list_node_suricata_rule_files(&node_id.0)
+            .await
+            .unwrap_or_default();
+        let Some(push) = crate::suricata_sync::build_ruleset_push(&desired, &reported) else {
+            return Ok(OperationResult {
+                success: true,
+                message: Some("Node is already in sync".to_string()),
+            });
+        };
+
+        match drive_pending(
+            PendingOp::PushSuricataRulesets {
+                node_id: node_id.0.clone(),
+                push,
+            },
+            pending,
+            sessions,
+            store,
+        )
+        .await
+        {
+            Ok(()) => Ok(OperationResult::ok()),
+            Err(e) => Ok(OperationResult::err(e.message)),
+        }
+    }
+
     /// Record a client-initiated audit entry (e.g. events exported).
     #[graphql(guard = "Require::new(\"audit:write\")")]
     async fn log_audit_entry(
@@ -2461,6 +2703,38 @@ async fn push_clear_stats(
     }
 }
 
+/// Require that a node's most recent AgentHello advertised `feature` in its
+/// capabilities. Feature-gated pushes (Suricata today) must be rejected here,
+/// synchronously: an agent that predates a message type silently drops the
+/// unknown oneof variant, which would otherwise strand the pending generation
+/// until its confirm deadline expires.
+async fn require_node_feature(
+    store: &Arc<dyn ControllerStore>,
+    node_id: &str,
+    feature: &str,
+) -> std::result::Result<(), String> {
+    let node = store
+        .get_node(node_id)
+        .await
+        .map_err(|e| format!("Failed to load node '{}': {:#}", node_id, e))?
+        .ok_or_else(|| format!("Node '{}' not found", node_id))?;
+
+    let features = serde_json::from_str::<serde_json::Value>(&node.capabilities)
+        .ok()
+        .and_then(|v| v.get("features").cloned())
+        .and_then(|f| serde_json::from_value::<Vec<String>>(f).ok())
+        .unwrap_or_default();
+
+    if features.iter().any(|f| f == feature) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Node '{}' does not support '{}' (agent or engine built without the feature)",
+            node_id, feature
+        ))
+    }
+}
+
 /// Gate → push → await agent confirm → commit to store.
 /// Returns Ok(()) only when the agent applied AND the controller committed.
 async fn drive_pending(
@@ -2733,6 +3007,7 @@ mod tests {
                 stop_behavior: None,
                 metrics_interval_secs: None,
                 capabilities: "{}".to_string(),
+                inspect_mode: "disabled".to_string(),
             })
             .await;
     }
@@ -2761,6 +3036,9 @@ mod tests {
                     Some(P::Attach(a)) => Some(a.generation_id),
                     Some(P::Detach(d)) => Some(d.generation_id),
                     Some(P::SetFib(f)) => Some(f.generation_id),
+                    Some(P::SetUrpf(u)) => Some(u.generation_id),
+                    Some(P::SetInspectMode(m)) => Some(m.generation_id),
+                    Some(P::SetInspectInterface(i)) => Some(i.generation_id),
                     _ => None,
                 };
                 if let Some(gen_id) = gen_id.filter(|g| !g.is_empty()) {
@@ -3527,6 +3805,224 @@ mod tests {
         assert!(res.errors.is_empty(), "{:?}", res.errors);
         let data = res.data.into_json().unwrap();
         assert!(!data["pushConfig"]["success"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_set_inspect_mode_rejects_non_capable_node() {
+        let h = make_harness().await;
+        // Default capabilities blob is "{}" — no "suricata" feature.
+        register_auto_confirming_agent(&h, "n1").await;
+        let res = h
+            .schema
+            .execute(
+                r#"mutation { setInspectMode(nodeId: "n1", mode: "ips") { success message } }"#,
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let data = res.data.into_json().unwrap();
+        assert!(!data["setInspectMode"]["success"].as_bool().unwrap());
+        assert!(data["setInspectMode"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not support"));
+        // Nothing committed.
+        assert_eq!(
+            h.store.get_node("n1").await.unwrap().unwrap().inspect_mode,
+            "disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_inspect_mode_applies_on_capable_node() {
+        let h = make_harness().await;
+        register_auto_confirming_agent(&h, "n1").await;
+        h.store
+            .update_node_capabilities("n1", r#"{"features":["suricata"],"sources":[]}"#)
+            .await
+            .unwrap();
+
+        let res = h
+            .schema
+            .execute(
+                r#"mutation { setInspectMode(nodeId: "n1", mode: "ips") { success message } }"#,
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let data = res.data.into_json().unwrap();
+        assert!(
+            data["setInspectMode"]["success"].as_bool().unwrap(),
+            "{:?}",
+            data
+        );
+        assert_eq!(
+            h.store.get_node("n1").await.unwrap().unwrap().inspect_mode,
+            "ips"
+        );
+
+        // Invalid mode string is rejected synchronously.
+        let res = h
+            .schema
+            .execute(
+                r#"mutation { setInspectMode(nodeId: "n1", mode: "paranoid") { success message } }"#,
+            )
+            .await;
+        let data = res.data.into_json().unwrap();
+        assert!(!data["setInspectMode"]["success"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_set_inspect_interface_applies_and_commits() {
+        use policy_controller_proto::controller::InterfaceReport;
+        let h = make_harness().await;
+        register_auto_confirming_agent(&h, "n1").await;
+        h.store
+            .update_node_capabilities("n1", r#"{"features":["suricata"],"sources":[]}"#)
+            .await
+            .unwrap();
+        h.store
+            .upsert_node_interfaces(
+                "n1",
+                &[InterfaceReport {
+                    name: "eth0".to_string(),
+                    addresses: vec![],
+                    mac_address: String::new(),
+                    link_state: "up".to_string(),
+                    ifindex: 2,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let res = h
+            .schema
+            .execute(
+                r#"mutation {
+                    setInspectInterface(nodeId: "n1", interfaceName: "eth0", enabled: true) {
+                        success message
+                    }
+                }"#,
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let data = res.data.into_json().unwrap();
+        assert!(
+            data["setInspectInterface"]["success"].as_bool().unwrap(),
+            "{:?}",
+            data
+        );
+        let ifaces = h.store.list_node_interfaces("n1").await.unwrap();
+        assert!(ifaces.iter().any(|i| i.name == "eth0" && i.inspect_enabled));
+    }
+
+    #[tokio::test]
+    async fn test_suricata_ruleset_crud_assign_and_push() {
+        let h = make_harness().await;
+        register_auto_confirming_agent(&h, "n1").await;
+        h.store
+            .update_node_capabilities("n1", r#"{"features":["suricata"],"sources":[]}"#)
+            .await
+            .unwrap();
+
+        // Create.
+        let res = h
+            .schema
+            .execute(
+                r#"mutation {
+                    createSuricataRuleset(
+                        name: "base"
+                        content: "alert tcp any any -> any any (sid:1;)"
+                    ) { id filename ruleCount sha256 }
+                }"#,
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let data = res.data.into_json().unwrap();
+        let rs = &data["createSuricataRuleset"];
+        assert_eq!(rs["filename"], "fleet-base.rules");
+        assert_eq!(rs["ruleCount"], 1);
+        let rs_id = rs["id"].as_str().unwrap().to_string();
+
+        // Assign to a capable node.
+        let res = h
+            .schema
+            .execute(format!(
+                r#"mutation {{ assignSuricataRuleset(nodeId: "n1", rulesetId: "{rs_id}") {{ success message }} }}"#
+            ))
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let data = res.data.into_json().unwrap();
+        assert!(
+            data["assignSuricataRuleset"]["success"].as_bool().unwrap(),
+            "{:?}",
+            data
+        );
+        assert_eq!(
+            h.store
+                .list_nodes_for_suricata_ruleset(&rs_id)
+                .await
+                .unwrap(),
+            vec!["n1".to_string()]
+        );
+
+        // Node reports the file in sync → push says "already in sync".
+        let rs_row = h.store.get_suricata_ruleset(&rs_id).await.unwrap().unwrap();
+        h.store
+            .replace_node_suricata_rule_files(
+                "n1",
+                &[crate::store::SuricataRuleFileReport {
+                    node_id: "n1".to_string(),
+                    filename: rs_row.filename(),
+                    sha256: rs_row.sha256.clone(),
+                    rule_count: rs_row.rule_count,
+                }],
+            )
+            .await
+            .unwrap();
+        let res = h
+            .schema
+            .execute(r#"mutation { pushSuricataRulesets(nodeId: "n1") { success message } }"#)
+            .await;
+        let data = res.data.into_json().unwrap();
+        assert!(data["pushSuricataRulesets"]["success"].as_bool().unwrap());
+        assert!(data["pushSuricataRulesets"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("in sync"));
+
+        // nodeSuricataRulesets reports in_sync = true.
+        let res = h
+            .schema
+            .execute(r#"{ nodeSuricataRulesets(nodeId: "n1") { name inSync } }"#)
+            .await;
+        let data = res.data.into_json().unwrap();
+        assert_eq!(data["nodeSuricataRulesets"][0]["name"], "base");
+        assert_eq!(data["nodeSuricataRulesets"][0]["inSync"], true);
+
+        // Assigning to a non-capable node is rejected.
+        register_auto_confirming_agent(&h, "plain").await;
+        let res = h
+            .schema
+            .execute(format!(
+                r#"mutation {{ assignSuricataRuleset(nodeId: "plain", rulesetId: "{rs_id}") {{ success message }} }}"#
+            ))
+            .await;
+        let data = res.data.into_json().unwrap();
+        assert!(!data["assignSuricataRuleset"]["success"].as_bool().unwrap());
+
+        // Delete unassigns everywhere.
+        let res = h
+            .schema
+            .execute(format!(
+                r#"mutation {{ deleteSuricataRuleset(id: "{rs_id}") {{ success }} }}"#
+            ))
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert!(h
+            .store
+            .get_suricata_ruleset(&rs_id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

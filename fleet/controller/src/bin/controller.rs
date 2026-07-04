@@ -169,6 +169,10 @@ async fn main() -> Result<()> {
     );
     let _retention_handle =
         event_pipeline::spawn_retention((*tenant_scope).clone(), Arc::clone(&event_metrics));
+    // Suricata alert persister: EVE alerts from the dedicated bus channel →
+    // suricata_alerts table (via the ControllerStore trait).
+    let _suricata_alert_handle =
+        event_pipeline::spawn_suricata_alert_persister(Arc::clone(&event_bus), Arc::clone(&store));
 
     // ── Alert pipeline (matcher → grouper → dispatcher) ───────────────────────
     let alert_metrics = Arc::new(event_pipeline::alert_metrics::AlertPipelineMetrics::new());

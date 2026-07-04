@@ -10,7 +10,9 @@ use std::sync::Mutex;
 
 use super::{
     rule_content_equal, AuditEntry, ControllerStore, DiffSummary, EnrollmentTokenRecord,
-    NewAuditEntry, NodeInterface, NodeRecord, NodeStatus, Rule, TokenRedeemOutcome,
+    NewAuditEntry, NewSuricataAlert, NodeInterface, NodeRecord, NodeStatus, Rule,
+    SuricataAlertFilter, SuricataAlertRecord, SuricataRuleFileReport, SuricataRuleset,
+    TokenRedeemOutcome,
 };
 
 /// In-memory implementation of [`ControllerStore`] for use in unit tests.
@@ -35,6 +37,13 @@ struct InMemoryState {
     audit_log: Vec<AuditEntry>,
     next_audit_id: i64,
     enrollment_tokens: HashMap<String, EnrollmentTokenRecord>,
+    suricata_rulesets: HashMap<String, SuricataRuleset>,
+    /// (node_id, ruleset_id) assignment pairs.
+    suricata_assignments: Vec<(String, String)>,
+    /// Maps node_id → agent-reported rule files.
+    suricata_rule_files: HashMap<String, Vec<SuricataRuleFileReport>>,
+    suricata_alerts: Vec<SuricataAlertRecord>,
+    next_alert_id: i64,
 }
 
 impl InMemoryControllerStore {
@@ -411,6 +420,7 @@ impl ControllerStore for InMemoryControllerStore {
             let tc = existing.is_some_and(|i| i.tc_attached);
             let fib = existing.is_some_and(|i| i.fib_forwarding);
             let urpf = existing.map(|i| i.urpf_mode).unwrap_or(0);
+            let inspect = existing.is_some_and(|i| i.inspect_enabled);
             let ingress_da = existing.and_then(|i| i.ingress_default_action.clone());
             let egress_da = existing.and_then(|i| i.egress_default_action.clone());
             state.interfaces.insert(
@@ -432,6 +442,7 @@ impl ControllerStore for InMemoryControllerStore {
                     tc_attached: tc,
                     fib_forwarding: fib,
                     urpf_mode: urpf,
+                    inspect_enabled: inspect,
                     ingress_default_action: ingress_da,
                     egress_default_action: egress_da,
                 },
@@ -531,6 +542,251 @@ impl ControllerStore for InMemoryControllerStore {
             }
         }
         Ok(())
+    }
+
+    async fn set_node_inspect_mode(&self, node_id: &str, mode: &str) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        if let Some(node) = state.nodes.get_mut(node_id) {
+            node.inspect_mode = mode.to_string();
+        }
+        Ok(())
+    }
+
+    async fn update_interface_inspect(
+        &self,
+        node_id: &str,
+        enabled_interfaces: &[String],
+    ) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        let enabled: std::collections::HashSet<&str> =
+            enabled_interfaces.iter().map(|s| s.as_str()).collect();
+        for iface in state.interfaces.values_mut() {
+            if iface.node_id == node_id {
+                iface.inspect_enabled = enabled.contains(iface.name.as_str());
+            }
+        }
+        Ok(())
+    }
+
+    async fn update_interface_inspect_enabled(
+        &self,
+        node_id: &str,
+        interface_name: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        for iface in state.interfaces.values_mut() {
+            if iface.node_id == node_id && iface.name == interface_name {
+                iface.inspect_enabled = enabled;
+            }
+        }
+        Ok(())
+    }
+
+    async fn create_suricata_ruleset(&self, ruleset: &SuricataRuleset) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        if state
+            .suricata_rulesets
+            .values()
+            .any(|r| r.tenant_id == ruleset.tenant_id && r.name == ruleset.name)
+        {
+            anyhow::bail!("Ruleset name '{}' already in use", ruleset.name);
+        }
+        state
+            .suricata_rulesets
+            .insert(ruleset.id.clone(), ruleset.clone());
+        Ok(())
+    }
+
+    async fn update_suricata_ruleset(
+        &self,
+        id: &str,
+        content: &str,
+        sha256: &str,
+        rule_count: u32,
+        updated_at: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        let rs = state
+            .suricata_rulesets
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("Ruleset '{}' not found", id))?;
+        rs.content = content.to_string();
+        rs.sha256 = sha256.to_string();
+        rs.rule_count = rule_count;
+        rs.updated_at = updated_at;
+        Ok(())
+    }
+
+    async fn delete_suricata_ruleset(&self, id: &str) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        state.suricata_rulesets.remove(id);
+        state.suricata_assignments.retain(|(_, r)| r != id);
+        Ok(())
+    }
+
+    async fn get_suricata_ruleset(&self, id: &str) -> Result<Option<SuricataRuleset>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .suricata_rulesets
+            .get(id)
+            .cloned())
+    }
+
+    async fn list_suricata_rulesets(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<SuricataRuleset>> {
+        let state = self.inner.lock().unwrap();
+        let mut out: Vec<SuricataRuleset> = state
+            .suricata_rulesets
+            .values()
+            .filter(|r| tenant_id.is_none_or(|t| r.tenant_id == t))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    async fn assign_suricata_ruleset(&self, node_id: &str, ruleset_id: &str) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        let pair = (node_id.to_string(), ruleset_id.to_string());
+        if !state.suricata_assignments.contains(&pair) {
+            state.suricata_assignments.push(pair);
+        }
+        Ok(())
+    }
+
+    async fn unassign_suricata_ruleset(&self, node_id: &str, ruleset_id: &str) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .suricata_assignments
+            .retain(|(n, r)| !(n == node_id && r == ruleset_id));
+        Ok(())
+    }
+
+    async fn list_suricata_rulesets_for_node(&self, node_id: &str) -> Result<Vec<SuricataRuleset>> {
+        let state = self.inner.lock().unwrap();
+        let mut out: Vec<SuricataRuleset> = state
+            .suricata_assignments
+            .iter()
+            .filter(|(n, _)| n == node_id)
+            .filter_map(|(_, r)| state.suricata_rulesets.get(r).cloned())
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    async fn list_nodes_for_suricata_ruleset(&self, ruleset_id: &str) -> Result<Vec<String>> {
+        let state = self.inner.lock().unwrap();
+        let mut out: Vec<String> = state
+            .suricata_assignments
+            .iter()
+            .filter(|(_, r)| r == ruleset_id)
+            .map(|(n, _)| n.clone())
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    async fn replace_node_suricata_rule_files(
+        &self,
+        node_id: &str,
+        files: &[SuricataRuleFileReport],
+    ) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .suricata_rule_files
+            .insert(node_id.to_string(), files.to_vec());
+        Ok(())
+    }
+
+    async fn list_node_suricata_rule_files(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<SuricataRuleFileReport>> {
+        let mut out = self
+            .inner
+            .lock()
+            .unwrap()
+            .suricata_rule_files
+            .get(node_id)
+            .cloned()
+            .unwrap_or_default();
+        out.sort_by(|a, b| a.filename.cmp(&b.filename));
+        Ok(out)
+    }
+
+    async fn insert_suricata_alerts(&self, alerts: &[NewSuricataAlert]) -> Result<()> {
+        let mut state = self.inner.lock().unwrap();
+        for a in alerts {
+            let id = state.next_alert_id;
+            state.next_alert_id += 1;
+            state.suricata_alerts.push(SuricataAlertRecord {
+                id,
+                tenant_id: a.tenant_id.clone(),
+                node_id: a.node_id.clone(),
+                timestamp: a.timestamp.clone(),
+                received_ns: a.received_ns,
+                src_ip: a.src_ip.clone(),
+                src_port: a.src_port,
+                dst_ip: a.dst_ip.clone(),
+                dst_port: a.dst_port,
+                proto: a.proto.clone(),
+                action: a.action.clone(),
+                signature_id: a.signature_id,
+                signature: a.signature.clone(),
+                category: a.category.clone(),
+                severity: a.severity,
+                raw_json: a.raw_json.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn list_suricata_alerts(
+        &self,
+        filter: &SuricataAlertFilter,
+        limit: i64,
+    ) -> Result<Vec<SuricataAlertRecord>> {
+        let state = self.inner.lock().unwrap();
+        let mut out: Vec<SuricataAlertRecord> = state
+            .suricata_alerts
+            .iter()
+            .filter(|a| filter.tenant_id.as_ref().is_none_or(|t| &a.tenant_id == t))
+            .filter(|a| filter.node_id.as_ref().is_none_or(|n| &a.node_id == n))
+            .filter(|a| {
+                filter
+                    .min_severity
+                    .is_none_or(|s| a.severity.is_some_and(|v| v <= s))
+            })
+            .filter(|a| {
+                filter
+                    .signature_id
+                    .is_none_or(|sid| a.signature_id == Some(sid))
+            })
+            .filter(|a| {
+                filter
+                    .signature_contains
+                    .as_ref()
+                    .is_none_or(|sig| a.signature.as_ref().is_some_and(|s| s.contains(sig)))
+            })
+            .cloned()
+            .collect();
+        out.sort_by_key(|a| std::cmp::Reverse(a.received_ns));
+        out.truncate(limit.max(0) as usize);
+        Ok(out)
+    }
+
+    async fn prune_suricata_alerts(&self, cutoff_ns: i64) -> Result<u64> {
+        let mut state = self.inner.lock().unwrap();
+        let before = state.suricata_alerts.len();
+        state.suricata_alerts.retain(|a| a.received_ns >= cutoff_ns);
+        Ok((before - state.suricata_alerts.len()) as u64)
     }
 
     async fn update_interface_attachments(
@@ -766,6 +1022,7 @@ mod tests {
             stop_behavior: None,
             metrics_interval_secs: None,
             capabilities: "{}".to_string(),
+            inspect_mode: "disabled".to_string(),
         }
     }
 

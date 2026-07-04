@@ -46,6 +46,23 @@ pub enum InverseOp {
     },
     /// Restore the FIB-forwarding enable state of an interface.
     SetFibForwarding { interface: String, enabled: bool },
+    /// Restore the node-global Suricata inspect mode (0=disabled, 1=IPS, 2=IDS).
+    SetInspectMode { mode: u32 },
+    /// Restore the per-interface Suricata inspection flag.
+    SetInspectInterface { interface: String, enabled: bool },
+}
+
+/// Suricata inspect state reported by the local engine.  Default (mode 0, no
+/// interfaces, no files) doubles as the "engine has no suricata feature"
+/// answer so snapshot building degrades gracefully.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LocalInspectStatus {
+    /// 0 = disabled, 1 = IPS, 2 = IDS (matches engine InspectMode).
+    pub mode: u32,
+    /// Interfaces with per-interface inspection enabled.
+    pub enabled_interfaces: Vec<String>,
+    /// Custom rule files as (filename, hex sha256, rule_count).
+    pub rule_files: Vec<(String, String, u32)>,
 }
 
 // ── Local policy-engine client abstraction (mockable) ────────────────────────
@@ -98,6 +115,36 @@ pub trait LocalPolicyClient: Send + Sync {
     /// Query the current uRPF mode for an interface ("off" / "loose" / "strict").
     /// Used to capture the prior value so a change can be rolled back.
     async fn get_urpf(&self, interface: &str) -> Result<String>;
+
+    // ── Suricata inspect (default impls so non-suricata clients/mocks need no
+    //    changes; the real client overrides all three) ────────────────────────
+
+    /// Set the node-global inspect mode: 0=disabled, 1=IPS, 2=IDS.
+    async fn set_inspect_mode(&self, _mode: u32) -> Result<()> {
+        anyhow::bail!("set_inspect_mode not supported by this client")
+    }
+    /// Enable/disable Suricata inspection on one interface.
+    async fn set_inspect_interface(&self, _interface: &str, _enabled: bool) -> Result<()> {
+        anyhow::bail!("set_inspect_interface not supported by this client")
+    }
+    /// Full inspect state (mode, enabled interfaces, rule-file digests).
+    /// The default returns "disabled / nothing" — the correct answer for an
+    /// engine built without the suricata feature.
+    async fn get_inspect_status(&self) -> Result<LocalInspectStatus> {
+        Ok(LocalInspectStatus::default())
+    }
+    /// Write one Suricata rule file (byte-verbatim; drift-digest contract).
+    async fn deploy_suricata_rules(&self, _filename: &str, _rules: &str) -> Result<()> {
+        anyhow::bail!("deploy_suricata_rules not supported by this client")
+    }
+    /// Delete one Suricata rule file from the rules directory.
+    async fn delete_suricata_rule_file(&self, _filename: &str) -> Result<()> {
+        anyhow::bail!("delete_suricata_rule_file not supported by this client")
+    }
+    /// Signal Suricata to reload its rules.
+    async fn reload_suricata_rules(&self) -> Result<()> {
+        anyhow::bail!("reload_suricata_rules not supported by this client")
+    }
 }
 
 // ── Real implementation using policy-engine-dev (blocking → async) ────────────
@@ -211,6 +258,97 @@ impl LocalPolicyClient for SpawnBlockingLocalClient {
         tokio::task::spawn_blocking(move || client.get_urpf(&iface))
             .await
             .context("spawn_blocking panicked")?
+    }
+
+    async fn set_inspect_mode(&self, mode: u32) -> Result<()> {
+        let client = self.make_client();
+        let result = tokio::task::spawn_blocking(move || match mode {
+            0 => client.disable_inspect(),
+            1 => client.configure_inspect(policy_engine_dev::GqlInspectMode::Ips),
+            2 => client.configure_inspect(policy_engine_dev::GqlInspectMode::Ids),
+            other => anyhow::bail!("invalid inspect mode {}", other),
+        })
+        .await
+        .context("spawn_blocking panicked")??;
+        if result.success {
+            Ok(())
+        } else {
+            anyhow::bail!("set_inspect_mode failed: {}", result.message)
+        }
+    }
+
+    async fn set_inspect_interface(&self, interface: &str, enabled: bool) -> Result<()> {
+        let client = self.make_client();
+        let iface = interface.to_string();
+        let result =
+            tokio::task::spawn_blocking(move || client.set_inspect_interface(&iface, enabled))
+                .await
+                .context("spawn_blocking panicked")??;
+        if result.success {
+            Ok(())
+        } else {
+            anyhow::bail!("set_inspect_interface failed: {}", result.message)
+        }
+    }
+
+    async fn deploy_suricata_rules(&self, filename: &str, rules: &str) -> Result<()> {
+        let client = self.make_client();
+        let f = filename.to_string();
+        let r = rules.to_string();
+        let result = tokio::task::spawn_blocking(move || client.deploy_suricata_rules(&r, &f))
+            .await
+            .context("spawn_blocking panicked")??;
+        if result.success {
+            Ok(())
+        } else {
+            anyhow::bail!("deploy_suricata_rules failed: {}", result.message)
+        }
+    }
+
+    async fn delete_suricata_rule_file(&self, filename: &str) -> Result<()> {
+        let client = self.make_client();
+        let f = filename.to_string();
+        let result = tokio::task::spawn_blocking(move || client.delete_suricata_rule_file(&f))
+            .await
+            .context("spawn_blocking panicked")??;
+        if result.success {
+            Ok(())
+        } else {
+            anyhow::bail!("delete_suricata_rule_file failed: {}", result.message)
+        }
+    }
+
+    async fn reload_suricata_rules(&self) -> Result<()> {
+        let client = self.make_client();
+        let result = tokio::task::spawn_blocking(move || client.reload_suricata_rules())
+            .await
+            .context("spawn_blocking panicked")??;
+        if result.success {
+            Ok(())
+        } else {
+            anyhow::bail!("reload_suricata_rules failed: {}", result.message)
+        }
+    }
+
+    async fn get_inspect_status(&self) -> Result<LocalInspectStatus> {
+        let client = self.make_client();
+        let status = tokio::task::spawn_blocking(move || client.inspect_status())
+            .await
+            .context("spawn_blocking panicked")??;
+        let mode = match status.mode {
+            policy_engine_dev::GqlInspectMode::Disabled => 0,
+            policy_engine_dev::GqlInspectMode::Ips => 1,
+            policy_engine_dev::GqlInspectMode::Ids => 2,
+        };
+        Ok(LocalInspectStatus {
+            mode,
+            enabled_interfaces: status.enabled_interfaces,
+            rule_files: status
+                .custom_rule_files
+                .into_iter()
+                .map(|f| (f.filename, f.sha256, f.rule_count.max(0) as u32))
+                .collect(),
+        })
     }
 
     async fn attach_ingress(&self, interface: &str, mode: &str) -> Result<()> {
@@ -430,6 +568,91 @@ impl ConfigApplier {
         self.client.set_fib_forwarding(interface, enabled).await
     }
 
+    /// Full Suricata inspect state from the local engine (prior-value capture
+    /// for gated inspect changes + StateSnapshot reporting).
+    pub async fn get_inspect_status(&self) -> Result<LocalInspectStatus> {
+        self.client.get_inspect_status().await
+    }
+
+    /// Set the node-global inspect mode (0=disabled, 1=IPS, 2=IDS).
+    pub async fn set_inspect_mode(&self, mode: u32) -> Result<()> {
+        self.client.set_inspect_mode(mode).await
+    }
+
+    /// Enable/disable Suricata inspection on one interface.
+    pub async fn set_inspect_interface(&self, interface: &str, enabled: bool) -> Result<()> {
+        self.client.set_inspect_interface(interface, enabled).await
+    }
+
+    /// Apply a fleet Suricata ruleset push: verify every file's digest, write
+    /// the changed files, delete stale fleet-managed files not in the desired
+    /// set, then reload Suricata once.
+    ///
+    /// Idempotent desired-state sync — deliberately NOT reverted on watchdog
+    /// timeout (the caller registers it with an empty inverse-op list): a
+    /// ruleset deploy cannot sever the control channel, and the controller's
+    /// snapshot-driven drift detection re-converges any partial state.
+    /// Only "fleet-" prefixed files are ever written or deleted; node-local
+    /// rule files stay operator-owned.
+    pub async fn apply_suricata_ruleset_push(
+        &self,
+        push: &policy_controller_proto::controller::SuricataRulesetPush,
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+
+        // Validate everything up front so a bad push changes nothing.
+        for f in &push.files {
+            anyhow::ensure!(
+                f.filename.starts_with("fleet-") && f.filename.ends_with(".rules"),
+                "refusing to write non-fleet rule file {:?}",
+                f.filename
+            );
+            let digest = format!("{:x}", Sha256::digest(&f.content));
+            anyhow::ensure!(
+                digest == f.sha256,
+                "digest mismatch for {:?}: push says {} but content hashes to {}",
+                f.filename,
+                f.sha256,
+                digest
+            );
+            anyhow::ensure!(
+                std::str::from_utf8(&f.content).is_ok(),
+                "rule file {:?} is not valid UTF-8",
+                f.filename
+            );
+        }
+        for name in &push.desired_filenames {
+            anyhow::ensure!(
+                name.starts_with("fleet-"),
+                "desired filename {:?} lacks the fleet- prefix",
+                name
+            );
+        }
+
+        for f in &push.files {
+            let content = std::str::from_utf8(&f.content).expect("validated above");
+            self.client
+                .deploy_suricata_rules(&f.filename, content)
+                .await
+                .with_context(|| format!("deploying {}", f.filename))?;
+        }
+
+        // Delete fleet-managed files that are no longer desired.
+        let desired: std::collections::HashSet<&str> =
+            push.desired_filenames.iter().map(|s| s.as_str()).collect();
+        let status = self.client.get_inspect_status().await?;
+        for (name, _, _) in &status.rule_files {
+            if name.starts_with("fleet-") && !desired.contains(name.as_str()) {
+                self.client
+                    .delete_suricata_rule_file(name)
+                    .await
+                    .with_context(|| format!("deleting stale {}", name))?;
+            }
+        }
+
+        self.client.reload_suricata_rules().await
+    }
+
     /// Capture the inverse of a push *before* applying it.
     ///
     /// Queries current rules (to snapshot JSON for any rule the push is about
@@ -600,6 +823,21 @@ impl ConfigApplier {
                     if let Err(e) = self.client.set_fib_forwarding(interface, *enabled).await {
                         log::warn!(
                             "apply_inverse: set_fib_forwarding({}, {}) failed: {:#}",
+                            interface,
+                            enabled,
+                            e
+                        );
+                    }
+                }
+                InverseOp::SetInspectMode { mode } => {
+                    if let Err(e) = self.client.set_inspect_mode(*mode).await {
+                        log::warn!("apply_inverse: set_inspect_mode({}) failed: {:#}", mode, e);
+                    }
+                }
+                InverseOp::SetInspectInterface { interface, enabled } => {
+                    if let Err(e) = self.client.set_inspect_interface(interface, *enabled).await {
+                        log::warn!(
+                            "apply_inverse: set_inspect_interface({}, {}) failed: {:#}",
                             interface,
                             enabled,
                             e
@@ -822,6 +1060,13 @@ mod tests {
         defaults: Mutex<Vec<(String, String)>>,
         attaches: Mutex<Vec<(String, String)>>,
         urpf_sets: Mutex<Vec<(String, String)>>,
+        inspect_mode_sets: Mutex<Vec<u32>>,
+        inspect_iface_sets: Mutex<Vec<(String, bool)>>,
+        deployed_rules: Mutex<Vec<(String, String)>>,
+        deleted_rule_files: Mutex<Vec<String>>,
+        reload_count: Mutex<u32>,
+        /// Rule files reported by get_inspect_status: (filename, sha256, count).
+        seeded_rule_files: Mutex<Vec<(String, String, u32)>>,
         detaches: Mutex<Vec<(String, String)>>,
         fib_sets: Mutex<Vec<(String, bool)>>,
         /// Seeded rules returned by `list_rules_json`, keyed by direction.
@@ -927,6 +1172,42 @@ mod tests {
         }
         async fn get_urpf(&self, _i: &str) -> Result<String> {
             Ok("off".to_string())
+        }
+        async fn set_inspect_mode(&self, mode: u32) -> Result<()> {
+            self.inspect_mode_sets.lock().unwrap().push(mode);
+            Ok(())
+        }
+        async fn set_inspect_interface(&self, interface: &str, enabled: bool) -> Result<()> {
+            self.inspect_iface_sets
+                .lock()
+                .unwrap()
+                .push((interface.to_string(), enabled));
+            Ok(())
+        }
+        async fn get_inspect_status(&self) -> Result<LocalInspectStatus> {
+            Ok(LocalInspectStatus {
+                mode: 0,
+                enabled_interfaces: vec![],
+                rule_files: self.seeded_rule_files.lock().unwrap().clone(),
+            })
+        }
+        async fn deploy_suricata_rules(&self, filename: &str, rules: &str) -> Result<()> {
+            self.deployed_rules
+                .lock()
+                .unwrap()
+                .push((filename.to_string(), rules.to_string()));
+            Ok(())
+        }
+        async fn delete_suricata_rule_file(&self, filename: &str) -> Result<()> {
+            self.deleted_rule_files
+                .lock()
+                .unwrap()
+                .push(filename.to_string());
+            Ok(())
+        }
+        async fn reload_suricata_rules(&self) -> Result<()> {
+            *self.reload_count.lock().unwrap() += 1;
+            Ok(())
         }
         async fn detach_ingress(&self, interface: &str) -> Result<()> {
             self.detaches
@@ -1162,6 +1443,120 @@ mod tests {
             vec![("eth0".to_string(), "off".to_string())],
             "apply_inverse(SetUrpf) must restore the prior uRPF mode"
         );
+    }
+
+    #[tokio::test]
+    async fn test_apply_inverse_inspect_ops_restore_prior_state() {
+        // Watchdog rollback for the Suricata ops: the inverse must restore
+        // the captured prior mode and per-interface flag.
+        let client = Arc::new(RecordingClient::default());
+        let applier = ConfigApplier::new(Arc::clone(&client) as Arc<dyn LocalPolicyClient>);
+
+        applier
+            .apply_inverse(&[
+                InverseOp::SetInspectMode { mode: 0 },
+                InverseOp::SetInspectInterface {
+                    interface: "eth0".to_string(),
+                    enabled: false,
+                },
+            ])
+            .await;
+
+        assert_eq!(*client.inspect_mode_sets.lock().unwrap(), vec![0]);
+        assert_eq!(
+            *client.inspect_iface_sets.lock().unwrap(),
+            vec![("eth0".to_string(), false)]
+        );
+    }
+
+    fn ruleset_push(
+        files: Vec<(&str, &str)>,
+        desired: Vec<&str>,
+    ) -> policy_controller_proto::controller::SuricataRulesetPush {
+        use sha2::{Digest, Sha256};
+        policy_controller_proto::controller::SuricataRulesetPush {
+            files: files
+                .into_iter()
+                .map(
+                    |(name, content)| policy_controller_proto::controller::SuricataRuleFile {
+                        filename: name.to_string(),
+                        content: content.as_bytes().to_vec(),
+                        sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
+                        rule_count: 1,
+                    },
+                )
+                .collect(),
+            desired_filenames: desired.into_iter().map(String::from).collect(),
+            generation_id: String::new(),
+            confirm_deadline_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ruleset_push_writes_deletes_stale_and_reloads_once() {
+        let client = Arc::new(RecordingClient::default());
+        // Node currently carries a stale fleet file and a local file.
+        client.seeded_rule_files.lock().unwrap().extend([
+            ("fleet-old.rules".to_string(), "aa".to_string(), 1),
+            ("custom.rules".to_string(), "bb".to_string(), 1),
+        ]);
+        let applier = ConfigApplier::new(Arc::clone(&client) as Arc<dyn LocalPolicyClient>);
+
+        let push = ruleset_push(
+            vec![(
+                "fleet-base.rules",
+                "alert tcp any any -> any any (sid:1;)\n",
+            )],
+            vec!["fleet-base.rules"],
+        );
+        applier.apply_suricata_ruleset_push(&push).await.unwrap();
+
+        assert_eq!(
+            *client.deployed_rules.lock().unwrap(),
+            vec![(
+                "fleet-base.rules".to_string(),
+                "alert tcp any any -> any any (sid:1;)\n".to_string()
+            )]
+        );
+        // Stale fleet file removed; local file untouched.
+        assert_eq!(
+            *client.deleted_rule_files.lock().unwrap(),
+            vec!["fleet-old.rules".to_string()]
+        );
+        assert_eq!(*client.reload_count.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_ruleset_push_rejects_digest_mismatch_before_writing() {
+        let client = Arc::new(RecordingClient::default());
+        let applier = ConfigApplier::new(Arc::clone(&client) as Arc<dyn LocalPolicyClient>);
+
+        let mut push = ruleset_push(
+            vec![("fleet-base.rules", "alert ...\n")],
+            vec!["fleet-base.rules"],
+        );
+        push.files[0].sha256 = "0".repeat(64);
+        let err = applier
+            .apply_suricata_ruleset_push(&push)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("digest mismatch"), "{err}");
+        assert!(client.deployed_rules.lock().unwrap().is_empty());
+        assert_eq!(*client.reload_count.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ruleset_push_rejects_non_fleet_filenames() {
+        let client = Arc::new(RecordingClient::default());
+        let applier = ConfigApplier::new(Arc::clone(&client) as Arc<dyn LocalPolicyClient>);
+
+        let push = ruleset_push(vec![("custom.rules", "x\n")], vec![]);
+        let err = applier
+            .apply_suricata_ruleset_push(&push)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-fleet"), "{err}");
+        assert!(client.deployed_rules.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

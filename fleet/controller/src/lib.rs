@@ -23,4 +23,5 @@ pub mod rule_lifecycle_bus;
 pub mod security;
 pub mod session;
 pub mod store;
+pub mod suricata_sync;
 pub mod ttl_reaper;

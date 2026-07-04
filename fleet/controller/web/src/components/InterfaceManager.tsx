@@ -37,6 +37,14 @@ const SET_FIB_FORWARDING = gql`
   }
 `
 
+const SET_INSPECT = gql`
+  mutation SetInspectInterface($nodeId: ID!, $interfaceName: String!, $enabled: Boolean!) {
+    setInspectInterface(nodeId: $nodeId, interfaceName: $interfaceName, enabled: $enabled) {
+      success message
+    }
+  }
+`
+
 const SET_URPF = gql`
   mutation SetUrpf($nodeId: ID!, $interfaceName: String!, $mode: String!) {
     setUrpf(nodeId: $nodeId, interfaceName: $interfaceName, mode: $mode) {
@@ -60,6 +68,8 @@ interface Props {
   interfaces: NodeInterfaceOutput[]
   rules?: RuleOutput[]
   pendingGeneration?: PendingGenerationInfo | null
+  /** Node advertised the "suricata" capability — shows the per-interface inspect toggle. */
+  suricataCapable?: boolean
   onRefetch: () => void
   onShowStats?: (interfaceName: string) => void
   onPendingChange?: (pending: boolean, opKind?: string) => void
@@ -98,6 +108,7 @@ export default function InterfaceManager({
   interfaces,
   rules = [],
   pendingGeneration,
+  suricataCapable = false,
   onRefetch,
   onShowStats,
   onPendingChange,
@@ -108,6 +119,7 @@ export default function InterfaceManager({
   const [detachProgram] = useMutation(DETACH_PROGRAM)
   const [setFibForwarding] = useMutation(SET_FIB_FORWARDING)
   const [setUrpf] = useMutation(SET_URPF)
+  const [setInspectInterface] = useMutation(SET_INSPECT)
   const [editingTag, setEditingTag] = useState<{ name: string; value: string } | null>(null)
   // Map key: "ifname:dir", value: expected attached state after op completes
   const [pending, setPending] = useState<Map<string, boolean>>(new Map())
@@ -115,14 +127,23 @@ export default function InterfaceManager({
   const [fibPending, setFibPending] = useState<Map<string, boolean>>(new Map())
   // Map key: ifname, value: expected urpfMode ("off"/"loose"/"strict") after op completes
   const [urpfPending, setUrpfPending] = useState<Map<string, string>>(new Map())
+  // Map key: ifname, value: expected inspectEnabled state after op completes
+  const [inspectPending, setInspectPending] = useState<Map<string, boolean>>(new Map())
   const [error, setError] = useState<string | null>(null)
   const prevPendingSizeRef = useRef(0)
   const prevFibPendingSizeRef = useRef(0)
   const prevUrpfPendingSizeRef = useRef(0)
+  const prevInspectPendingSizeRef = useRef(0)
 
   // Clear pending entries once the interface state reflects the expected outcome.
   useEffect(() => {
-    if (pending.size === 0 && fibPending.size === 0 && urpfPending.size === 0) return
+    if (
+      pending.size === 0 &&
+      fibPending.size === 0 &&
+      urpfPending.size === 0 &&
+      inspectPending.size === 0
+    )
+      return
 
     let attachChanged = false
     const nextPending = new Map(pending)
@@ -152,6 +173,15 @@ export default function InterfaceManager({
       if ((iface.urpfMode ?? 'off') === expected) { nextUrpf.delete(ifaceName); urpfChanged = true }
     }
     if (urpfChanged) setUrpfPending(nextUrpf)
+
+    let inspectChanged = false
+    const nextInspect = new Map(inspectPending)
+    for (const [ifaceName, expected] of inspectPending) {
+      const iface = interfaces.find((i) => i.name === ifaceName)
+      if (!iface) continue
+      if (iface.inspectEnabled === expected) { nextInspect.delete(ifaceName); inspectChanged = true }
+    }
+    if (inspectChanged) setInspectPending(nextInspect)
     // Intentionally re-evaluates only when fresh interface state arrives; the
     // pending maps are read, not watched (a pending entry clears the moment the
     // interface it targets reaches the expected value).
@@ -189,6 +219,16 @@ export default function InterfaceManager({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [urpfPending])
+
+  // Clear pending-confirm badge when the inspect spinner resolves.
+  useEffect(() => {
+    const prevSize = prevInspectPendingSizeRef.current
+    prevInspectPendingSizeRef.current = inspectPending.size
+    if (prevSize > 0 && inspectPending.size === 0) {
+      onPendingChange?.(false)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inspectPending])
 
   async function handleSaveTag(interfaceName: string, tag: string) {
     if (tag.trim()) {
@@ -295,6 +335,30 @@ export default function InterfaceManager({
     } catch (e) {
       setError(String(e).replace(/^ApolloError:\s*/, ''))
       setFibPending((prev) => { const next = new Map(prev); next.delete(ifaceName); return next })
+      onPendingChange?.(false)
+    }
+  }
+
+  function isInspectPending(ifaceName: string): boolean {
+    return inspectPending.has(ifaceName) || serverPending(ifaceName, 'set_inspect_interface')
+  }
+
+  async function handleToggleInspect(ifaceName: string, enabled: boolean) {
+    setError(null)
+    onPendingChange?.(true, 'set_inspect_interface')
+    setInspectPending((prev) => new Map(prev).set(ifaceName, enabled))
+    try {
+      const res = await setInspectInterface({ variables: { nodeId, interfaceName: ifaceName, enabled } })
+      const r = res.data?.setInspectInterface
+      if (!r?.success) {
+        setError(r?.message ?? 'Inspect toggle failed')
+        setInspectPending((prev) => { const next = new Map(prev); next.delete(ifaceName); return next })
+        onPendingChange?.(false)
+      }
+      // On success: badge clears via the inspectPending→empty useEffect
+    } catch (e) {
+      setError(String(e).replace(/^ApolloError:\s*/, ''))
+      setInspectPending((prev) => { const next = new Map(prev); next.delete(ifaceName); return next })
       onPendingChange?.(false)
     }
   }
@@ -433,6 +497,13 @@ export default function InterfaceManager({
                             pending={isUrpfPending(iface.name)}
                             onChange={(m) => handleSetUrpf(iface.name, m)}
                           />
+                          {suricataCapable && (
+                            <InspectToggle
+                              enabled={iface.inspectEnabled}
+                              pending={isInspectPending(iface.name)}
+                              onToggle={(v) => handleToggleInspect(iface.name, v)}
+                            />
+                          )}
                         </>
                       ) : null
                     }
@@ -513,6 +584,38 @@ function AttachCell({
         Attach
       </button>
     </span>
+  )
+}
+
+function InspectToggle({
+  enabled,
+  pending,
+  onToggle,
+}: {
+  enabled: boolean
+  pending: boolean
+  onToggle: (v: boolean) => void
+}) {
+  if (pending) {
+    return <Spinner />
+  }
+  const title = enabled
+    ? 'Suricata inspection enabled on this interface — INSPECT-matched flows are mirrored ' +
+      'to Suricata while the node inspect mode (IPS/IDS) is active. Click to disable.'
+    : 'Enable Suricata inspection on this interface. Requires an active node inspect mode ' +
+      '(IPS/IDS) and INSPECT rules to select traffic.'
+  return (
+    <button
+      onClick={() => onToggle(!enabled)}
+      className={`ml-1 px-1.5 py-0.5 rounded text-[10px] font-medium border ${
+        enabled
+          ? 'bg-purple-900/40 border-purple-700 text-purple-300 hover:bg-purple-900/60'
+          : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-gray-200'
+      }`}
+      title={title}
+    >
+      IDS {enabled ? 'on' : 'off'}
+    </button>
   )
 }
 

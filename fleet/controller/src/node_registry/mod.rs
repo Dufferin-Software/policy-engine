@@ -150,6 +150,7 @@ impl NodeRegistry {
             stop_behavior: None,
             metrics_interval_secs: None,
             capabilities: "{}".to_string(),
+            inspect_mode: "disabled".to_string(),
         };
 
         self.store.upsert_node(&record).await?;
@@ -1284,6 +1285,7 @@ mod tests {
             stop_behavior: None,
             metrics_interval_secs: None,
             capabilities: "{}".to_string(),
+            inspect_mode: "disabled".to_string(),
         };
         store.upsert_node(&node).await.unwrap();
         assert!(store.get_node("node-del").await.unwrap().is_some());
@@ -1331,6 +1333,7 @@ mod tests {
             stop_behavior: None,
             metrics_interval_secs: None,
             capabilities: "{}".to_string(),
+            inspect_mode: "disabled".to_string(),
         };
         store.upsert_node(&node).await.unwrap();
 
@@ -1377,6 +1380,7 @@ mod tests {
             stop_behavior: None,
             metrics_interval_secs: None,
             capabilities: "{}".to_string(),
+            inspect_mode: "disabled".to_string(),
         };
         store.upsert_node(&node).await.unwrap();
 
@@ -1435,6 +1439,7 @@ mod tests {
             stop_behavior: None,
             metrics_interval_secs: None,
             capabilities: "{}".to_string(),
+            inspect_mode: "disabled".to_string(),
         };
         store.upsert_node(&node).await.unwrap();
 

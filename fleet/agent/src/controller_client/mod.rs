@@ -383,6 +383,17 @@ pub async fn run_stream_loop(
             events_tx,
         ))));
 
+        // Suricata alert forwarder — only when the local engine advertised
+        // the capability (a plain engine has no /ws/alerts endpoint).
+        // Connection-scoped like every forwarder: must live in
+        // _connection_tasks or it leaks across reconnects.
+        if suricata_capable {
+            let alerts_tx = outbound_tx.clone();
+            _connection_tasks.push(AbortOnDrop(tokio::spawn(
+                crate::suricata_alert_forwarder::run(base.clone(), node_id.clone(), alerts_tx),
+            )));
+        }
+
         let lifecycle_tx = outbound_tx.clone();
         _connection_tasks.push(AbortOnDrop(tokio::spawn(
             crate::rule_lifecycle_forwarder::run(base, node_id, lifecycle_tx),
@@ -1203,6 +1214,241 @@ async fn handle_controller_message(
                 .await
                 .context("Failed to send FlowVerdictSnapshot")?;
         }
+        Some(CtrlPayload::SetInspectMode(req)) => {
+            let generation_id = req.generation_id.clone();
+            let gated = !generation_id.is_empty();
+            let deadline_ms = req.confirm_deadline_ms;
+            let mode = req.mode;
+            log::info!(
+                "Received SetInspectMode (mode={}, generation={})",
+                mode,
+                generation_id,
+            );
+
+            if let Some(a) = applier {
+                // Capture the prior mode before applying so a missed CommitAck
+                // reverts to it.  If it can't be read, fall back to disabled —
+                // reverting to "no inspection" is always safe.
+                let prior_mode = match a.get_inspect_status().await {
+                    Ok(s) => s.mode,
+                    Err(e) => {
+                        log::warn!(
+                            "SetInspectMode: could not read prior mode ({:#}); \
+                             will revert to disabled if needed",
+                            e
+                        );
+                        0
+                    }
+                };
+
+                let apply_res = a.set_inspect_mode(mode).await;
+                let (outcome, error_message) = match &apply_res {
+                    Ok(()) => {
+                        log::info!("Inspect mode set to {}", mode);
+                        if gated {
+                            pending.register(
+                                generation_id.clone(),
+                                vec![InverseOp::SetInspectMode { mode: prior_mode }],
+                                watchdog_deadline_ms(deadline_ms),
+                                Arc::clone(a),
+                                outbound_tx.clone(),
+                            );
+                        }
+                        (ConfirmOutcome::Applied, String::new())
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to set inspect mode: {:#}", e);
+                        (ConfirmOutcome::Rejected, format!("{:#}", e))
+                    }
+                };
+
+                if gated {
+                    outbound_tx
+                        .send(AgentMessage {
+                            payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
+                                generation_id: generation_id.clone(),
+                                outcome: outcome as i32,
+                                error_message,
+                            })),
+                        })
+                        .await
+                        .context("Failed to send ConfigConfirm for set_inspect_mode")?;
+                } else if apply_res.is_ok() {
+                    if let Some(url) = local_graphql_url {
+                        spawn_push_state_snapshot(url.to_string(), outbound_tx.clone());
+                    }
+                }
+            } else {
+                log::warn!("No local applier configured — cannot set inspect mode");
+                if gated {
+                    outbound_tx
+                        .send(AgentMessage {
+                            payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
+                                generation_id,
+                                outcome: ConfirmOutcome::Rejected as i32,
+                                error_message: "No local applier configured".to_string(),
+                            })),
+                        })
+                        .await
+                        .context("Failed to send ConfigConfirm for set_inspect_mode")?;
+                }
+            }
+        }
+        Some(CtrlPayload::SetInspectInterface(req)) => {
+            let generation_id = req.generation_id.clone();
+            let gated = !generation_id.is_empty();
+            let deadline_ms = req.confirm_deadline_ms;
+            let interface = req.interface_name.clone();
+            let enabled = req.enabled;
+            log::info!(
+                "Received SetInspectInterface (interface={}, enabled={}, generation={})",
+                interface,
+                enabled,
+                generation_id,
+            );
+
+            if let Some(a) = applier {
+                let prior_enabled = match a.get_inspect_status().await {
+                    Ok(s) => s.enabled_interfaces.iter().any(|i| i == &interface),
+                    Err(e) => {
+                        log::warn!(
+                            "SetInspectInterface: could not read prior state for {} ({:#}); \
+                             will revert to disabled if needed",
+                            interface,
+                            e
+                        );
+                        false
+                    }
+                };
+
+                let apply_res = a.set_inspect_interface(&interface, enabled).await;
+                let (outcome, error_message) = match &apply_res {
+                    Ok(()) => {
+                        log::info!(
+                            "Inspection {} on {}",
+                            if enabled { "enabled" } else { "disabled" },
+                            interface
+                        );
+                        if gated {
+                            pending.register(
+                                generation_id.clone(),
+                                vec![InverseOp::SetInspectInterface {
+                                    interface: interface.clone(),
+                                    enabled: prior_enabled,
+                                }],
+                                watchdog_deadline_ms(deadline_ms),
+                                Arc::clone(a),
+                                outbound_tx.clone(),
+                            );
+                        }
+                        (ConfirmOutcome::Applied, String::new())
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to set inspect interface {}: {:#}", interface, e);
+                        (ConfirmOutcome::Rejected, format!("{:#}", e))
+                    }
+                };
+
+                if gated {
+                    outbound_tx
+                        .send(AgentMessage {
+                            payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
+                                generation_id: generation_id.clone(),
+                                outcome: outcome as i32,
+                                error_message,
+                            })),
+                        })
+                        .await
+                        .context("Failed to send ConfigConfirm for set_inspect_interface")?;
+                } else if apply_res.is_ok() {
+                    if let Some(url) = local_graphql_url {
+                        spawn_push_state_snapshot(url.to_string(), outbound_tx.clone());
+                    }
+                }
+            } else {
+                log::warn!("No local applier configured — cannot set inspect interface");
+                if gated {
+                    outbound_tx
+                        .send(AgentMessage {
+                            payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
+                                generation_id,
+                                outcome: ConfirmOutcome::Rejected as i32,
+                                error_message: "No local applier configured".to_string(),
+                            })),
+                        })
+                        .await
+                        .context("Failed to send ConfigConfirm for set_inspect_interface")?;
+                }
+            }
+        }
+        Some(CtrlPayload::SuricataRulesetPush(push)) => {
+            let generation_id = push.generation_id.clone();
+            let gated = !generation_id.is_empty();
+            let deadline_ms = push.confirm_deadline_ms;
+            log::info!(
+                "Received SuricataRulesetPush ({} files, {} desired, generation={})",
+                push.files.len(),
+                push.desired_filenames.len(),
+                generation_id,
+            );
+
+            if let Some(a) = applier {
+                let apply_res = a.apply_suricata_ruleset_push(&push).await;
+                let (outcome, error_message) = match &apply_res {
+                    Ok(()) => {
+                        // Non-reverting by design: register with no inverse
+                        // ops so the confirm handshake still runs, but a
+                        // watchdog timeout undoes nothing — the controller's
+                        // snapshot-driven drift detection is the corrector.
+                        if gated {
+                            pending.register(
+                                generation_id.clone(),
+                                Vec::new(),
+                                watchdog_deadline_ms(deadline_ms),
+                                Arc::clone(a),
+                                outbound_tx.clone(),
+                            );
+                        }
+                        (ConfirmOutcome::Applied, String::new())
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to apply Suricata ruleset push: {:#}", e);
+                        (ConfirmOutcome::Rejected, format!("{:#}", e))
+                    }
+                };
+
+                if gated {
+                    outbound_tx
+                        .send(AgentMessage {
+                            payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
+                                generation_id: generation_id.clone(),
+                                outcome: outcome as i32,
+                                error_message,
+                            })),
+                        })
+                        .await
+                        .context("Failed to send ConfigConfirm for suricata_ruleset_push")?;
+                } else if apply_res.is_ok() {
+                    if let Some(url) = local_graphql_url {
+                        spawn_push_state_snapshot(url.to_string(), outbound_tx.clone());
+                    }
+                }
+            } else {
+                log::warn!("No local applier configured — cannot apply Suricata rulesets");
+                if gated {
+                    outbound_tx
+                        .send(AgentMessage {
+                            payload: Some(AgentPayload::ConfigConfirm(ConfigConfirm {
+                                generation_id,
+                                outcome: ConfirmOutcome::Rejected as i32,
+                                error_message: "No local applier configured".to_string(),
+                            })),
+                        })
+                        .await
+                        .context("Failed to send ConfigConfirm for suricata_ruleset_push")?;
+                }
+            }
+        }
         None => {
             log::warn!("Received ControllerMessage with no payload");
         }
@@ -1559,22 +1805,32 @@ async fn do_fetch_state_snapshot(graphql_url: &str) -> Result<StateSnapshot> {
     use policy_engine_dev::{ClientConfig, GqlDirection, PolicyClient};
 
     let url = graphql_url.to_string();
-    let (ingress_rules, egress_rules, interfaces, fib_entries, urpf_entries, stop_behavior) =
-        tokio::task::spawn_blocking(move || {
-            let client = PolicyClient::with_config(ClientConfig {
-                server_url: url,
-                ..Default::default()
-            });
-            let ingress = client.list_rules(GqlDirection::Ingress)?;
-            let egress = client.list_rules(GqlDirection::Egress)?;
-            let ifaces = client.list_interfaces()?;
-            let fib = client.list_fib_forwarding().unwrap_or_default();
-            let urpf = client.list_urpf().unwrap_or_default();
-            let sb = client.get_stop_behavior().unwrap_or_default();
-            Ok::<_, anyhow::Error>((ingress, egress, ifaces, fib, urpf, sb))
-        })
-        .await
-        .context("spawn_blocking panicked")??;
+    let (
+        ingress_rules,
+        egress_rules,
+        interfaces,
+        fib_entries,
+        urpf_entries,
+        stop_behavior,
+        inspect_status,
+    ) = tokio::task::spawn_blocking(move || {
+        let client = PolicyClient::with_config(ClientConfig {
+            server_url: url,
+            ..Default::default()
+        });
+        let ingress = client.list_rules(GqlDirection::Ingress)?;
+        let egress = client.list_rules(GqlDirection::Egress)?;
+        let ifaces = client.list_interfaces()?;
+        let fib = client.list_fib_forwarding().unwrap_or_default();
+        let urpf = client.list_urpf().unwrap_or_default();
+        let sb = client.get_stop_behavior().unwrap_or_default();
+        // None on engines built without the suricata feature (the query
+        // errors there) — reported as mode 0 / empty lists.
+        let inspect = client.inspect_status().ok();
+        Ok::<_, anyhow::Error>((ingress, egress, ifaces, fib, urpf, sb, inspect))
+    })
+    .await
+    .context("spawn_blocking panicked")??;
 
     let mut rules = Vec::new();
     for (dir, rule_list) in [
@@ -1663,6 +1919,28 @@ async fn do_fetch_state_snapshot(graphql_url: &str) -> Result<StateSnapshot> {
         })
         .collect();
 
+    let (inspect_mode, suricata_rule_files, inspect_enabled_interfaces) = match inspect_status {
+        Some(s) => (
+            match s.mode {
+                policy_engine_dev::GqlInspectMode::Ips => 1,
+                policy_engine_dev::GqlInspectMode::Ids => 2,
+                policy_engine_dev::GqlInspectMode::Disabled => 0,
+            },
+            s.custom_rule_files
+                .into_iter()
+                .map(
+                    |f| policy_controller_proto::controller::SuricataRuleFileDigest {
+                        filename: f.filename,
+                        sha256: f.sha256,
+                        rule_count: f.rule_count.max(0) as u32,
+                    },
+                )
+                .collect(),
+            s.enabled_interfaces,
+        ),
+        None => (0, Vec::new(), Vec::new()),
+    };
+
     Ok(StateSnapshot {
         rules,
         attachments,
@@ -1671,6 +1949,9 @@ async fn do_fetch_state_snapshot(graphql_url: &str) -> Result<StateSnapshot> {
         per_interface_default_actions: std::collections::HashMap::new(),
         stop_behavior,
         urpf_interfaces,
+        inspect_mode,
+        suricata_rule_files,
+        inspect_enabled_interfaces,
     })
 }
 

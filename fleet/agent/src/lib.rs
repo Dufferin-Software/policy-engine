@@ -13,4 +13,5 @@ pub mod metrics_forwarder;
 pub mod network_info;
 pub mod pending_change;
 pub mod rule_lifecycle_forwarder;
+pub mod suricata_alert_forwarder;
 pub mod system_info;

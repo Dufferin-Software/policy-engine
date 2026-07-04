@@ -213,6 +213,7 @@ mod tests {
             stop_behavior: None,
             metrics_interval_secs: None,
             capabilities: "{}".to_string(),
+            inspect_mode: "disabled".to_string(),
         }
     }
 

@@ -691,6 +691,13 @@ async fn validate_rule_sources(
 /// `match_json` field maps to PolicyEvents, so the answer is always
 /// `{"policy_events"}`. When ipfix/suricata/quic-inspect MatchSpec
 /// variants land, branch here.
+///
+/// Suricata alerts are persisted and streamed (`/ws/alerts`,
+/// `suricataAlerts` query) but are not yet a MatchSpec source — matching
+/// alert *rules* on signature/severity needs a new MatchSpec variant and a
+/// matcher branch over the alert channel. When that lands, a rule referencing
+/// suricata fields must return `"suricata_alerts"` here so the capability-
+/// union validation (agents already advertise the source) gates it.
 fn required_sources_for_rule(_rule: &NewAlertRule) -> Vec<&'static str> {
     vec!["policy_events"]
 }

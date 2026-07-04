@@ -101,6 +101,15 @@ pub struct NodeRecord {
     /// until the agent reconnects after step-6 was deployed (pre-step-6
     /// rows surface the same default).
     pub capabilities: String,
+    /// Node-global Suricata inspect mode: "disabled" / "ips" / "ids".
+    /// Agent-authoritative — written on SetInspectMode commit and overwritten
+    /// by every StateSnapshot.
+    #[serde(default = "default_inspect_mode")]
+    pub inspect_mode: String,
+}
+
+fn default_inspect_mode() -> String {
+    "disabled".to_string()
 }
 
 /// A policy rule scoped to a specific (tenant, node, interface, direction).
@@ -170,12 +179,100 @@ pub struct NodeInterface {
     /// uRPF mode on this interface (ingress only): 0 = off, 1 = loose, 2 = strict.
     #[serde(default)]
     pub urpf_mode: u32,
+    /// Per-interface Suricata inspection flag (agent-reported; only effective
+    /// while the node's inspect_mode is "ips"/"ids").
+    #[serde(default)]
+    pub inspect_enabled: bool,
     /// Controller-set default action for unmatched ingress packets ("pass" or "drop").
     #[serde(default)]
     pub ingress_default_action: Option<String>,
     /// Controller-set default action for unmatched egress packets ("pass" or "drop").
     #[serde(default)]
     pub egress_default_action: Option<String>,
+}
+
+/// A named fleet-managed Suricata ruleset. Materialises on assigned nodes as
+/// `fleet-<name>.rules`; `sha256` is over the exact content bytes (the
+/// drift-detection contract with the engine's byte-verbatim file handling).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuricataRuleset {
+    pub id: String,
+    pub tenant_id: String,
+    pub name: String,
+    pub content: String,
+    pub sha256: String,
+    pub rule_count: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl SuricataRuleset {
+    /// Filename this ruleset materialises as on a node.
+    pub fn filename(&self) -> String {
+        format!("fleet-{}.rules", self.name)
+    }
+}
+
+/// One agent-reported Suricata rule file (from StateSnapshot digests).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuricataRuleFileReport {
+    pub node_id: String,
+    pub filename: String,
+    pub sha256: String,
+    pub rule_count: u32,
+}
+
+/// A persisted Suricata alert. `received_ns` is the controller receive time
+/// (stable ordering key); `timestamp` is Suricata's own EVE timestamp string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuricataAlertRecord {
+    pub id: i64,
+    pub tenant_id: String,
+    pub node_id: String,
+    pub timestamp: String,
+    pub received_ns: i64,
+    pub src_ip: Option<String>,
+    pub src_port: Option<i32>,
+    pub dst_ip: Option<String>,
+    pub dst_port: Option<i32>,
+    pub proto: Option<String>,
+    pub action: Option<String>,
+    pub signature_id: Option<i64>,
+    pub signature: Option<String>,
+    pub category: Option<String>,
+    pub severity: Option<i32>,
+    pub raw_json: String,
+}
+
+/// A new Suricata alert to insert (no id yet).
+#[derive(Debug, Clone)]
+pub struct NewSuricataAlert {
+    pub tenant_id: String,
+    pub node_id: String,
+    pub timestamp: String,
+    pub received_ns: i64,
+    pub src_ip: Option<String>,
+    pub src_port: Option<i32>,
+    pub dst_ip: Option<String>,
+    pub dst_port: Option<i32>,
+    pub proto: Option<String>,
+    pub action: Option<String>,
+    pub signature_id: Option<i64>,
+    pub signature: Option<String>,
+    pub category: Option<String>,
+    pub severity: Option<i32>,
+    pub raw_json: String,
+}
+
+/// Filter for querying Suricata alerts. All fields optional (AND-combined).
+#[derive(Debug, Clone, Default)]
+pub struct SuricataAlertFilter {
+    pub tenant_id: Option<String>,
+    pub node_id: Option<String>,
+    pub min_severity: Option<i32>,
+    pub signature_id: Option<i64>,
+    /// Substring match against the signature text.
+    pub signature_contains: Option<String>,
 }
 
 /// A ZTP enrollment token. Operators mint these via the GraphQL API; the
@@ -464,6 +561,76 @@ pub trait ControllerStore: Send + Sync {
         node_id: &str,
         interface_modes: &[(String, u32)],
     ) -> Result<()>;
+
+    /// Set the node-global Suricata inspect mode ("disabled" / "ips" / "ids").
+    async fn set_node_inspect_mode(&self, node_id: &str, mode: &str) -> Result<()>;
+
+    /// Replace the set of interfaces with Suricata inspection enabled on a
+    /// node. Any interface not listed has its inspect flag cleared.
+    async fn update_interface_inspect(
+        &self,
+        node_id: &str,
+        enabled_interfaces: &[String],
+    ) -> Result<()>;
+
+    /// Set the inspect flag for a single interface (SetInspectInterface commit).
+    async fn update_interface_inspect_enabled(
+        &self,
+        node_id: &str,
+        interface_name: &str,
+        enabled: bool,
+    ) -> Result<()>;
+
+    // ── Suricata rulesets (fleet-managed signature files) ────────────────────
+
+    /// Create a ruleset. Fails if `(tenant_id, name)` already exists.
+    async fn create_suricata_ruleset(&self, ruleset: &SuricataRuleset) -> Result<()>;
+    /// Replace the content/digest/count of an existing ruleset by id.
+    async fn update_suricata_ruleset(
+        &self,
+        id: &str,
+        content: &str,
+        sha256: &str,
+        rule_count: u32,
+        updated_at: DateTime<Utc>,
+    ) -> Result<()>;
+    /// Delete a ruleset and all of its node assignments.
+    async fn delete_suricata_ruleset(&self, id: &str) -> Result<()>;
+    async fn get_suricata_ruleset(&self, id: &str) -> Result<Option<SuricataRuleset>>;
+    /// List rulesets, optionally scoped to a tenant, ordered by name.
+    async fn list_suricata_rulesets(&self, tenant_id: Option<&str>)
+        -> Result<Vec<SuricataRuleset>>;
+    /// Assign a ruleset to a node (idempotent).
+    async fn assign_suricata_ruleset(&self, node_id: &str, ruleset_id: &str) -> Result<()>;
+    async fn unassign_suricata_ruleset(&self, node_id: &str, ruleset_id: &str) -> Result<()>;
+    /// All rulesets assigned to a node (the node's desired fleet-* file set).
+    async fn list_suricata_rulesets_for_node(&self, node_id: &str) -> Result<Vec<SuricataRuleset>>;
+    /// IDs of nodes a ruleset is assigned to.
+    async fn list_nodes_for_suricata_ruleset(&self, ruleset_id: &str) -> Result<Vec<String>>;
+    /// Replace the agent-reported rule-file digests for a node (snapshot writeback).
+    async fn replace_node_suricata_rule_files(
+        &self,
+        node_id: &str,
+        files: &[SuricataRuleFileReport],
+    ) -> Result<()>;
+    /// Agent-reported rule files for a node, ordered by filename.
+    async fn list_node_suricata_rule_files(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<SuricataRuleFileReport>>;
+
+    // ── Suricata alerts ──────────────────────────────────────────────────────
+
+    /// Batch-insert Suricata alerts (one transaction).
+    async fn insert_suricata_alerts(&self, alerts: &[NewSuricataAlert]) -> Result<()>;
+    /// Query alerts newest-first (by received_ns), capped at `limit`.
+    async fn list_suricata_alerts(
+        &self,
+        filter: &SuricataAlertFilter,
+        limit: i64,
+    ) -> Result<Vec<SuricataAlertRecord>>;
+    /// Delete alerts older than `cutoff_ns` (retention). Returns rows removed.
+    async fn prune_suricata_alerts(&self, cutoff_ns: i64) -> Result<u64>;
 
     /// Set the default action for a specific interface+direction on a node.
     /// `direction` must be "ingress" or "egress". `action` must be "pass" or "drop".

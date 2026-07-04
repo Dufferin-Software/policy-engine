@@ -6,5 +6,6 @@ pub mod api_tokens;
 pub mod events;
 pub mod iam;
 pub mod schema;
+pub mod suricata;
 
 pub use schema::{build_schema, ControllerSchema, ServiceEndpoints};

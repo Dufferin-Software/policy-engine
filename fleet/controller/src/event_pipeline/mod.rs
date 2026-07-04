@@ -28,6 +28,7 @@ pub mod persister;
 pub mod providers;
 pub mod retention;
 pub mod store;
+pub mod suricata_alert_persister;
 pub mod tenant;
 pub mod types;
 
@@ -35,5 +36,6 @@ pub use metrics::EventPipelineMetrics;
 pub use persister::{spawn_persister, PersisterConfig};
 pub use retention::spawn_retention;
 pub use store::EventStore;
+pub use suricata_alert_persister::spawn_suricata_alert_persister;
 pub use tenant::{bootstrap_default_tenant, TenantScope, DEFAULT_TENANT_SLUG};
 pub use types::{parse_policy_event, Action, Direction, PolicyEvent};

@@ -43,7 +43,12 @@ CREATE TABLE IF NOT EXISTS nodes (
     -- the most recent AgentHello. Used by alert-rule write-time validation to
     -- reject rules referencing sources no node in the fleet advertises.
     -- Defaults to '{}' so pre-step-6 rows decode as "no capabilities known".
-    capabilities      TEXT NOT NULL DEFAULT '{}'
+    capabilities      TEXT NOT NULL DEFAULT '{}',
+    -- Node-global Suricata inspect mode ('disabled' / 'ips' / 'ids').
+    -- Agent-authoritative: written when a SetInspectMode generation commits
+    -- AND overwritten by every StateSnapshot; never re-pushed on reconnect
+    -- (same model as uRPF/FIB).
+    inspect_mode      TEXT NOT NULL DEFAULT 'disabled'
 );
 
 CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
@@ -102,6 +107,9 @@ CREATE TABLE IF NOT EXISTS node_interfaces (
     fib_forwarding  INTEGER NOT NULL DEFAULT 0,
     -- uRPF mode on this interface (ingress only): 0 = off, 1 = loose, 2 = strict
     urpf_mode       INTEGER NOT NULL DEFAULT 0,
+    -- Agent-reported per-interface Suricata inspection flag (0/1). Only
+    -- effective while the node's inspect_mode is 'ips' or 'ids'.
+    inspect_enabled INTEGER NOT NULL DEFAULT 0,
     -- Operator-configured default action for unmatched packets (NULL = engine default PASS)
     ingress_default_action TEXT,
     egress_default_action  TEXT,
@@ -109,6 +117,45 @@ CREATE TABLE IF NOT EXISTS node_interfaces (
 );
 
 CREATE INDEX IF NOT EXISTS idx_node_interfaces_node ON node_interfaces(node_id);
+
+-- Named fleet-managed Suricata rulesets. Each ruleset materialises on
+-- assigned nodes as one file: /etc/suricata/rules/policy-engine/fleet-<name>.rules
+-- (files without the "fleet-" prefix are node-local and never touched by the
+-- controller). Content is capped at 4 MiB and canonicalised to end with '\n';
+-- sha256 is over the exact content bytes — the drift-detection contract with
+-- the engine's byte-verbatim write_rules/list_custom_rules_meta.
+CREATE TABLE IF NOT EXISTS suricata_rulesets (
+    id          TEXT PRIMARY KEY,
+    tenant_id   TEXT NOT NULL DEFAULT 'default',
+    name        TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    sha256      TEXT NOT NULL,
+    rule_count  INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    UNIQUE (tenant_id, name)
+);
+
+-- Which rulesets are assigned to which nodes (desired state).
+CREATE TABLE IF NOT EXISTS node_suricata_rulesets (
+    node_id     TEXT NOT NULL REFERENCES nodes(id),
+    ruleset_id  TEXT NOT NULL REFERENCES suricata_rulesets(id),
+    PRIMARY KEY (node_id, ruleset_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_suricata_rulesets_ruleset
+    ON node_suricata_rulesets(ruleset_id);
+
+-- Agent-reported Suricata rule files (ALL files in the rules dir, fleet- and
+-- local), refreshed from every StateSnapshot. Drives in-sync badges and the
+-- drift reconcile without re-querying agents.
+CREATE TABLE IF NOT EXISTS node_suricata_rule_files (
+    node_id     TEXT NOT NULL REFERENCES nodes(id),
+    filename    TEXT NOT NULL,
+    sha256      TEXT NOT NULL,
+    rule_count  INTEGER NOT NULL,
+    PRIMARY KEY (node_id, filename)
+);
 
 CREATE TABLE IF NOT EXISTS revoked_certs (
     -- Hex-encoded DER serial
@@ -301,6 +348,38 @@ CREATE INDEX IF NOT EXISTS events_tenant_rule_ts
     ON events(tenant_id, rule_id, ts_ns DESC);
 CREATE INDEX IF NOT EXISTS events_tenant_action_ts
     ON events(tenant_id, action, ts_ns DESC);
+
+-- Suricata IPS/IDS alerts forwarded from nodes. Separate from `events`
+-- (which is BPF-event-shaped): alerts carry signature/category/severity.
+-- `raw_json` preserves the full engine SuricataAlert for the UI.
+CREATE TABLE IF NOT EXISTS suricata_alerts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    node_id      TEXT NOT NULL,
+    -- Alert timestamp string as reported by Suricata (EVE `timestamp`).
+    timestamp    TEXT NOT NULL,
+    -- Controller receive time (ns since epoch) for stable ordering when two
+    -- alerts share an EVE timestamp string.
+    received_ns  INTEGER NOT NULL,
+    src_ip       TEXT,
+    src_port     INTEGER,
+    dst_ip       TEXT,
+    dst_port     INTEGER,
+    proto        TEXT,
+    action       TEXT,
+    signature_id INTEGER,
+    signature    TEXT,
+    category     TEXT,
+    severity     INTEGER,
+    raw_json     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS suricata_alerts_tenant_ts
+    ON suricata_alerts(tenant_id, received_ns DESC);
+CREATE INDEX IF NOT EXISTS suricata_alerts_node_ts
+    ON suricata_alerts(node_id, received_ns DESC);
+CREATE INDEX IF NOT EXISTS suricata_alerts_sid
+    ON suricata_alerts(tenant_id, signature_id);
 
 -- ----------------------------------------------------------------------
 -- Alert pipeline tables (event-pipeline.md step 4).

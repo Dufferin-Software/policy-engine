@@ -6,16 +6,20 @@ import FleetDashboard from './components/FleetDashboard.tsx'
 import EnrollmentQueue from './components/EnrollmentQueue.tsx'
 import AuditLog from './components/AuditLog.tsx'
 import EventsView from './components/EventsView.tsx'
+import SuricataRulesets from './components/SuricataRulesets.tsx'
+import AlertsView from './components/AlertsView.tsx'
 import ThemeToggle from './components/ThemeToggle.tsx'
 import { getUsername, logout } from './lib/auth'
 
-type Tab = 'fleet' | 'enrollment' | 'events' | 'audit'
+type Tab = 'fleet' | 'enrollment' | 'events' | 'suricata-rules' | 'ids-alerts' | 'audit'
 type NodeTab = 'overview' | 'policy' | 'verdict-cache' | 'events' | 'rule-lifecycle'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'fleet', label: 'Fleet' },
   { id: 'enrollment', label: 'Enrollment' },
   { id: 'events', label: 'Events' },
+  { id: 'suricata-rules', label: 'Suricata Rules' },
+  { id: 'ids-alerts', label: 'IDS Alerts' },
   { id: 'audit', label: 'Audit Log' },
 ]
 
@@ -103,6 +107,8 @@ export default function App() {
         )}
         {tab === 'enrollment' && <EnrollmentQueue />}
         {tab === 'events' && <EventsView onNavigateToNode={navigateToNode} />}
+        {tab === 'suricata-rules' && <SuricataRulesets />}
+        {tab === 'ids-alerts' && <AlertsView />}
         {tab === 'audit' && <AuditLog />}
       </main>
     </div>

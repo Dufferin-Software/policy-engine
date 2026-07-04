@@ -23,7 +23,8 @@ use tokio::sync::oneshot;
 
 use policy_controller_proto::controller::{
     controller_message::Payload as CtrlPayload, AttachProgram, BpfDirection, BpfMode,
-    ControllerMessage, DeltaConfigPush, DetachProgram, SetFibForwarding, SetUrpf,
+    ControllerMessage, DeltaConfigPush, DetachProgram, SetFibForwarding, SetInspectInterface,
+    SetInspectMode, SetUrpf,
 };
 
 use crate::{
@@ -64,6 +65,25 @@ pub enum PendingOp {
         /// 0 = off, 1 = loose, 2 = strict (matches URPF_* in policy_common.h).
         mode: u32,
     },
+    SetInspectMode {
+        node_id: String,
+        /// 0 = disabled, 1 = IPS, 2 = IDS (matches engine InspectMode).
+        mode: u32,
+    },
+    SetInspectInterface {
+        node_id: String,
+        interface_name: String,
+        enabled: bool,
+    },
+    /// Operator-initiated fleet Suricata ruleset sync. The push is pre-built
+    /// by suricata_sync::build_ruleset_push; the generation is stamped in
+    /// to_controller_message. Commit is a no-op: desired state already lives
+    /// in the assignment tables and reported state arrives with the next
+    /// snapshot. Non-reverting on the agent (idempotent desired-state sync).
+    PushSuricataRulesets {
+        node_id: String,
+        push: policy_controller_proto::controller::SuricataRulesetPush,
+    },
     SetDefaultAction {
         node_id: String,
         interface_name: String,
@@ -96,6 +116,9 @@ impl PendingOp {
             PendingOp::Detach { .. } => "detach",
             PendingOp::SetFibForwarding { .. } => "set_fib_forwarding",
             PendingOp::SetUrpf { .. } => "set_urpf",
+            PendingOp::SetInspectMode { .. } => "set_inspect_mode",
+            PendingOp::SetInspectInterface { .. } => "set_inspect_interface",
+            PendingOp::PushSuricataRulesets { .. } => "push_suricata_rulesets",
             PendingOp::SetDefaultAction { .. } => "set_default_action",
             PendingOp::SetStopBehavior { .. } => "set_stop_behavior",
             PendingOp::FlushRules { .. } => "flush_rules",
@@ -110,6 +133,9 @@ impl PendingOp {
             | PendingOp::Detach { node_id, .. }
             | PendingOp::SetFibForwarding { node_id, .. }
             | PendingOp::SetUrpf { node_id, .. }
+            | PendingOp::SetInspectMode { node_id, .. }
+            | PendingOp::SetInspectInterface { node_id, .. }
+            | PendingOp::PushSuricataRulesets { node_id, .. }
             | PendingOp::SetDefaultAction { node_id, .. }
             | PendingOp::SetStopBehavior { node_id, .. }
             | PendingOp::FlushRules { node_id, .. } => node_id,
@@ -142,9 +168,15 @@ impl PendingOp {
                 ..
             } => (Some(interface_name.clone()), Some(direction.clone())),
             PendingOp::SetFibForwarding { interface_name, .. }
-            | PendingOp::SetUrpf { interface_name, .. } => (Some(interface_name.clone()), None),
+            | PendingOp::SetUrpf { interface_name, .. }
+            | PendingOp::SetInspectInterface { interface_name, .. } => {
+                (Some(interface_name.clone()), None)
+            }
             PendingOp::CreateRule(r) => (Some(r.interface_name.clone()), Some(r.direction.clone())),
-            PendingOp::DeleteRule { .. } | PendingOp::SetStopBehavior { .. } => (None, None),
+            PendingOp::DeleteRule { .. }
+            | PendingOp::SetStopBehavior { .. }
+            | PendingOp::SetInspectMode { .. }
+            | PendingOp::PushSuricataRulesets { .. } => (None, None),
         }
     }
 
@@ -220,6 +252,27 @@ impl PendingOp {
                 generation_id: generation_id.to_string(),
                 confirm_deadline_ms,
             }),
+            PendingOp::SetInspectMode { mode, .. } => CtrlPayload::SetInspectMode(SetInspectMode {
+                mode: *mode,
+                generation_id: generation_id.to_string(),
+                confirm_deadline_ms,
+            }),
+            PendingOp::SetInspectInterface {
+                interface_name,
+                enabled,
+                ..
+            } => CtrlPayload::SetInspectInterface(SetInspectInterface {
+                interface_name: interface_name.clone(),
+                enabled: *enabled,
+                generation_id: generation_id.to_string(),
+                confirm_deadline_ms,
+            }),
+            PendingOp::PushSuricataRulesets { push, .. } => {
+                let mut push = push.clone();
+                push.generation_id = generation_id.to_string();
+                push.confirm_deadline_ms = confirm_deadline_ms;
+                CtrlPayload::SuricataRulesetPush(push)
+            }
             PendingOp::SetDefaultAction {
                 interface_name,
                 direction,
@@ -356,6 +409,26 @@ impl PendingOp {
                 }
                 store.update_interface_urpf(node_id, &modes).await
             }
+            PendingOp::SetInspectMode { node_id, mode } => {
+                let mode_str = match mode {
+                    1 => "ips",
+                    2 => "ids",
+                    _ => "disabled",
+                };
+                store.set_node_inspect_mode(node_id, mode_str).await
+            }
+            PendingOp::SetInspectInterface {
+                node_id,
+                interface_name,
+                enabled,
+            } => {
+                store
+                    .update_interface_inspect_enabled(node_id, interface_name, *enabled)
+                    .await
+            }
+            // Desired state is the assignment tables (already written by the
+            // mutation); reported state arrives with the next snapshot.
+            PendingOp::PushSuricataRulesets { .. } => Ok(()),
             PendingOp::SetDefaultAction {
                 node_id,
                 interface_name,
@@ -770,6 +843,42 @@ mod tests {
             expires_after_secs: None,
             schedule_json: None,
         })
+    }
+
+    #[test]
+    fn inspect_ops_build_gated_messages() {
+        let op = PendingOp::SetInspectMode {
+            node_id: "n1".into(),
+            mode: 1,
+        };
+        assert_eq!(op.kind(), "set_inspect_mode");
+        assert_eq!(op.node_id(), "n1");
+        assert_eq!(op.interface_target(), (None, None));
+        match op.to_controller_message("GEN", 30_000).payload {
+            Some(CtrlPayload::SetInspectMode(m)) => {
+                assert_eq!(m.mode, 1);
+                assert_eq!(m.generation_id, "GEN");
+                assert_eq!(m.confirm_deadline_ms, 30_000);
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+
+        let op = PendingOp::SetInspectInterface {
+            node_id: "n1".into(),
+            interface_name: "eth0".into(),
+            enabled: true,
+        };
+        assert_eq!(op.kind(), "set_inspect_interface");
+        assert_eq!(op.interface_target(), (Some("eth0".to_string()), None));
+        match op.to_controller_message("GEN2", 10_000).payload {
+            Some(CtrlPayload::SetInspectInterface(m)) => {
+                assert_eq!(m.interface_name, "eth0");
+                assert!(m.enabled);
+                assert_eq!(m.generation_id, "GEN2");
+                assert_eq!(m.confirm_deadline_ms, 10_000);
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
     }
 
     #[tokio::test]

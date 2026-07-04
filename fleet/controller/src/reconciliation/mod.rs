@@ -992,6 +992,7 @@ mod tests {
             tc_attached: false,
             fib_forwarding: false,
             urpf_mode: 0,
+            inspect_enabled: false,
             ingress_default_action: Some("drop".into()),
             egress_default_action: Some("pass".into()),
         };
@@ -1072,6 +1073,7 @@ mod tests {
             stop_behavior: None,
             metrics_interval_secs: None,
             capabilities: "{}".to_string(),
+            inspect_mode: "disabled".to_string(),
         }
     }
 

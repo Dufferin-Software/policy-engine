@@ -10,7 +10,9 @@ use std::path::Path;
 
 use super::{
     rule_content_equal, AuditEntry, ControllerStore, DiffSummary, EnrollmentTokenRecord,
-    NewAuditEntry, NodeInterface, NodeRecord, NodeStatus, Rule, TokenRedeemOutcome,
+    NewAuditEntry, NewSuricataAlert, NodeInterface, NodeRecord, NodeStatus, Rule,
+    SuricataAlertFilter, SuricataAlertRecord, SuricataRuleFileReport, SuricataRuleset,
+    TokenRedeemOutcome,
 };
 
 /// Production [`ControllerStore`] backed by SQLite via `sqlx`.
@@ -127,7 +129,7 @@ impl ControllerStore for SqliteControllerStore {
         let row = sqlx::query(
             "SELECT id, label, public_key_der, dmi_uuid, status, cert_serial, cert_expiry, \
              last_seen, enrolled_at, decommissioned_at, enrollment_id, tpm_backed, \
-             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at, metrics_interval_secs \
+             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at, metrics_interval_secs, capabilities, inspect_mode \
              FROM nodes WHERE id = ?",
         )
         .bind(id)
@@ -142,7 +144,7 @@ impl ControllerStore for SqliteControllerStore {
         let row = sqlx::query(
             "SELECT id, label, public_key_der, dmi_uuid, status, cert_serial, cert_expiry, \
              last_seen, enrolled_at, decommissioned_at, enrollment_id, tpm_backed, \
-             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at, metrics_interval_secs \
+             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at, metrics_interval_secs, capabilities, inspect_mode \
              FROM nodes WHERE enrollment_id = ?",
         )
         .bind(enrollment_id)
@@ -160,7 +162,7 @@ impl ControllerStore for SqliteControllerStore {
     ) -> Result<Vec<NodeRecord>> {
         const COLS: &str = "id, label, public_key_der, dmi_uuid, status, cert_serial, cert_expiry, \
              last_seen, enrolled_at, decommissioned_at, enrollment_id, tpm_backed, \
-             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at, metrics_interval_secs";
+             agent_version, hostname, os_pretty_name, kernel_version, dmi_sys_vendor, dmi_product_name, tenant_id, last_renewed_at, metrics_interval_secs, capabilities, inspect_mode";
         let mut sql = format!("SELECT {COLS} FROM nodes");
         let mut clauses: Vec<&'static str> = Vec::new();
         if status.is_some() {
@@ -732,7 +734,7 @@ impl ControllerStore for SqliteControllerStore {
         let rows = if let Some(t) = tenant_id {
             sqlx::query(
                 "SELECT ni.node_id, ni.interface_name, ni.ifindex, ni.mac_address, ni.link_state, ni.addresses_json, \
-                 ni.tag, ni.last_reported, ni.xdp_attached, ni.tc_attached, ni.fib_forwarding, ni.urpf_mode, \
+                 ni.tag, ni.last_reported, ni.xdp_attached, ni.tc_attached, ni.fib_forwarding, ni.urpf_mode, ni.inspect_enabled, \
                  ni.ingress_default_action, ni.egress_default_action \
                  FROM node_interfaces ni \
                  JOIN nodes n ON n.id = ni.node_id \
@@ -745,7 +747,7 @@ impl ControllerStore for SqliteControllerStore {
         } else {
             sqlx::query(
                 "SELECT node_id, interface_name, ifindex, mac_address, link_state, addresses_json, \
-                 tag, last_reported, xdp_attached, tc_attached, fib_forwarding, urpf_mode, \
+                 tag, last_reported, xdp_attached, tc_attached, fib_forwarding, urpf_mode, inspect_enabled, \
                  ingress_default_action, egress_default_action \
                  FROM node_interfaces ORDER BY node_id, interface_name",
             )
@@ -759,7 +761,7 @@ impl ControllerStore for SqliteControllerStore {
     async fn list_node_interfaces(&self, node_id: &str) -> Result<Vec<NodeInterface>> {
         let rows = sqlx::query(
             "SELECT node_id, interface_name, ifindex, mac_address, link_state, addresses_json, \
-             tag, last_reported, xdp_attached, tc_attached, fib_forwarding, urpf_mode, \
+             tag, last_reported, xdp_attached, tc_attached, fib_forwarding, urpf_mode, inspect_enabled, \
              ingress_default_action, egress_default_action \
              FROM node_interfaces WHERE node_id = ? ORDER BY interface_name",
         )
@@ -886,6 +888,376 @@ impl ControllerStore for SqliteControllerStore {
         }
         tx.commit().await.context("Failed to commit")?;
         Ok(())
+    }
+
+    async fn set_node_inspect_mode(&self, node_id: &str, mode: &str) -> Result<()> {
+        sqlx::query("UPDATE nodes SET inspect_mode = ? WHERE id = ?")
+            .bind(mode)
+            .bind(node_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update node inspect_mode")?;
+        Ok(())
+    }
+
+    async fn update_interface_inspect(
+        &self,
+        node_id: &str,
+        enabled_interfaces: &[String],
+    ) -> Result<()> {
+        // Reset the flag on all interfaces for this node, then set the listed ones.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("Failed to begin transaction")?;
+        sqlx::query("UPDATE node_interfaces SET inspect_enabled = 0 WHERE node_id = ?")
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to clear node inspect_enabled")?;
+        for iface in enabled_interfaces {
+            sqlx::query(
+                "UPDATE node_interfaces SET inspect_enabled = 1 \
+                 WHERE node_id = ? AND interface_name = ?",
+            )
+            .bind(node_id)
+            .bind(iface)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to set interface inspect_enabled")?;
+        }
+        tx.commit().await.context("Failed to commit")?;
+        Ok(())
+    }
+
+    async fn update_interface_inspect_enabled(
+        &self,
+        node_id: &str,
+        interface_name: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE node_interfaces SET inspect_enabled = ? \
+             WHERE node_id = ? AND interface_name = ?",
+        )
+        .bind(enabled as i64)
+        .bind(node_id)
+        .bind(interface_name)
+        .execute(&self.pool)
+        .await
+        .context("Failed to set interface inspect_enabled")?;
+        Ok(())
+    }
+
+    async fn create_suricata_ruleset(&self, ruleset: &SuricataRuleset) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO suricata_rulesets \
+             (id, tenant_id, name, content, sha256, rule_count, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&ruleset.id)
+        .bind(&ruleset.tenant_id)
+        .bind(&ruleset.name)
+        .bind(&ruleset.content)
+        .bind(&ruleset.sha256)
+        .bind(ruleset.rule_count as i64)
+        .bind(ruleset.created_at.timestamp())
+        .bind(ruleset.updated_at.timestamp())
+        .execute(&self.pool)
+        .await
+        .context("Failed to create suricata ruleset (name already in use?)")?;
+        Ok(())
+    }
+
+    async fn update_suricata_ruleset(
+        &self,
+        id: &str,
+        content: &str,
+        sha256: &str,
+        rule_count: u32,
+        updated_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let res = sqlx::query(
+            "UPDATE suricata_rulesets \
+             SET content = ?, sha256 = ?, rule_count = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(content)
+        .bind(sha256)
+        .bind(rule_count as i64)
+        .bind(updated_at.timestamp())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to update suricata ruleset")?;
+        anyhow::ensure!(res.rows_affected() > 0, "Ruleset '{}' not found", id);
+        Ok(())
+    }
+
+    async fn delete_suricata_ruleset(&self, id: &str) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("Failed to begin transaction")?;
+        sqlx::query("DELETE FROM node_suricata_rulesets WHERE ruleset_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to delete ruleset assignments")?;
+        sqlx::query("DELETE FROM suricata_rulesets WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to delete suricata ruleset")?;
+        tx.commit().await.context("Failed to commit")?;
+        Ok(())
+    }
+
+    async fn get_suricata_ruleset(&self, id: &str) -> Result<Option<SuricataRuleset>> {
+        let row = sqlx::query(
+            "SELECT id, tenant_id, name, content, sha256, rule_count, created_at, updated_at \
+             FROM suricata_rulesets WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to query suricata ruleset")?;
+        row.map(row_to_suricata_ruleset).transpose()
+    }
+
+    async fn list_suricata_rulesets(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<SuricataRuleset>> {
+        let rows = if let Some(t) = tenant_id {
+            sqlx::query(
+                "SELECT id, tenant_id, name, content, sha256, rule_count, created_at, updated_at \
+                 FROM suricata_rulesets WHERE tenant_id = ? ORDER BY name",
+            )
+            .bind(t)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "SELECT id, tenant_id, name, content, sha256, rule_count, created_at, updated_at \
+                 FROM suricata_rulesets ORDER BY name",
+            )
+            .fetch_all(&self.pool)
+            .await
+        }
+        .context("Failed to list suricata rulesets")?;
+        rows.into_iter().map(row_to_suricata_ruleset).collect()
+    }
+
+    async fn assign_suricata_ruleset(&self, node_id: &str, ruleset_id: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO node_suricata_rulesets (node_id, ruleset_id) VALUES (?, ?)",
+        )
+        .bind(node_id)
+        .bind(ruleset_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to assign suricata ruleset")?;
+        Ok(())
+    }
+
+    async fn unassign_suricata_ruleset(&self, node_id: &str, ruleset_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM node_suricata_rulesets WHERE node_id = ? AND ruleset_id = ?")
+            .bind(node_id)
+            .bind(ruleset_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to unassign suricata ruleset")?;
+        Ok(())
+    }
+
+    async fn list_suricata_rulesets_for_node(&self, node_id: &str) -> Result<Vec<SuricataRuleset>> {
+        let rows = sqlx::query(
+            "SELECT r.id, r.tenant_id, r.name, r.content, r.sha256, r.rule_count, \
+             r.created_at, r.updated_at \
+             FROM suricata_rulesets r \
+             JOIN node_suricata_rulesets a ON a.ruleset_id = r.id \
+             WHERE a.node_id = ? ORDER BY r.name",
+        )
+        .bind(node_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list node suricata rulesets")?;
+        rows.into_iter().map(row_to_suricata_ruleset).collect()
+    }
+
+    async fn list_nodes_for_suricata_ruleset(&self, ruleset_id: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT node_id FROM node_suricata_rulesets WHERE ruleset_id = ? ORDER BY node_id",
+        )
+        .bind(ruleset_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list ruleset nodes")?;
+        Ok(rows.into_iter().map(|r| r.get("node_id")).collect())
+    }
+
+    async fn replace_node_suricata_rule_files(
+        &self,
+        node_id: &str,
+        files: &[SuricataRuleFileReport],
+    ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("Failed to begin transaction")?;
+        sqlx::query("DELETE FROM node_suricata_rule_files WHERE node_id = ?")
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to clear node rule files")?;
+        for f in files {
+            sqlx::query(
+                "INSERT INTO node_suricata_rule_files (node_id, filename, sha256, rule_count) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(node_id)
+            .bind(&f.filename)
+            .bind(&f.sha256)
+            .bind(f.rule_count as i64)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to insert node rule file")?;
+        }
+        tx.commit().await.context("Failed to commit")?;
+        Ok(())
+    }
+
+    async fn list_node_suricata_rule_files(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<SuricataRuleFileReport>> {
+        let rows = sqlx::query(
+            "SELECT node_id, filename, sha256, rule_count \
+             FROM node_suricata_rule_files WHERE node_id = ? ORDER BY filename",
+        )
+        .bind(node_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list node rule files")?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SuricataRuleFileReport {
+                node_id: r.get("node_id"),
+                filename: r.get("filename"),
+                sha256: r.get("sha256"),
+                rule_count: r.get::<i64, _>("rule_count") as u32,
+            })
+            .collect())
+    }
+
+    async fn insert_suricata_alerts(&self, alerts: &[NewSuricataAlert]) -> Result<()> {
+        if alerts.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("Failed to begin transaction")?;
+        for a in alerts {
+            sqlx::query(
+                "INSERT INTO suricata_alerts \
+                 (tenant_id, node_id, timestamp, received_ns, src_ip, src_port, dst_ip, \
+                  dst_port, proto, action, signature_id, signature, category, severity, raw_json) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&a.tenant_id)
+            .bind(&a.node_id)
+            .bind(&a.timestamp)
+            .bind(a.received_ns)
+            .bind(&a.src_ip)
+            .bind(a.src_port)
+            .bind(&a.dst_ip)
+            .bind(a.dst_port)
+            .bind(&a.proto)
+            .bind(&a.action)
+            .bind(a.signature_id)
+            .bind(&a.signature)
+            .bind(&a.category)
+            .bind(a.severity)
+            .bind(&a.raw_json)
+            .execute(&mut *tx)
+            .await
+            .context("Failed to insert suricata alert")?;
+        }
+        tx.commit().await.context("Failed to commit")?;
+        Ok(())
+    }
+
+    async fn list_suricata_alerts(
+        &self,
+        filter: &SuricataAlertFilter,
+        limit: i64,
+    ) -> Result<Vec<SuricataAlertRecord>> {
+        let mut sql = String::from(
+            "SELECT id, tenant_id, node_id, timestamp, received_ns, src_ip, src_port, dst_ip, \
+             dst_port, proto, action, signature_id, signature, category, severity, raw_json \
+             FROM suricata_alerts",
+        );
+        let mut clauses: Vec<&'static str> = Vec::new();
+        if filter.tenant_id.is_some() {
+            clauses.push("tenant_id = ?");
+        }
+        if filter.node_id.is_some() {
+            clauses.push("node_id = ?");
+        }
+        if filter.min_severity.is_some() {
+            // Lower severity number = higher urgency in Suricata; "min_severity"
+            // means "at least this urgent", i.e. severity <= N.
+            clauses.push("severity <= ?");
+        }
+        if filter.signature_id.is_some() {
+            clauses.push("signature_id = ?");
+        }
+        if filter.signature_contains.is_some() {
+            clauses.push("signature LIKE ?");
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY received_ns DESC LIMIT ?");
+
+        let mut q = sqlx::query(&sql);
+        if let Some(ref t) = filter.tenant_id {
+            q = q.bind(t);
+        }
+        if let Some(ref n) = filter.node_id {
+            q = q.bind(n);
+        }
+        if let Some(s) = filter.min_severity {
+            q = q.bind(s);
+        }
+        if let Some(sid) = filter.signature_id {
+            q = q.bind(sid);
+        }
+        if let Some(ref sig) = filter.signature_contains {
+            q = q.bind(format!("%{}%", sig));
+        }
+        q = q.bind(limit.max(0));
+
+        let rows = q
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to query suricata alerts")?;
+        Ok(rows.into_iter().map(row_to_suricata_alert).collect())
+    }
+
+    async fn prune_suricata_alerts(&self, cutoff_ns: i64) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM suricata_alerts WHERE received_ns < ?")
+            .bind(cutoff_ns)
+            .execute(&self.pool)
+            .await
+            .context("Failed to prune suricata alerts")?;
+        Ok(res.rows_affected())
     }
 
     async fn update_interface_attachments(
@@ -1278,6 +1650,9 @@ fn row_to_node(row: sqlx::sqlite::SqliteRow) -> Result<NodeRecord> {
         capabilities: row
             .try_get("capabilities")
             .unwrap_or_else(|_| "{}".to_string()),
+        inspect_mode: row
+            .try_get("inspect_mode")
+            .unwrap_or_else(|_| "disabled".to_string()),
     })
 }
 
@@ -1326,6 +1701,42 @@ fn row_to_enrollment_token(row: sqlx::sqlite::SqliteRow) -> Result<EnrollmentTok
     })
 }
 
+fn row_to_suricata_alert(row: sqlx::sqlite::SqliteRow) -> SuricataAlertRecord {
+    SuricataAlertRecord {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        node_id: row.get("node_id"),
+        timestamp: row.get("timestamp"),
+        received_ns: row.get("received_ns"),
+        src_ip: row.get("src_ip"),
+        src_port: row.get::<Option<i64>, _>("src_port").map(|p| p as i32),
+        dst_ip: row.get("dst_ip"),
+        dst_port: row.get::<Option<i64>, _>("dst_port").map(|p| p as i32),
+        proto: row.get("proto"),
+        action: row.get("action"),
+        signature_id: row.get("signature_id"),
+        signature: row.get("signature"),
+        category: row.get("category"),
+        severity: row.get::<Option<i64>, _>("severity").map(|s| s as i32),
+        raw_json: row.get("raw_json"),
+    }
+}
+
+fn row_to_suricata_ruleset(row: sqlx::sqlite::SqliteRow) -> Result<SuricataRuleset> {
+    let created_at: i64 = row.get("created_at");
+    let updated_at: i64 = row.get("updated_at");
+    Ok(SuricataRuleset {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        name: row.get("name"),
+        content: row.get("content"),
+        sha256: row.get("sha256"),
+        rule_count: row.get::<i64, _>("rule_count") as u32,
+        created_at: DateTime::from_timestamp(created_at, 0).unwrap_or_default(),
+        updated_at: DateTime::from_timestamp(updated_at, 0).unwrap_or_default(),
+    })
+}
+
 fn row_to_node_interface(row: sqlx::sqlite::SqliteRow) -> Result<NodeInterface> {
     let last_reported: i64 = row.get("last_reported");
     Ok(NodeInterface {
@@ -1341,6 +1752,7 @@ fn row_to_node_interface(row: sqlx::sqlite::SqliteRow) -> Result<NodeInterface> 
         tc_attached: row.try_get::<bool, _>("tc_attached").unwrap_or(false),
         fib_forwarding: row.try_get::<bool, _>("fib_forwarding").unwrap_or(false),
         urpf_mode: row.try_get::<i64, _>("urpf_mode").unwrap_or(0) as u32,
+        inspect_enabled: row.try_get::<bool, _>("inspect_enabled").unwrap_or(false),
         ingress_default_action: row.try_get("ingress_default_action").unwrap_or(None),
         egress_default_action: row.try_get("egress_default_action").unwrap_or(None),
     })
@@ -1384,6 +1796,7 @@ mod tests {
             stop_behavior: None,
             metrics_interval_secs: None,
             capabilities: "{}".to_string(),
+            inspect_mode: "disabled".to_string(),
         }
     }
 
@@ -1480,6 +1893,77 @@ mod tests {
         let mode = |name: &str| all.iter().find(|i| i.name == name).unwrap().urpf_mode;
         assert_eq!(mode("eth0"), 1);
         assert_eq!(mode("eth1"), 0);
+    }
+
+    // Inspect mode + per-interface inspect flags round-trip through the real
+    // SQL columns (both the snapshot-writeback replace path and the single-
+    // interface commit path).
+    #[tokio::test]
+    async fn inspect_state_round_trips_through_sqlite() {
+        let (store, _dir) = temp_store().await;
+        store.upsert_node(&sample_node("n1")).await.unwrap();
+        store
+            .upsert_node_interfaces(
+                "n1",
+                &[
+                    InterfaceReport {
+                        name: "eth0".to_string(),
+                        addresses: vec![],
+                        mac_address: String::new(),
+                        link_state: "up".to_string(),
+                        ifindex: 2,
+                    },
+                    InterfaceReport {
+                        name: "eth1".to_string(),
+                        addresses: vec![],
+                        mac_address: String::new(),
+                        link_state: "up".to_string(),
+                        ifindex: 3,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Defaults: mode disabled, no interface flagged.
+        assert_eq!(
+            store.get_node("n1").await.unwrap().unwrap().inspect_mode,
+            "disabled"
+        );
+        let ifaces = store.list_node_interfaces("n1").await.unwrap();
+        assert!(ifaces.iter().all(|i| !i.inspect_enabled));
+
+        // Node-global mode.
+        store.set_node_inspect_mode("n1", "ips").await.unwrap();
+        assert_eq!(
+            store.get_node("n1").await.unwrap().unwrap().inspect_mode,
+            "ips"
+        );
+
+        // Single-interface commit path.
+        store
+            .update_interface_inspect_enabled("n1", "eth0", true)
+            .await
+            .unwrap();
+        let flag = |ifaces: &[NodeInterface], name: &str| {
+            ifaces
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap()
+                .inspect_enabled
+        };
+        let ifaces = store.list_node_interfaces("n1").await.unwrap();
+        assert!(flag(&ifaces, "eth0"));
+        assert!(!flag(&ifaces, "eth1"));
+
+        // Snapshot-writeback replace path: only eth1 listed → eth0 cleared.
+        store
+            .update_interface_inspect("n1", &["eth1".to_string()])
+            .await
+            .unwrap();
+        let ifaces = store.list_node_interfaces("n1").await.unwrap();
+        assert!(!flag(&ifaces, "eth0"));
+        assert!(flag(&ifaces, "eth1"));
     }
 
     fn sample_rule(id: &str, node_id: &str) -> Rule {

@@ -526,6 +526,8 @@ async fn drive_stream(
     // ── Step 4: register session ─────────────────────────────────────────────
     // Interface rows are committed above before we mark the node online so any
     // caller gating on is_online() is guaranteed to find the interface rows.
+    // Captured for tagging Suricata alerts without a per-batch store lookup.
+    let node_tenant = node.tenant_id.clone();
     sessions.register(node_id.clone(), node.tenant_id.clone(), tx.clone());
 
     // ── Step 5: reconciliation — send full restore from stored rules ─────
@@ -638,6 +640,84 @@ async fn drive_stream(
                     if let Err(e) = store.update_interface_urpf(&node_id, &urpf_modes).await {
                         log::warn!("Failed to update urpf for {}: {:#}", node_id, e);
                     }
+                    // Suricata inspect state is agent-authoritative like
+                    // fib/urpf: the snapshot overwrites the stored mode and
+                    // per-interface flags; nothing is re-pushed on reconnect.
+                    let mode_str = match snap.inspect_mode {
+                        1 => "ips",
+                        2 => "ids",
+                        _ => "disabled",
+                    };
+                    if let Err(e) = store.set_node_inspect_mode(&node_id, mode_str).await {
+                        log::warn!("Failed to update inspect_mode for {}: {:#}", node_id, e);
+                    }
+                    if let Err(e) = store
+                        .update_interface_inspect(&node_id, &snap.inspect_enabled_interfaces)
+                        .await
+                    {
+                        log::warn!(
+                            "Failed to update inspect interfaces for {}: {:#}",
+                            node_id,
+                            e
+                        );
+                    }
+                    // Reported rule-file digests (all files, fleet- and local)
+                    // — drives in-sync badges and the drift reconcile below.
+                    let reported: Vec<crate::store::SuricataRuleFileReport> = snap
+                        .suricata_rule_files
+                        .iter()
+                        .map(|f| crate::store::SuricataRuleFileReport {
+                            node_id: node_id.clone(),
+                            filename: f.filename.clone(),
+                            sha256: f.sha256.clone(),
+                            rule_count: f.rule_count,
+                        })
+                        .collect();
+                    if let Err(e) = store
+                        .replace_node_suricata_rule_files(&node_id, &reported)
+                        .await
+                    {
+                        log::warn!("Failed to update rule files for {}: {:#}", node_id, e);
+                    }
+
+                    // Fleet-ruleset drift reconcile. Unlike inspect mode
+                    // (agent-authoritative), assigned rulesets are controller
+                    // desired state: converge the node's fleet-* files toward
+                    // them, un-gated like the rules reconciliation below.
+                    // Skip nodes without the suricata capability — an old or
+                    // featureless agent silently drops the message.
+                    let capable = store
+                        .get_node(&node_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|n| n.capabilities.contains("\"suricata\""))
+                        .unwrap_or(false);
+                    if capable {
+                        match store.list_suricata_rulesets_for_node(&node_id).await {
+                            Ok(desired) => {
+                                if let Some(push) =
+                                    crate::suricata_sync::build_ruleset_push(&desired, &reported)
+                                {
+                                    log::info!(
+                                        "Suricata ruleset drift for {}: pushing {} files, {} desired",
+                                        node_id,
+                                        push.files.len(),
+                                        push.desired_filenames.len()
+                                    );
+                                    enqueue(
+                                        tx,
+                                        ControllerMessage {
+                                            payload: Some(CtrlPayload::SuricataRulesetPush(push)),
+                                        },
+                                    )?;
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Failed to load rulesets for {}: {:#}", node_id, e)
+                            }
+                        }
+                    }
                 }
                 // Diff snapshot against desired state and send delta if needed.
                 // Exclude TTL-expired rules from desired so they are not pushed back —
@@ -723,6 +803,23 @@ async fn drive_stream(
                     node_id: node_id.clone(),
                     timestamp_ns: batch.timestamp_ns,
                     events_json: batch.events_json,
+                });
+            }
+            Some(AgentPayload::SuricataAlerts(batch)) => {
+                log::debug!(
+                    "SuricataAlertBatch from {} ({} alerts)",
+                    node_id,
+                    batch.alerts_json.len()
+                );
+                // Publish to the dedicated alert channel; the persister writes
+                // the DB rows, the /ws/alerts handler streams to operators, and
+                // the alert engine matches rules — none of which happen on this
+                // hot read path (mirrors the EventBatch arm above).
+                event_bus.publish_suricata_alerts(crate::event_bus::TaggedSuricataAlertBatch {
+                    node_id: node_id.clone(),
+                    tenant_id: node_tenant.clone(),
+                    timestamp_ns: batch.timestamp_ns,
+                    alerts_json: batch.alerts_json,
                 });
             }
             Some(AgentPayload::RuleLifecycleEvents(batch)) => {
@@ -1241,6 +1338,7 @@ mod tests {
                 stop_behavior: None,
                 metrics_interval_secs: None,
                 capabilities: "{}".to_string(),
+                inspect_mode: "disabled".to_string(),
             })
             .await
             .unwrap();
