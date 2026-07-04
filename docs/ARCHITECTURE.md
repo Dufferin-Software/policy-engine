@@ -202,6 +202,42 @@ NIC (ingress)
 - **IPS:** Suricata alerts cause permanent DROP verdicts written to the flow cache. All subsequent packets on the matching flow are dropped at XDP speed.
 - **IDS:** Suricata alerts are logged but no DROP verdicts are written. Traffic is never blocked.
 
+The mode is **node-global** (one IPS/IDS/off setting per engine), but **which
+interfaces are inspected is per-interface**: only interfaces with the
+per-interface inspect flag set have their INSPECT-matched flows mirrored to
+Suricata. The flag lives in the per-interface `fib_config_map` entry shared
+with XDP FIB forwarding and uRPF (one map lookup covers all three), so
+inspection requires *both* an active node-global mode and the interface flag.
+Mirroring of an already-marked flow follows the flow, not the interface, so a
+flow marked on an enabled interface is captured bidirectionally even when its
+reverse path exits another interface.
+
+Inspect state (mode + enabled interfaces) is persisted to `state.json` and
+restored on daemon startup — including recreating the veth pair, applying the
+Suricata config, and re-enabling the per-interface flags.
+
+### Fleet control
+
+When managed by the controller, IPS/IDS is driven fleet-wide:
+
+- **Per-node mode + per-interface enable** via `setInspectMode` /
+  `setInspectInterface` (gated, auto-reverting, agent-authoritative — the
+  agent's `StateSnapshot` writes the reported mode/flags back to the
+  controller DB; nothing is re-pushed on reconnect).
+- **Named fleet rulesets** stored in the controller and materialised on
+  assigned nodes as `fleet-<name>.rules` (byte-verbatim; drift is detected by
+  comparing SHA-256 digests reported in the snapshot and reconverged with a
+  minimal `SuricataRulesetPush`). Node-local rule files are never touched.
+- **Central alerts:** the engine exposes EVE alerts on `/ws/alerts`; the agent
+  forwards them as `SuricataAlertBatch` messages; the controller persists them
+  to `suricata_alerts`, streams them on its own `/ws/alerts`, and serves them
+  via the `suricataAlerts` GraphQL query.
+
+Feature-specific pushes are gated on the node's advertised `suricata`
+capability (`AgentHello.capabilities.features`) so a plain-engine or
+older agent — which silently drops the unknown message — is rejected
+synchronously rather than stranding a pending generation.
+
 ### Key Constants
 
 | Constant | Value | Description |
@@ -359,7 +395,9 @@ node_id. Full design in [enrollment-crypto.md](enrollment-crypto.md) Phase 7.
 | `StateSnapshot` | Current rules, attachments, default actions (on connect + on demand) |
 | `MetricsUpdate` | Scraped Prometheus text from local `/metrics` (every 30s) |
 | `EventBatch` | BPF events forwarded from local WebSocket stream |
+| `SuricataAlertBatch` | Suricata EVE alerts forwarded from local `/ws/alerts` (suricata-capable nodes only) |
 | `ConfigApplyResult` | Success/failure after a ConfigPush |
+| `ConfigConfirm` | Per-generation apply/reject/revert confirmation for gated ops |
 
 **Controller → Agent:**
 
@@ -367,6 +405,9 @@ node_id. Full design in [enrollment-crypto.md](enrollment-crypto.md) Phase 7.
 |---------|-------------|
 | `ConfigPush` | Desired ruleset to apply |
 | `StateQuery` | Request a fresh StateSnapshot |
+| `SetInspectMode` | Set node-global Suricata mode (disabled/IPS/IDS), gated |
+| `SetInspectInterface` | Enable/disable inspection on one interface, gated |
+| `SuricataRulesetPush` | Sync fleet-managed `fleet-*.rules` files (idempotent) |
 | `Disconnect` | Graceful shutdown signal |
 
 ### Reconciliation
@@ -400,6 +441,9 @@ Schema lives in `fleet/controller/migrations/0001_initial.sql`. Key tables:
 | `audit_log` | Append-only mutation log |
 | `events` | Persisted BPF events forwarded by agents |
 | `alert_rules`, `receivers`, `silences`, `alert_history` | Alerting subsystem |
+| `suricata_rulesets`, `node_suricata_rulesets` | Named fleet Suricata rulesets + per-node assignments |
+| `node_suricata_rule_files` | Agent-reported rule-file digests (drift detection) |
+| `suricata_alerts` | Persisted Suricata IPS/IDS alerts forwarded by agents |
 
 ---
 
@@ -412,6 +456,7 @@ Schema lives in `fleet/controller/migrations/0001_initial.sql`. Key tables:
 | POST | `/graphql` | GraphQL API |
 | GET | `/playground` | GraphQL Playground |
 | GET | `/ws/events` | WebSocket BPF event stream |
+| GET | `/ws/alerts` | WebSocket Suricata EVE alert stream (IPS build; idles while inspection off) |
 | GET | `/metrics` | Prometheus metrics |
 | GET | `/` | Web UI (if `policy-engine-web` installed) |
 
@@ -423,6 +468,7 @@ Schema lives in `fleet/controller/migrations/0001_initial.sql`. Key tables:
 | GET | `/playground` | GraphQL Playground |
 | GET | `/health` | Health check (`{"status":"ok"}`) |
 | GET | `/ws/events[?node=<id>]` | WebSocket BPF event stream (all nodes or filtered) |
+| GET | `/ws/alerts[?node=<id>]` | WebSocket Suricata alert stream (all nodes or filtered) |
 | GET | `/metrics` | Aggregated Prometheus (all nodes) |
 | GET | `/metrics/node/<id>` | Per-node Prometheus metrics |
 | GET | `/` | Fleet web UI (if `policy-controller-web` installed) |

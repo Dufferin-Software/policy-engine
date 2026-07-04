@@ -399,6 +399,17 @@ policy-client inspect enable --mode ips
 policy-client inspect enable --mode ids
 ```
 
+Inspection only happens on interfaces that are explicitly enabled. With no
+`--interface` flag, `inspect enable` enables every currently XDP-attached
+interface (matching the historical node-global behaviour); pass one or more
+`--interface` flags to scope it, or toggle interfaces individually:
+
+```bash
+policy-client inspect enable --mode ips --interface eth0 --interface eth1
+policy-client inspect interface eth2 on
+policy-client inspect interface eth0 off
+```
+
 ### Configure Inspect Rules
 
 Add INSPECT actions to rule(s) to select which traffic Suricata inspects:
@@ -693,6 +704,37 @@ Push to all online nodes at once:
 policy-controller-client nodes push-all
 ```
 
+### Fleet Suricata IPS/IDS
+
+Nodes running the `policy-engine-ips` package advertise a `suricata`
+capability; the commands below are rejected for plain-engine nodes.
+
+```bash
+# Enable IPS (or "ids"/"off") on a node, then turn inspection on for an interface.
+# Inspection only happens on enabled interfaces, and only for INSPECT-action
+# rules (push those with the normal rule commands).
+policy-controller-client inspect set-mode <node_id> ips
+policy-controller-client inspect interface <node_id> eth0 on
+policy-controller-client inspect status <node_id>
+
+# Named fleet rulesets — stored centrally, materialised on assigned nodes as
+# /etc/suricata/rules/policy-engine/fleet-<name>.rules (node-local rule files
+# are never touched). Assigned nodes reconverge automatically on drift.
+policy-controller-client suricata-rules create base --file ./base.rules
+policy-controller-client suricata-rules assign <node_id> <ruleset_id>
+policy-controller-client suricata-rules list
+policy-controller-client suricata-rules push <node_id>       # force sync + confirm
+policy-controller-client suricata-rules unassign <node_id> <ruleset_id>
+
+# Central alert history (newest first).
+policy-controller-client alerts list --limit 50
+policy-controller-client alerts list --node-id <node_id> --min-severity 2
+```
+
+Alerts also stream live over the controller's `ws://controller:8443/ws/alerts`
+(all nodes, or `?node=<id>`), and are queryable via the `suricataAlerts`
+GraphQL query.
+
 ### Monitoring the Fleet
 
 ```bash
@@ -772,7 +814,12 @@ Pages:
 - **Fleet Dashboard** — all nodes, online/offline status, health indicators
 - **Enrollment Queue** — approve or reject pending nodes
 - **Ruleset Editor** — create, edit, and delete rulesets
-- **Node Detail** — per-node live stats, assigned ruleset, events
+- **Node Detail** — per-node live stats, assigned ruleset, events; the IPS/IDS
+  mode selector and per-interface inspection toggles appear here for
+  suricata-capable nodes
+- **Suricata Rules** — create/edit fleet Suricata rulesets and assign them to
+  nodes, with per-node in-sync badges
+- **IDS Alerts** — live + historical Suricata alerts across the fleet
 - **Audit Log** — full mutation history
 
 ### GraphQL Playground
@@ -825,6 +872,7 @@ setFibForwarding(input: SetFibForwardingInput!)
 configureFlowExport(input: FlowExportInput!)
 
 configureInspect(mode: InspectMode!)
+setInspectInterface(interface: String!, enabled: Boolean!)  # per-interface enable
 disableInspect
 deploySuricataRules(filename: String!, rules: String!)
 reloadSuricataRules
@@ -847,7 +895,17 @@ auditLog(limit: Int, offset: Int)
 caCertPem                      # controller CA PEM
 onlineNodes                    # IDs of currently connected agents
 enrollmentTokens               # ZTP bootstrap tokens (newest first)
+
+# Suricata IPS/IDS (nodes with the "suricata" capability)
+suricataRulesets               # all fleet Suricata rulesets
+suricataRuleset(id: ID!)       # one ruleset, with content
+nodeSuricataRulesets(nodeId: ID!)   # assigned rulesets + per-file inSync
+nodeSuricataRuleFiles(nodeId: ID!)  # agent-reported rule files (fleet + local)
+suricataAlerts(filter: SuricataAlertFilterInput, limit: Int)  # IDS alerts, newest first
 ```
+
+`node(id:)` exposes `inspectMode` and the raw `capabilities` JSON;
+`nodeInterfaces(nodeId:)` exposes `inspectEnabled` per interface.
 
 ### policy-controller Mutations
 
@@ -871,4 +929,14 @@ unassignRuleset(nodeId: ID!)
 
 pushConfig(nodeId: ID!)
 pushConfigAll
+
+# Suricata IPS/IDS (gated on the node's "suricata" capability)
+setInspectMode(nodeId: ID!, mode: String!)              # "disabled"/"ips"/"ids"
+setInspectInterface(nodeId: ID!, interfaceName: String!, enabled: Boolean!)
+createSuricataRuleset(name: String!, content: String!)
+updateSuricataRuleset(id: ID!, content: String!)
+deleteSuricataRuleset(id: ID!)
+assignSuricataRuleset(nodeId: ID!, rulesetId: ID!)
+unassignSuricataRuleset(nodeId: ID!, rulesetId: ID!)
+pushSuricataRulesets(nodeId: ID!)                       # force a sync + confirm
 ```
