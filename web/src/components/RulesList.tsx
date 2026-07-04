@@ -352,7 +352,7 @@ function RuleRow({
   )
 }
 
-export function RulesList() {
+export function RulesList({ inspectSupported = false }: { inspectSupported?: boolean }) {
   const [activeDirection, setActiveDirection] = useState<'INGRESS' | 'EGRESS'>('INGRESS')
 
   const { loading, error, data, refetch } = useQuery<RulesData>(GET_RULES, {
@@ -879,7 +879,7 @@ export function RulesList() {
                 onClick={() => {
                   const usedActions = new Set(formActions.map((a) => a.action))
                   const next = ['LOG', 'PASS', 'DROP', 'INSPECT'].find((a) => {
-                    if (a === 'INSPECT' && activeDirection !== 'INGRESS') return false
+                    if (a === 'INSPECT' && (activeDirection !== 'INGRESS' || !inspectSupported)) return false
                     return !usedActions.has(a)
                   }) || 'PASS'
                   setFormActions([...formActions, { action: next, param: '' }])
@@ -905,7 +905,7 @@ export function RulesList() {
                     <option value="DROP">Drop</option>
                     <option value="PASS">Pass</option>
                     <option value="LOG">Log</option>
-                    {activeDirection === 'INGRESS' && (
+                    {activeDirection === 'INGRESS' && inspectSupported && (
                       <option value="INSPECT">Inspect (IPS)</option>
                     )}
                   </select>

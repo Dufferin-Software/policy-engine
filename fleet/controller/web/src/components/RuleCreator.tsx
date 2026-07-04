@@ -30,6 +30,8 @@ interface Props {
   nodeId: string
   interfaceName: string
   direction: string
+  /** Node advertised the "suricata" capability — offers the INSPECT action. */
+  suricataCapable?: boolean
   onClose: () => void
   onCreated: () => void
   onPendingChange?: (pending: boolean, opKind?: string) => void
@@ -47,7 +49,7 @@ function validateMac(v: string): boolean {
   return v === '' || MAC_RE.test(v)
 }
 
-export default function RuleCreator({ nodeId, interfaceName, direction, onClose, onCreated, onPendingChange }: Props) {
+export default function RuleCreator({ nodeId, interfaceName, direction, suricataCapable = false, onClose, onCreated, onPendingChange }: Props) {
   const [createRule] = useMutation(CREATE_RULE)
 
   const [srcCidr, setSrcCidr] = useState('')
@@ -331,7 +333,7 @@ export default function RuleCreator({ nodeId, interfaceName, direction, onClose,
                   <option value="pass">PASS</option>
                   <option value="drop">DROP</option>
                   <option value="log">LOG</option>
-                  <option value="inspect">INSPECT</option>
+                  {suricataCapable && <option value="inspect">INSPECT</option>}
                 </select>
                 <input
                   type="number"

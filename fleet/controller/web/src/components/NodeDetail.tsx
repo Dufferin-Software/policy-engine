@@ -4,7 +4,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
 import { useQuery, useMutation, gql } from '@apollo/client'
-import { ControlledNode, NodeInterfaceOutput, RuleOutput, relTime, statusColor, shortId } from './types.ts'
+import { ControlledNode, NodeInterfaceOutput, RuleOutput, capabilityFeatures, relTime, statusColor, shortId } from './types.ts'
 import InterfaceManager from './InterfaceManager.tsx'
 import NodeInterfaceStats from './NodeInterfaceStats.tsx'
 import InterfaceStatsDetail from './InterfaceStatsDetail.tsx'
@@ -242,6 +242,9 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
   const node = data?.node
   const interfaces = data?.nodeInterfaces ?? []
   const rules = data?.rules ?? []
+  // Node's agent advertised the "suricata" capability — gates all IPS/IDS
+  // config UI (mode selector, per-interface inspect toggle, INSPECT action).
+  const suricataCapable = capabilityFeatures(node?.capabilities).includes('suricata')
   // Effective metrics scrape interval; null means the node uses the agent
   // default of 5s. Drives the stats poll cadence and the "Ns refresh" label.
   const refreshSecs = node?.metricsIntervalSecs ?? 5
@@ -580,12 +583,7 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
                     {(() => {
                       // IPS/IDS mode selector — only for nodes whose agent
                       // advertised the "suricata" capability.
-                      let capable = false
-                      try {
-                        const caps = JSON.parse(node.capabilities || '{}')
-                        capable = Array.isArray(caps.features) && caps.features.includes('suricata')
-                      } catch { /* treat unparseable capabilities as not capable */ }
-                      if (!capable) return null
+                      if (!suricataCapable) return null
                       const mode = node.inspectMode || 'disabled'
                       const btn = (value: string, label: string, activeCls: string, tip: string) => (
                         <button
@@ -649,14 +647,7 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
                   interfaces={interfaces}
                   rules={rules}
                   pendingGeneration={pendingGeneration}
-                  suricataCapable={(() => {
-                    try {
-                      const caps = JSON.parse(node?.capabilities || '{}')
-                      return Array.isArray(caps.features) && caps.features.includes('suricata')
-                    } catch {
-                      return false
-                    }
-                  })()}
+                  suricataCapable={suricataCapable}
                   onRefetch={() => refetch()}
                   onShowStats={(name) => setStatsIface((prev) => (prev === name ? null : name))}
                   onPendingChange={handlePendingChange}
@@ -783,6 +774,7 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
                               nodeId={nodeId}
                               interfaceName={ifaceName}
                               direction={dir}
+                              suricataCapable={suricataCapable}
                               onClose={() => setCreatingRule(null)}
                               onCreated={() => { refetch(); flash('Rule created.') }}
                               onPendingChange={handlePendingChange}

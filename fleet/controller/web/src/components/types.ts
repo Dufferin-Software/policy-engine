@@ -90,6 +90,23 @@ export interface OperationResult {
 
 // ── Common UI helpers ─────────────────────────────────────────────────────────
 
+/** Parse the JSON-encoded Capabilities blob and return the advertised feature
+ *  list (empty for vanilla nodes or unparseable blobs). */
+export function capabilityFeatures(capabilities: string | undefined | null): string[] {
+  try {
+    const caps = JSON.parse(capabilities || '{}')
+    return Array.isArray(caps.features) ? caps.features.filter((f: unknown) => typeof f === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+/** Display metadata for known node features; unknown features fall back to
+ *  their raw name so new agent capabilities show up without a UI change. */
+export const FEATURE_BADGES: Record<string, { label: string; title: string }> = {
+  suricata: { label: 'IPS', title: 'Suricata IPS/IDS inspection supported (feature: suricata)' },
+}
+
 export function statusColor(status: string): string {
   switch (status) {
     case 'active':

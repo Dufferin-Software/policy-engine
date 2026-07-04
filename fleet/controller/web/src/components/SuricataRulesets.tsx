@@ -3,6 +3,7 @@
 
 import { useState } from 'react'
 import { gql, useQuery, useMutation } from '@apollo/client'
+import { capabilityFeatures, nodeDisplayName, shortId } from './types.ts'
 
 const GET_RULESETS = gql`
   query GetSuricataRulesets {
@@ -81,12 +82,7 @@ interface RulesetsData {
 }
 
 function suricataCapable(capabilities: string): boolean {
-  try {
-    const caps = JSON.parse(capabilities || '{}')
-    return Array.isArray(caps.features) && caps.features.includes('suricata')
-  } catch {
-    return false
-  }
+  return capabilityFeatures(capabilities).includes('suricata')
 }
 
 export default function SuricataRulesets() {
@@ -129,7 +125,7 @@ export default function SuricataRulesets() {
 
   const nodeLabel = (id: string) => {
     const n = nodes.find((x) => x.id === id)
-    const name = n?.label || n?.hostname || id.slice(0, 12)
+    const name = n ? nodeDisplayName(n) : shortId(id)
     return online.has(id) ? name : `${name} (offline)`
   }
 

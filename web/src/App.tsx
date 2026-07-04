@@ -107,7 +107,7 @@ function App() {
           <EventStream />
           <RuleLifecycleStream />
         </div>
-        {activeTab === 'rules' && <RulesList />}
+        {activeTab === 'rules' && <RulesList inspectSupported={inspectSupported} />}
         {activeTab === 'inspect' && inspectSupported && <InspectPanel />}
         {activeTab === 'performance' && <PerformancePanel />}
         {activeTab === 'audit' && <AuditLogPanel />}

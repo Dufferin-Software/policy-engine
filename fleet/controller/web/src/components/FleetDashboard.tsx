@@ -3,7 +3,7 @@
 
 import { useState } from 'react'
 import { useQuery, useMutation, gql } from '@apollo/client'
-import { ControlledNode, nodeDisplayName, relTime, shortId, statusColor } from './types.ts'
+import { ControlledNode, capabilityFeatures, FEATURE_BADGES, nodeDisplayName, relTime, shortId, statusColor } from './types.ts'
 import NodeDetail, { NodeTab } from './NodeDetail.tsx'
 import FleetConfig from './FleetConfig.tsx'
 import MonitoringSetup from './MonitoringSetup.tsx'
@@ -12,7 +12,7 @@ import FleetMetricsBar from './FleetMetricsBar.tsx'
 const GET_FLEET = gql`
   query GetFleet {
     nodes {
-      id label hostname status certExpiry lastSeen enrolledAt tpmBacked agentVersion dmiUuid
+      id label hostname status certExpiry lastSeen enrolledAt tpmBacked agentVersion dmiUuid capabilities
     }
     onlineNodes
     pendingGenerations {
@@ -205,9 +205,19 @@ export default function FleetDashboard({ selectedNode, onSelectNode }: FleetDash
                           ? shortId(node.id)
                           : ''}
                     </div>
-                    {node.tpmBacked && (
-                      <span className="text-xs text-purple-400" title="TPM-backed key">TPM</span>
-                    )}
+                    <span className="inline-flex gap-2">
+                      {node.tpmBacked && (
+                        <span className="text-xs text-purple-400" title="TPM-backed key">TPM</span>
+                      )}
+                      {capabilityFeatures(node.capabilities).map((f) => {
+                        const badge = FEATURE_BADGES[f] ?? { label: f, title: `Node feature: ${f}` }
+                        return (
+                          <span key={f} className="text-xs text-cyan-400" title={badge.title}>
+                            {badge.label}
+                          </span>
+                        )
+                      })}
+                    </span>
                   </td>
 
                   {/* Status */}
