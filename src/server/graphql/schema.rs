@@ -606,14 +606,17 @@ impl QueryRoot {
 
         let custom_rule_files = state
             .suricata_coordinator
-            .list_custom_rules()
+            .list_custom_rules_meta()
             .into_iter()
-            .map(|(filename, rules)| CustomRuleFileOutput {
-                filename,
-                rule_count: rules.len() as i32,
-                rules,
+            .map(|meta| CustomRuleFileOutput {
+                filename: meta.filename,
+                rule_count: meta.rules.len() as i32,
+                rules: meta.rules,
+                sha256: meta.sha256,
             })
             .collect();
+
+        let enabled_interfaces = service.list_inspect_interfaces().unwrap_or_default();
 
         Ok(InspectStatusOutput {
             mode,
@@ -625,6 +628,7 @@ impl QueryRoot {
             suricata_version: state.suricata_coordinator.suricata_version(),
             ruleset_version: state.suricata_coordinator.ruleset_version(),
             custom_rule_files,
+            enabled_interfaces,
         })
     }
 
@@ -1799,40 +1803,13 @@ impl MutationRoot {
             GqlInspectMode::Disabled => InspectMode::Disabled,
         };
 
-        // When enabling IPS, create the veth pair and get pe-inspect0 ifindex.
-        // TC ingress will bpf_clone_redirect INSPECT-matched flows to pe-inspect0;
-        // Suricata listens on pe-inspect1 (the veth peer) and sees the full stream.
-        let mirror_ifindex = if mode != InspectMode::Disabled {
-            let mut veth = state.veth_manager.lock().await;
-            if let Err(e) = veth.create_pair() {
-                log::warn!("Failed to create veth pair for INSPECT cloning: {}", e);
-            }
-            veth.get_ifindex().unwrap_or(0)
-        } else {
-            0
-        };
-
-        let mut service = state.service.lock().await;
-        let op = service
-            .configure_inspect(mode, mirror_ifindex)
-            .map_err(|e| async_graphql::Error::new(format!("{}", e)))?;
-
-        if mode != InspectMode::Disabled {
-            // Start the EVE consumer first so the socket exists before Suricata
-            // restarts.  Suricata's unix_stream EVE output connects once at startup
-            // and does not retry; if the socket is absent it silently disables EVE.
-            {
-                let mut eve = state.eve_consumer.lock().await;
-                if !eve.is_running() {
-                    eve.start().await.ok();
-                }
-            }
-            // Suricata monitors pe-inspect1 via AF-packet; TC ingress sends clones there.
-            // Config-write failures are fatal: without policy-engine.yaml Suricata
-            // inspects nothing while the mode reports enabled.  Restart failures
-            // stay warn-only inside apply_config (Suricata may not be installed).
-            if let Err(e) = state.suricata_coordinator.apply_config("pe-inspect1") {
-                let msg = format!("Failed to apply Suricata config: {:#}", e);
+        // Full enable/disable sequence (veth, BPF config, EVE consumer,
+        // Suricata config/timer) lives in inspect_orchestrator so the
+        // startup restore path runs exactly the same code.
+        let op = match crate::server::inspect_orchestrator::enable_inspect(state, mode).await {
+            Ok(op) => op,
+            Err(e) => {
+                let msg = format!("{:#}", e);
                 state.audit_logger.log_event(
                     "configure_inspect",
                     serde_json::to_value(&input).unwrap_or(serde_json::Value::Null),
@@ -1842,28 +1819,7 @@ impl MutationRoot {
                 );
                 return Err(async_graphql::Error::new(msg));
             }
-            if let Err(e) = state.suricata_coordinator.enable_update_timer() {
-                log::warn!("Failed to enable Suricata update timer: {}", e);
-            }
-        } else {
-            // Teardown: stop EVE, remove Suricata config, destroy the veth pair.
-            {
-                let mut eve = state.eve_consumer.lock().await;
-                eve.stop();
-            }
-            if let Err(e) = state.suricata_coordinator.remove_config() {
-                log::warn!("Failed to remove Suricata config: {}", e);
-            }
-            if let Err(e) = state.suricata_coordinator.disable_update_timer() {
-                log::warn!("Failed to disable Suricata update timer: {}", e);
-            }
-            let mut veth = state.veth_manager.lock().await;
-            if veth.is_up() {
-                if let Err(e) = veth.destroy_pair() {
-                    log::warn!("Failed to destroy veth pair: {}", e);
-                }
-            }
-        }
+        };
 
         state.audit_logger.log_event(
             "configure_inspect",
@@ -1884,36 +1840,46 @@ impl MutationRoot {
         let state = ctx.data::<Arc<AppState>>()?;
         let source_ip = get_source_ip(ctx);
 
-        let mut service = state.service.lock().await;
-        let op = service
-            .disable_inspect()
-            .map_err(|e| async_graphql::Error::new(format!("{}", e)))?;
-
-        // Stop EVE consumer
-        let mut eve = state.eve_consumer.lock().await;
-        eve.stop();
-        drop(eve);
-
-        // Remove Suricata config and restart before destroying the veth pair so
-        // Suricata stops using pe-inspect1 before the interface disappears.
-        if let Err(e) = state.suricata_coordinator.remove_config() {
-            log::warn!("Failed to remove Suricata config: {}", e);
-        }
-        if let Err(e) = state.suricata_coordinator.disable_update_timer() {
-            log::warn!("Failed to disable Suricata update timer: {}", e);
-        }
-
-        // Destroy the veth pair (pe-inspect0/pe-inspect1)
-        let mut veth = state.veth_manager.lock().await;
-        if veth.is_up() {
-            if let Err(e) = veth.destroy_pair() {
-                log::warn!("Failed to destroy veth pair: {}", e);
-            }
-        }
+        let op = crate::server::inspect_orchestrator::disable_inspect(state)
+            .await
+            .map_err(|e| async_graphql::Error::new(format!("{:#}", e)))?;
 
         state.audit_logger.log_event(
             "disable_inspect",
             serde_json::Value::Null,
+            if op.success { "ok" } else { "error" },
+            &op.message,
+            &source_ip,
+        );
+        Ok(OperationResult {
+            success: op.success,
+            message: op.message,
+        })
+    }
+
+    /// Enable or disable Suricata inspection on a single interface.  Only
+    /// interfaces with this flag set have their INSPECT-matched flows
+    /// mirrored to Suricata; the node-global inspect mode (configureInspect)
+    /// must also be active for inspection to occur.
+    #[cfg(feature = "suricata")]
+    async fn set_inspect_interface<'ctx>(
+        &self,
+        ctx: &Context<'ctx>,
+        interface: String,
+        enabled: bool,
+    ) -> Result<OperationResult> {
+        let state = ctx.data::<Arc<AppState>>()?;
+        let source_ip = get_source_ip(ctx);
+
+        let mut service = state.service.lock().await;
+        let op = service
+            .set_inspect_interface(&interface, enabled)
+            .map_err(|e| async_graphql::Error::new(format!("{}", e)))?;
+        drop(service);
+
+        state.audit_logger.log_event(
+            "set_inspect_interface",
+            serde_json::json!({ "interface": interface, "enabled": enabled }),
             if op.success { "ok" } else { "error" },
             &op.message,
             &source_ip,
@@ -3239,15 +3205,22 @@ mod tests {
         mock.expect_get_inspect_config()
             .returning(|_| Ok(InspectConfig::default()));
         mock.expect_get_flow_verdict_count().returning(|_| Ok(0));
+        mock.expect_list_fib_configs().returning(|| Ok(vec![]));
 
         let schema = make_schema(mock);
         let resp = schema
-            .execute("{ inspectStatus { mode suricataRunning flowVerdictCount } }")
+            .execute(
+                "{ inspectStatus { mode suricataRunning flowVerdictCount enabledInterfaces } }",
+            )
             .await;
         assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
         let data = resp.data.into_json().unwrap();
         assert_eq!(data["inspectStatus"]["mode"], "DISABLED");
         assert_eq!(data["inspectStatus"]["flowVerdictCount"], 0);
+        assert_eq!(
+            data["inspectStatus"]["enabledInterfaces"],
+            serde_json::json!([])
+        );
     }
 
     #[tokio::test]

@@ -641,6 +641,12 @@ pub async fn run_server(config: ServerConfig) -> std::io::Result<()> {
     // --- Spawn background tasks ---
     #[cfg(feature = "suricata")]
     start_inspect_tasks(&state).await?;
+    // Re-apply persisted inspect state (mode + per-interface flags).  Runs
+    // after init_policy_service has replayed attachments, so the per-interface
+    // TC auto-attach sees the restored XDP interfaces.  Failures are logged,
+    // never fatal.
+    #[cfg(feature = "suricata")]
+    super::inspect_orchestrator::restore_inspect_state(&state).await;
     #[cfg(feature = "ipfix")]
     spawn_ipfix_export_loop(state.clone());
     // Evict expired flow verdicts in every build — SNI/QUIC matching populates
@@ -691,6 +697,13 @@ pub async fn run_server(config: ServerConfig) -> std::io::Result<()> {
                 "/ws/rule-events",
                 web::get().to(rule_events::ws_rule_events),
             );
+
+        // Suricata EVE alert stream — present whenever the feature is
+        // compiled in; idles while inspection is disabled.
+        #[cfg(feature = "suricata")]
+        {
+            app = app.route("/ws/alerts", web::get().to(super::alert_stream::ws_alerts));
+        }
 
         // Serve the web UI (and its SPA fallback) when a root is configured.
         if let Some(ref root) = web_root {

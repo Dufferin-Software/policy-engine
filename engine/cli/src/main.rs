@@ -6,7 +6,7 @@
 //! A command-line client that connects to a running policy-engine server
 //! and manages policies via GraphQL.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use prettytable::{format, row, Table};
 use serde::Serialize;
@@ -113,9 +113,21 @@ enum InspectCommand {
         /// Inspect mode: ips (block matching flows) or ids (alert only)
         #[arg(long, default_value = "ips")]
         mode: String,
+        /// Enable inspection on this interface (repeatable).  Without this
+        /// flag, inspection is enabled on every currently XDP-attached
+        /// interface — matching the pre-per-interface behaviour.
+        #[arg(long)]
+        interface: Vec<String>,
     },
     /// Disable inspect mode
     Disable,
+    /// Enable or disable inspection on a single interface
+    Interface {
+        /// Interface name (e.g. eth0)
+        interface: String,
+        /// "on" to enable, "off" to disable
+        state: String,
+    },
     /// Show flow verdicts. By default prints the active-verdict count; pass
     /// `--list` to dump the individual cached entries.
     Verdicts {
@@ -979,7 +991,10 @@ fn handle_inspect(client: &PolicyClient, cmd: InspectCommand, json_output: bool)
     // them here.
     let needs_suricata = matches!(
         cmd,
-        InspectCommand::Status | InspectCommand::Enable { .. } | InspectCommand::Disable
+        InspectCommand::Status
+            | InspectCommand::Enable { .. }
+            | InspectCommand::Disable
+            | InspectCommand::Interface { .. }
     );
     if needs_suricata {
         if let Err(e) = require_suricata(client) {
@@ -1029,17 +1044,55 @@ fn handle_inspect(client: &PolicyClient, cmd: InspectCommand, json_output: bool)
                 if let Some(ref ver) = status.ruleset_version {
                     println!("  Ruleset Version:   {}", ver);
                 }
+                println!(
+                    "  Interfaces:        {}",
+                    if status.enabled_interfaces.is_empty() {
+                        "none".to_string()
+                    } else {
+                        status.enabled_interfaces.join(", ")
+                    }
+                );
             }
         }
 
-        InspectCommand::Enable { mode } => {
+        InspectCommand::Enable { mode, interface } => {
             let inspect_mode: GqlInspectMode =
                 mode.parse().map_err(|e: anyhow::Error| anyhow!("{}", e))?;
             handle_operation(|| client.configure_inspect(inspect_mode), json_output)?;
+
+            // Inspection only happens on interfaces with the per-interface
+            // flag set.  Explicit --interface flags win; otherwise enable on
+            // every XDP-attached interface for compatibility with the old
+            // node-global behaviour.
+            let targets: Vec<String> = if interface.is_empty() {
+                client
+                    .list_interfaces()?
+                    .into_iter()
+                    .filter(|i| i.direction.eq_ignore_ascii_case("ingress"))
+                    .map(|i| i.interface)
+                    .collect()
+            } else {
+                interface
+            };
+            for iface in targets {
+                handle_operation(|| client.set_inspect_interface(&iface, true), json_output)?;
+            }
         }
 
         InspectCommand::Disable => {
             handle_operation(|| client.disable_inspect(), json_output)?;
+        }
+
+        InspectCommand::Interface { interface, state } => {
+            let enabled = match state.to_lowercase().as_str() {
+                "on" | "enable" | "enabled" | "true" => true,
+                "off" | "disable" | "disabled" | "false" => false,
+                other => bail!("Invalid state {:?}: expected \"on\" or \"off\"", other),
+            };
+            handle_operation(
+                || client.set_inspect_interface(&interface, enabled),
+                json_output,
+            )?;
         }
 
         InspectCommand::Verdicts {

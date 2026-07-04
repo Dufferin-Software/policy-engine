@@ -18,6 +18,17 @@ const DEFAULT_RULES_DIR: &str = "/etc/suricata/rules/policy-engine";
 const DEFAULT_EVE_PATH: &str = "/run/policy-engine/eve.sock";
 const DEFAULT_CMD_SOCKET: &str = "/var/run/suricata-command.socket";
 
+/// Metadata for one custom `.rules` file: parsed rule lines plus the raw-byte
+/// SHA-256 digest used for fleet drift detection.
+#[derive(Debug, Clone)]
+pub struct RuleFileMeta {
+    pub filename: String,
+    /// Non-empty, non-comment rule lines.
+    pub rules: Vec<String>,
+    /// Hex SHA-256 over the raw file bytes.
+    pub sha256: String,
+}
+
 /// Status of the Suricata service.
 #[derive(Debug, Clone)]
 pub struct SuricataStatus {
@@ -185,6 +196,19 @@ impl SuricataCoordinator {
     /// List custom `.rules` files deployed to the policy-engine rules directory.
     /// Returns `(filename, rules)` where `rules` is the non-empty, non-comment lines.
     pub fn list_custom_rules(&self) -> Vec<(String, Vec<String>)> {
+        self.list_custom_rules_meta()
+            .into_iter()
+            .map(|m| (m.filename, m.rules))
+            .collect()
+    }
+
+    /// Like [`list_custom_rules`](Self::list_custom_rules) but also returns
+    /// each file's hex SHA-256 digest, computed over the *raw file bytes*
+    /// exactly as written by [`write_rules`](Self::write_rules).  This is the
+    /// drift-detection contract with the fleet controller: the controller
+    /// hashes the bytes it pushes and compares against these digests, so no
+    /// canonicalisation may ever be applied on either side.
+    pub fn list_custom_rules_meta(&self) -> Vec<RuleFileMeta> {
         let Ok(entries) = std::fs::read_dir(&self.rules_dir) else {
             return vec![];
         };
@@ -192,18 +216,28 @@ impl SuricataCoordinator {
         for entry in entries.flatten() {
             if entry.path().extension().and_then(|e| e.to_str()) == Some("rules") {
                 let name = entry.file_name().to_string_lossy().to_string();
-                let rules = std::fs::read_to_string(entry.path())
-                    .map(|c| {
-                        c.lines()
-                            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
-                            .map(|l| l.to_string())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                files.push((name, rules));
+                let Ok(bytes) = std::fs::read(entry.path()) else {
+                    continue;
+                };
+                let sha256 = {
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(&bytes);
+                    format!("{:x}", hasher.finalize())
+                };
+                let rules: Vec<String> = String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+                    .map(|l| l.to_string())
+                    .collect();
+                files.push(RuleFileMeta {
+                    filename: name,
+                    rules,
+                    sha256,
+                });
             }
         }
-        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files.sort_by_key(|f| f.filename.clone());
         files
     }
 

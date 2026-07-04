@@ -45,11 +45,21 @@ const GET_INSPECT_STATUS = gql`
       peerInterface
       suricataVersion
       rulesetVersion
+      enabledInterfaces
       customRuleFiles {
         filename
         ruleCount
         rules
       }
+    }
+  }
+`
+
+const SET_INSPECT_INTERFACE = gql`
+  mutation SetInspectInterface($interface: String!, $enabled: Boolean!) {
+    setInspectInterface(interface: $interface, enabled: $enabled) {
+      success
+      message
     }
   }
 `
@@ -180,6 +190,7 @@ interface InspectStatus {
   peerInterface: string | null
   suricataVersion: string | null
   rulesetVersion: string | null
+  enabledInterfaces: string[]
   customRuleFiles: CustomRuleFile[]
 }
 
@@ -260,19 +271,28 @@ export function InspectPanel() {
 
   const [attachIngressForInspect] = useMutation(ATTACH_INGRESS_FOR_INSPECT)
   const [attachTcForInspect] = useMutation(ATTACH_TC_FOR_INSPECT)
+  const [setInspectInterface] = useMutation<{
+    setInspectInterface: OperationResult
+  }>(SET_INSPECT_INTERFACE)
 
   const availableInterfaces = (ifaceData?.availableInterfaces ?? []).filter((i) => i !== 'lo')
   const attachedInterfaces = ifaceData?.interfaces ?? []
 
-  // Pre-select interfaces that already have programs attached
+  // Pre-select the interfaces the server reports as inspect-enabled, falling
+  // back to interfaces that already have programs attached.
   const initializedRef = useRef(false)
   useEffect(() => {
-    if (!initializedRef.current && attachedInterfaces.length > 0) {
+    if (initializedRef.current) return
+    const enabled = data?.inspectStatus?.enabledInterfaces ?? []
+    if (enabled.length > 0) {
+      initializedRef.current = true
+      setSelectedInterfaces(new Set(enabled))
+    } else if (attachedInterfaces.length > 0) {
       initializedRef.current = true
       setSelectedInterfaces(new Set(attachedInterfaces.map((i) => i.interface)))
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [attachedInterfaces.length])
+  }, [attachedInterfaces.length, data?.inspectStatus?.enabledInterfaces?.length])
 
   const toggleInterface = (iface: string) => {
     setSelectedInterfaces((prev) => {
@@ -332,6 +352,19 @@ export function InspectPanel() {
         }
         const { data: r } = await configureInspect({ variables: { mode } })
         handleResult(r?.configureInspect, `Failed to enable ${mode}`)
+
+        // Sync the per-interface inspect flags to the current selection:
+        // enable selected interfaces, disable previously-enabled ones that
+        // were unselected.
+        const previouslyEnabled = new Set(status?.enabledInterfaces ?? [])
+        for (const iface of selectedInterfaces) {
+          await setInspectInterface({ variables: { interface: iface, enabled: true } })
+        }
+        for (const iface of previouslyEnabled) {
+          if (!selectedInterfaces.has(iface)) {
+            await setInspectInterface({ variables: { interface: iface, enabled: false } })
+          }
+        }
         refetchInterfaces()
       }
       refetch()

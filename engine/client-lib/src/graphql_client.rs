@@ -1168,12 +1168,69 @@ impl PolicyClient {
                     flowVerdictCount
                     suricataVersion
                     rulesetVersion
+                    enabledInterfaces
+                    customRuleFiles {
+                        filename
+                        ruleCount
+                        sha256
+                    }
                 }
             }
         "#;
 
         let response: Response = self.execute(query, None)?;
         Ok(response.inspect_status)
+    }
+
+    /// Enable or disable Suricata inspection on a single interface
+    /// (only succeeds against IPS/IDS servers)
+    pub fn set_inspect_interface(&self, interface: &str, enabled: bool) -> Result<OperationResult> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "setInspectInterface")]
+            set_inspect_interface: OperationResult,
+        }
+
+        let query = r#"
+            mutation SetInspectInterface($interface: String!, $enabled: Boolean!) {
+                setInspectInterface(interface: $interface, enabled: $enabled) {
+                    success
+                    message
+                }
+            }
+        "#;
+
+        let variables = json!({
+            "interface": interface,
+            "enabled": enabled,
+        });
+
+        let response: Response = self.execute(query, Some(variables))?;
+        Ok(response.set_inspect_interface)
+    }
+
+    /// Delete one custom Suricata rule file from the rules directory
+    /// (only succeeds against IPS/IDS servers)
+    pub fn delete_suricata_rule_file(&self, filename: &str) -> Result<OperationResult> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "deleteRuleFile")]
+            delete_rule_file: OperationResult,
+        }
+
+        let query = r#"
+            mutation DeleteRuleFile($filename: String!) {
+                deleteRuleFile(filename: $filename) {
+                    success
+                    message
+                }
+            }
+        "#;
+
+        let variables = json!({ "filename": filename });
+
+        let response: Response = self.execute(query, Some(variables))?;
+        Ok(response.delete_rule_file)
     }
 
     /// Configure inspect mode (only succeeds against IPS/IDS servers)

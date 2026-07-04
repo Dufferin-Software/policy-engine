@@ -91,6 +91,19 @@ struct {
 } tc_inspect_config SEC(".maps");
 
 /*
+ * Per-interface XDP feature config (FIB forwarding / uRPF / inspect enable).
+ * Owned and pinned by the XDP skeleton; this skeleton reuses the pin (same
+ * mechanism as flows_to_inspect below) so the TC egress ACTION_INSPECT arms
+ * can honour the per-interface inspect_enabled flag.  Keyed by ifindex.
+ */
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, MAX_INTERFACES);
+  __type(key, __u32);
+  __type(value, struct fib_config);
+} fib_config_map SEC(".maps");
+
+/*
  * Flows to inspect: shared with XDP skeleton via BPF filesystem pinning.
  * XDP writes an entry on each INSPECT rule match; TC ingress reads it to
  * decide which flows to clone to pe-inspect0 for Suricata inspection.
@@ -926,6 +939,13 @@ int tc_sni_inspect(struct __sk_buff *ctx) {
         struct inspect_config *icfg =
             bpf_map_lookup_elem(&tc_inspect_config, &icfg_key);
         if (!icfg || icfg->mode == INSPECT_MODE_DISABLED)
+          break;
+        /* Per-interface gate — mirrors the ACTION_INSPECT arm in
+         * tc/actions.h: only mark flows on inspect-enabled interfaces. */
+        __u32 if_key = ctx->ifindex;
+        const struct fib_config *fc =
+            bpf_map_lookup_elem(&fib_config_map, &if_key);
+        if (!fc || fc->inspect_enabled != INSPECT_IF_ENABLED)
           break;
         struct flow_inspect_key fi_key = {};
         flow_inspect_key_from_flow_reversed(&fi_key, &meta->flow);

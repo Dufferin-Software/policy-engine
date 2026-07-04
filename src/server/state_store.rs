@@ -68,6 +68,16 @@ pub struct PersistedState {
     /// What to do with BPF programs and maps when the daemon stops.
     #[serde(default)]
     pub stop_behavior: StopBehavior,
+    /// Suricata inspect mode: "ips" / "ids"; `None` = disabled.
+    ///
+    /// Deliberately NOT feature-gated: a state.json written by an -ips build
+    /// must survive a serde round-trip on a plain build unchanged.  Only the
+    /// restore *action* is gated behind the suricata feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspect_mode: Option<String>,
+    /// Interfaces with per-interface Suricata inspection enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inspect_interfaces: Vec<String>,
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -111,6 +121,17 @@ pub trait StateStore: Send + Sync {
 
     fn save_stop_behavior(&self, behavior: StopBehavior) -> Result<()>;
     fn load_stop_behavior(&self) -> Result<StopBehavior>;
+
+    // ── Inspect (Suricata) state ─────────────────────────────────────────────
+    // Not feature-gated: plain builds must preserve inspect state written by
+    // an -ips build (they just never act on it).
+
+    /// Persist the node-global inspect mode ("ips"/"ids"; `None` = disabled).
+    fn save_inspect_mode(&self, mode: Option<String>) -> Result<()>;
+    /// Persist the enabled/disabled state of one inspect interface.
+    fn save_inspect_interface(&self, iface: &str, enabled: bool) -> Result<()>;
+    /// Load the persisted inspect state as (mode, enabled interfaces).
+    fn load_inspect_state(&self) -> Result<(Option<String>, Vec<String>)>;
 }
 
 // ── InMemoryStateStore (tests) ────────────────────────────────────────────────
@@ -224,6 +245,25 @@ impl StateStore for InMemoryStateStore {
 
     fn load_stop_behavior(&self) -> Result<StopBehavior> {
         Ok(self.state.lock().unwrap().stop_behavior)
+    }
+
+    fn save_inspect_mode(&self, mode: Option<String>) -> Result<()> {
+        self.state.lock().unwrap().inspect_mode = mode;
+        Ok(())
+    }
+
+    fn save_inspect_interface(&self, iface: &str, enabled: bool) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        s.inspect_interfaces.retain(|i| i != iface);
+        if enabled {
+            s.inspect_interfaces.push(iface.to_string());
+        }
+        Ok(())
+    }
+
+    fn load_inspect_state(&self) -> Result<(Option<String>, Vec<String>)> {
+        let s = self.state.lock().unwrap();
+        Ok((s.inspect_mode.clone(), s.inspect_interfaces.clone()))
     }
 }
 
@@ -372,5 +412,103 @@ impl StateStore for FileStateStore {
 
     fn load_stop_behavior(&self) -> Result<StopBehavior> {
         Ok(self.state.lock().unwrap().stop_behavior)
+    }
+
+    fn save_inspect_mode(&self, mode: Option<String>) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        s.inspect_mode = mode;
+        self.persist(&s)
+    }
+
+    fn save_inspect_interface(&self, iface: &str, enabled: bool) -> Result<()> {
+        let mut s = self.state.lock().unwrap();
+        s.inspect_interfaces.retain(|i| i != iface);
+        if enabled {
+            s.inspect_interfaces.push(iface.to_string());
+        }
+        self.persist(&s)
+    }
+
+    fn load_inspect_state(&self) -> Result<(Option<String>, Vec<String>)> {
+        let s = self.state.lock().unwrap();
+        Ok((s.inspect_mode.clone(), s.inspect_interfaces.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A state.json written before the inspect fields existed must load with
+    /// inspect disabled — and one written by an -ips build must round-trip
+    /// through (de)serialisation unchanged even though the fields are unknown
+    /// to older readers of this struct.
+    #[test]
+    fn persisted_state_backcompat_without_inspect_fields() {
+        let json = r#"{"version":1,"rules":[],"attachments":[]}"#;
+        let s: PersistedState = serde_json::from_str(json).unwrap();
+        assert!(s.inspect_mode.is_none());
+        assert!(s.inspect_interfaces.is_empty());
+    }
+
+    #[test]
+    fn persisted_state_inspect_fields_roundtrip() {
+        let mut s = PersistedState {
+            version: 1,
+            ..Default::default()
+        };
+        s.inspect_mode = Some("ids".to_string());
+        s.inspect_interfaces = vec!["eth0".to_string(), "eth1".to_string()];
+        let json = serde_json::to_string(&s).unwrap();
+        let back: PersistedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.inspect_mode.as_deref(), Some("ids"));
+        assert_eq!(back.inspect_interfaces, s.inspect_interfaces);
+    }
+
+    /// Simulated daemon restart: a fresh FileStateStore over the same path
+    /// must see the inspect state exactly as the previous instance left it.
+    #[test]
+    fn file_store_inspect_state_survives_reopen() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("pe_state_store_test_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let store = FileStateStore::new(&path);
+            store.save_inspect_mode(Some("ips".to_string())).unwrap();
+            store.save_inspect_interface("eth0", true).unwrap();
+            store.save_inspect_interface("eth1", true).unwrap();
+            store.save_inspect_interface("eth0", false).unwrap();
+        }
+
+        let store = FileStateStore::new(&path);
+        let (mode, interfaces) = store.load_inspect_state().unwrap();
+        assert_eq!(mode.as_deref(), Some("ips"));
+        assert_eq!(interfaces, vec!["eth1".to_string()]);
+
+        // Clearing the mode persists too.
+        store.save_inspect_mode(None).unwrap();
+        let store = FileStateStore::new(&path);
+        let (mode, interfaces) = store.load_inspect_state().unwrap();
+        assert!(mode.is_none());
+        assert_eq!(interfaces, vec!["eth1".to_string()]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn in_memory_store_inspect_state_roundtrip() {
+        let store = InMemoryStateStore::new();
+        store.save_inspect_mode(Some("ids".to_string())).unwrap();
+        store.save_inspect_interface("eth2", true).unwrap();
+        assert_eq!(
+            store.load_inspect_state().unwrap(),
+            (Some("ids".to_string()), vec!["eth2".to_string()])
+        );
+        store.save_inspect_interface("eth2", false).unwrap();
+        assert_eq!(
+            store.load_inspect_state().unwrap(),
+            (Some("ids".to_string()), Vec::new())
+        );
     }
 }

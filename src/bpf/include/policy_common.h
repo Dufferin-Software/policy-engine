@@ -387,10 +387,24 @@ struct inspect_config {
 #define URPF_LOOSE 1
 #define URPF_STRICT 2
 
+/*
+ * Per-interface Suricata inspection enable (SURICATA_IPS builds).  Stored in
+ * the same per-interface config entry as FIB forwarding and uRPF.  Inspection
+ * requires BOTH the node-global inspect_config mode (IPS/IDS) and this
+ * per-interface flag: the flag gates *flow marking* (XDP ACTION_INSPECT and
+ * the TC egress ACTION_INSPECT arms).  Mirroring of already-marked flows
+ * (tc_policy_ingress / tc_clone_inspected_flow) deliberately follows the
+ * flow, not the interface, so a flow marked on an enabled interface is
+ * captured bidirectionally even when its reverse path uses another interface.
+ */
+#define INSPECT_IF_DISABLED 0
+#define INSPECT_IF_ENABLED 1
+
 struct fib_config {
-  __u32 mode;      /* FIB_FORWARD_DISABLED or FIB_FORWARD_ENABLED */
-  __u32 urpf_mode; /* URPF_DISABLED / URPF_LOOSE / URPF_STRICT */
-  __u32 _pad[2];   /* reserved */
+  __u32 mode;            /* FIB_FORWARD_DISABLED or FIB_FORWARD_ENABLED */
+  __u32 urpf_mode;       /* URPF_DISABLED / URPF_LOOSE / URPF_STRICT */
+  __u32 inspect_enabled; /* INSPECT_IF_DISABLED / INSPECT_IF_ENABLED */
+  __u32 _pad;            /* reserved */
 } __attribute__((packed));
 
 /*

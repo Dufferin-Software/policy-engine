@@ -672,3 +672,32 @@ fn test_default_coord_uses_standard_paths() {
     );
     let _ = std::fs::remove_dir_all(rules_dir);
 }
+
+#[test]
+fn write_rules_digest_matches_input_bytes() {
+    // Drift-detection contract with the fleet controller: write_rules must
+    // store content byte-verbatim, and list_custom_rules_meta must hash the
+    // raw file bytes — the controller hashes what it pushes and compares.
+    // Any normalisation on either side would make the two digests oscillate
+    // and re-push the ruleset on every snapshot.
+    let rules_dir = make_tmp_rules_dir("digest");
+    let coord = make_coord(MockRuntime::new(), rules_dir.clone());
+
+    let content = "alert tcp any any -> any any (sid:1;)\n# a comment\n\nalert udp any any -> any any (sid:2;)\n";
+    coord.write_rules("fleet-test.rules", content).unwrap();
+
+    let metas = coord.list_custom_rules_meta();
+    assert_eq!(metas.len(), 1);
+    assert_eq!(metas[0].filename, "fleet-test.rules");
+
+    use sha2::{Digest, Sha256};
+    let expected = format!("{:x}", Sha256::digest(content.as_bytes()));
+    assert_eq!(metas[0].sha256, expected, "sha256 must cover raw bytes");
+    // Comment and blank lines are excluded from the parsed rule lines only.
+    assert_eq!(metas[0].rules.len(), 2);
+
+    // list_custom_rules stays consistent with the meta variant.
+    let plain = coord.list_custom_rules();
+    assert_eq!(plain[0].1, metas[0].rules);
+    let _ = std::fs::remove_dir_all(rules_dir);
+}

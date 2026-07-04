@@ -11,6 +11,8 @@
 //! - Suricata IPS integration (veth mirroring, EVE consumption, flow verdicts)
 //!   (only available with the `suricata` feature)
 
+#[cfg(feature = "suricata")]
+pub mod alert_stream;
 pub mod audit_export;
 pub mod audit_logger;
 pub mod auth_middleware;
@@ -22,6 +24,8 @@ pub mod event_stream;
 pub mod flow_verdict_manager;
 pub mod graphql;
 mod http;
+#[cfg(feature = "suricata")]
+pub mod inspect_orchestrator;
 pub mod ip_forwarding;
 #[cfg(feature = "ipfix")]
 pub mod ipfix_exporter;

@@ -793,21 +793,29 @@ impl BpfManager {
             {
                 try_reuse_tc!(open_skel.maps.tc_inspect_config, "tc_inspect_config");
 
-                // flows_to_inspect is owned (pinned) by the XDP skeleton; TC reuses it.
-                // The pin path is the same as XDP's (no tc_ prefix).
-                let fti_path = format!("{}/flows_to_inspect", pin_path);
-                if Path::new(&fti_path).exists() {
-                    match open_skel.maps.flows_to_inspect.reuse_pinned_map(&fti_path) {
-                        Ok(()) => debug!("Reusing pinned XDP map for TC: flows_to_inspect"),
-                        Err(e) => {
-                            warn!(
-                                "Failed to reuse flows_to_inspect for TC: {}, will create new",
-                                e
-                            );
-                            let _ = fs::remove_file(&fti_path);
+                // flows_to_inspect and fib_config_map are owned (pinned) by the
+                // XDP skeleton; TC reuses them so both programs observe the same
+                // inspected-flow set and per-interface inspect_enabled flags.
+                // The pin paths are the same as XDP's (no tc_ prefix).
+                macro_rules! try_reuse_xdp_owned {
+                    ($map:expr, $name:expr) => {{
+                        let map_path = format!("{}/{}", pin_path, $name);
+                        if Path::new(&map_path).exists() {
+                            match $map.reuse_pinned_map(&map_path) {
+                                Ok(()) => debug!("Reusing pinned XDP map for TC: {}", $name),
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to reuse {} for TC: {}, will create new",
+                                        $name, e
+                                    );
+                                    let _ = fs::remove_file(&map_path);
+                                }
+                            }
                         }
-                    }
+                    }};
                 }
+                try_reuse_xdp_owned!(open_skel.maps.flows_to_inspect, "flows_to_inspect");
+                try_reuse_xdp_owned!(open_skel.maps.fib_config_map, "fib_config_map");
             }
         }
 
@@ -2981,11 +2989,13 @@ impl BpfManager {
         let ifindex = Self::get_ifindex(interface)? as u32;
         let key = ifindex.to_ne_bytes();
         if let Some(skel) = &mut self.xdp_skel {
-            // The entry is shared between FIB forwarding and uRPF.  Only delete
-            // it when BOTH features are disabled; otherwise persist the struct
-            // so disabling one feature does not wipe the other's config.
+            // The entry is shared between FIB forwarding, uRPF, and the
+            // per-interface inspect flag.  Only delete it when ALL features
+            // are disabled; otherwise persist the struct so disabling one
+            // feature does not wipe the others' config.
             if config.mode == crate::types::FIB_FORWARD_DISABLED
                 && config.urpf_mode == crate::types::URPF_DISABLED
+                && config.inspect_enabled == crate::types::INSPECT_IF_DISABLED
             {
                 let _ = skel.maps.fib_config_map.delete(&key);
             } else {
@@ -2997,9 +3007,10 @@ impl BpfManager {
         }
         let mode = config.mode;
         let urpf_mode = config.urpf_mode;
+        let inspect_enabled = config.inspect_enabled;
         info!(
-            "Set per-interface XDP config: interface={} ifindex={} fib_mode={} urpf_mode={}",
-            interface, ifindex, mode, urpf_mode
+            "Set per-interface XDP config: interface={} ifindex={} fib_mode={} urpf_mode={} inspect_enabled={}",
+            interface, ifindex, mode, urpf_mode, inspect_enabled
         );
         Ok(())
     }

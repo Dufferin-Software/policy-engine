@@ -735,6 +735,10 @@ pub struct CustomRuleFileOutput {
     pub rule_count: i32,
     /// Individual rule lines (non-empty, non-comment lines)
     pub rules: Vec<String>,
+    /// Hex SHA-256 over the raw file bytes.  The fleet controller compares
+    /// this against its stored ruleset digests for drift detection, so it
+    /// must always hash the file content exactly as written.
+    pub sha256: String,
 }
 
 /// Inspect status output
@@ -755,6 +759,8 @@ pub struct InspectStatusOutput {
     pub ruleset_version: Option<String>,
     /// Custom rule files deployed to the policy-engine rules directory
     pub custom_rule_files: Vec<CustomRuleFileOutput>,
+    /// Interfaces with per-interface inspection enabled (setInspectInterface)
+    pub enabled_interfaces: Vec<String>,
 }
 
 /// Suricata alert output

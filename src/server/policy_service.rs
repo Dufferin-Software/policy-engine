@@ -1960,27 +1960,16 @@ impl PolicyService {
         self.bpf_ops
             .set_inspect_config(&config, Direction::Egress)?;
 
-        // INSPECT requires TC ingress to clone packets to Suricata.  TC is
-        // attached via attach_tc(), which users may not have called if they
-        // only attached ingress (XDP).  Ensure TC is now attached to every
-        // interface that has XDP, silently ignoring "already attached" errors.
-        if mode != InspectMode::Disabled {
-            let xdp_ifaces: Vec<String> = self
-                .bpf_ops
-                .get_attached_interfaces()
-                .into_iter()
-                .filter(|i| i.direction == "ingress")
-                .map(|i| i.interface)
-                .collect();
-            for ifname in xdp_ifaces {
-                if let Err(e) = self.bpf_ops.attach_tc(&ifname) {
-                    // "already attached" is expected and fine; log anything else
-                    let msg = e.to_string();
-                    if !msg.contains("already attached") {
-                        log::warn!("Failed to attach TC to {} for INSPECT: {}", ifname, e);
-                    }
-                }
-            }
+        // Persist so the inspect mode survives daemon restart and reboot.
+        // Which interfaces actually get inspected is a separate per-interface
+        // flag (see set_inspect_interface); the mode alone inspects nothing.
+        let persisted = match mode {
+            InspectMode::Ips => Some("ips".to_string()),
+            InspectMode::Ids => Some("ids".to_string()),
+            InspectMode::Disabled => None,
+        };
+        if let Err(e) = self.state_store.save_inspect_mode(persisted) {
+            log::warn!("Failed to persist inspect mode: {:#}", e);
         }
 
         Ok(OperationResult::success(format!(
@@ -1989,7 +1978,9 @@ impl PolicyService {
         )))
     }
 
-    /// Disable inspect mode
+    /// Disable inspect mode.  Per-interface inspect flags are deliberately
+    /// kept (in BPF and on disk) so a later re-enable restores the same
+    /// interface set; with the mode disabled they have no effect.
     #[cfg(feature = "suricata")]
     pub fn disable_inspect(&mut self) -> Result<OperationResult> {
         self.ensure_programs_loaded()?;
@@ -1999,6 +1990,10 @@ impl PolicyService {
         self.bpf_ops
             .set_inspect_config(&config, Direction::Egress)?;
 
+        if let Err(e) = self.state_store.save_inspect_mode(None) {
+            log::warn!("Failed to persist inspect mode: {:#}", e);
+        }
+
         Ok(OperationResult::success("Inspect mode disabled"))
     }
 
@@ -2006,6 +2001,78 @@ impl PolicyService {
     #[cfg(feature = "suricata")]
     pub fn get_inspect_config(&self, direction: Direction) -> Result<InspectConfig> {
         self.bpf_ops.get_inspect_config(direction)
+    }
+
+    /// Enable or disable Suricata inspection on a single interface.  The flag
+    /// lives in the per-interface config entry shared with FIB forwarding and
+    /// uRPF; it gates INSPECT flow marking (XDP and TC egress) for packets on
+    /// this interface.  Inspection additionally requires an active node-global
+    /// inspect mode (configure_inspect).
+    #[cfg(feature = "suricata")]
+    pub fn set_inspect_interface(
+        &mut self,
+        interface: &str,
+        enabled: bool,
+    ) -> Result<OperationResult> {
+        self.ensure_programs_loaded()?;
+
+        // The TC programs carry both the ingress clone hook and the egress
+        // mirror for inspected flows; make sure they are attached on this
+        // interface, silently ignoring "already attached".
+        if enabled {
+            if let Err(e) = self.bpf_ops.attach_tc(interface) {
+                let msg = e.to_string();
+                if !msg.contains("already attached") {
+                    log::warn!("Failed to attach TC to {} for INSPECT: {}", interface, e);
+                }
+            }
+        }
+
+        let mut config = self.bpf_ops.get_fib_config(interface)?;
+        config.inspect_enabled = if enabled {
+            INSPECT_IF_ENABLED
+        } else {
+            INSPECT_IF_DISABLED
+        };
+        self.bpf_ops.set_fib_config(interface, &config)?;
+
+        if let Err(e) = self.state_store.save_inspect_interface(interface, enabled) {
+            log::warn!("Failed to persist inspect interface flag: {:#}", e);
+        }
+
+        Ok(OperationResult::success(format!(
+            "Inspection {} on {}",
+            if enabled { "enabled" } else { "disabled" },
+            interface
+        )))
+    }
+
+    /// Current per-interface inspection flag for a single interface.
+    #[cfg(feature = "suricata")]
+    pub fn get_inspect_interface(&self, interface: &str) -> Result<bool> {
+        let config = self.bpf_ops.get_fib_config(interface)?;
+        Ok(config.inspect_enabled == INSPECT_IF_ENABLED)
+    }
+
+    /// List all interfaces with per-interface inspection enabled.
+    #[cfg(feature = "suricata")]
+    pub fn list_inspect_interfaces(&self) -> Result<Vec<String>> {
+        let entries = self.bpf_ops.list_fib_configs()?;
+        Ok(entries
+            .into_iter()
+            .filter(|(_, cfg)| cfg.inspect_enabled == INSPECT_IF_ENABLED)
+            .map(|(name, _)| name)
+            .collect())
+    }
+
+    /// Persisted inspect state (mode string + enabled interfaces) as loaded
+    /// from the state store — used by the startup restore path, which must
+    /// re-run the full enable orchestration (veth, Suricata, BPF config).
+    #[cfg(feature = "suricata")]
+    pub fn persisted_inspect_state(&self) -> (Option<String>, Vec<String>) {
+        self.state_store
+            .load_inspect_state()
+            .unwrap_or((None, Vec::new()))
     }
 
     /// Enable or disable XDP FIB forwarding for a single ingress interface.
@@ -2423,6 +2490,138 @@ mod tests {
         let mut service = PolicyService::new(Box::new(mock)).with_forwarding(Box::new(fwd));
         let r = service.set_fib_forwarding("eth0", false).unwrap();
         assert!(r.success);
+    }
+
+    // ── Per-interface Suricata inspection ────────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "suricata")]
+    fn set_inspect_interface_enable_sets_flag_attaches_tc_and_persists() {
+        let mut mock = create_mock_with_loaded_programs();
+        mock.expect_attach_tc()
+            .withf(|iface| iface == "eth0")
+            .times(1)
+            .returning(|_| Ok(()));
+        mock.expect_get_fib_config()
+            .returning(|_| Ok(FibConfig::default()));
+        mock.expect_set_fib_config()
+            .withf(|iface, cfg| iface == "eth0" && cfg.inspect_enabled == INSPECT_IF_ENABLED)
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let mut service = PolicyService::new(Box::new(mock));
+        let r = service.set_inspect_interface("eth0", true).unwrap();
+        assert!(r.success, "{}", r.message);
+
+        let (_, interfaces) = service.persisted_inspect_state();
+        assert_eq!(interfaces, vec!["eth0".to_string()]);
+    }
+
+    #[test]
+    #[cfg(feature = "suricata")]
+    fn set_inspect_interface_disable_clears_flag_without_tc_attach() {
+        let mut mock = create_mock_with_loaded_programs();
+        // Disable must never attach TC.
+        mock.expect_attach_tc().times(0);
+        mock.expect_get_fib_config().returning(|_| {
+            Ok(FibConfig {
+                inspect_enabled: INSPECT_IF_ENABLED,
+                ..Default::default()
+            })
+        });
+        mock.expect_set_fib_config()
+            .withf(|iface, cfg| iface == "eth0" && cfg.inspect_enabled == INSPECT_IF_DISABLED)
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let mut service = PolicyService::new(Box::new(mock));
+        let r = service.set_inspect_interface("eth0", false).unwrap();
+        assert!(r.success);
+        let (_, interfaces) = service.persisted_inspect_state();
+        assert!(interfaces.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "suricata")]
+    fn set_inspect_interface_preserves_fib_and_urpf_fields() {
+        let mut mock = create_mock_with_loaded_programs();
+        mock.expect_attach_tc().returning(|_| Ok(()));
+        mock.expect_get_fib_config().returning(|_| {
+            Ok(FibConfig {
+                mode: FIB_FORWARD_ENABLED,
+                urpf_mode: URPF_STRICT,
+                ..Default::default()
+            })
+        });
+        mock.expect_set_fib_config()
+            .withf(|_, cfg| {
+                cfg.mode == FIB_FORWARD_ENABLED
+                    && cfg.urpf_mode == URPF_STRICT
+                    && cfg.inspect_enabled == INSPECT_IF_ENABLED
+            })
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let mut service = PolicyService::new(Box::new(mock));
+        assert!(service.set_inspect_interface("eth0", true).unwrap().success);
+    }
+
+    #[test]
+    #[cfg(feature = "suricata")]
+    fn configure_inspect_persists_mode_and_disable_keeps_interfaces() {
+        let mut mock = create_mock_with_loaded_programs();
+        mock.expect_set_inspect_config().returning(|_, _| Ok(()));
+        mock.expect_attach_tc().returning(|_| Ok(()));
+        mock.expect_get_fib_config()
+            .returning(|_| Ok(FibConfig::default()));
+        mock.expect_set_fib_config().returning(|_, _| Ok(()));
+
+        let mut service = PolicyService::new(Box::new(mock));
+        service.set_inspect_interface("eth0", true).unwrap();
+        service.configure_inspect(InspectMode::Ips, 42).unwrap();
+        assert_eq!(
+            service.persisted_inspect_state(),
+            (Some("ips".to_string()), vec!["eth0".to_string()])
+        );
+
+        // Disabling the mode keeps the interface set so a later re-enable
+        // restores the same interfaces.
+        service.disable_inspect().unwrap();
+        assert_eq!(
+            service.persisted_inspect_state(),
+            (None, vec!["eth0".to_string()])
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "suricata")]
+    fn list_inspect_interfaces_filters_disabled_entries() {
+        let mut mock = create_mock_with_loaded_programs();
+        mock.expect_list_fib_configs().returning(|| {
+            Ok(vec![
+                (
+                    "eth0".to_string(),
+                    FibConfig {
+                        inspect_enabled: INSPECT_IF_ENABLED,
+                        ..Default::default()
+                    },
+                ),
+                // fib-only entry must be filtered out.
+                (
+                    "eth1".to_string(),
+                    FibConfig {
+                        mode: FIB_FORWARD_ENABLED,
+                        ..Default::default()
+                    },
+                ),
+            ])
+        });
+
+        let service = PolicyService::new(Box::new(mock));
+        assert_eq!(
+            service.list_inspect_interfaces().unwrap(),
+            vec!["eth0".to_string()]
+        );
     }
 
     /// Helper to create a default L4Rule for testing

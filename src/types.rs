@@ -183,15 +183,23 @@ pub const URPF_DISABLED: u32 = 0;
 pub const URPF_LOOSE: u32 = 1;
 pub const URPF_STRICT: u32 = 2;
 
+/// Per-interface Suricata inspection enable constants (must match BPF
+/// policy_common.h). Gates INSPECT flow marking; requires an active
+/// node-global inspect mode to have any effect.
+pub const INSPECT_IF_DISABLED: u32 = 0;
+pub const INSPECT_IF_ENABLED: u32 = 1;
+
 /// FIB forwarding configuration (must match BPF struct fib_config layout).
-/// The same per-interface entry also carries the uRPF mode so a single BPF map
-/// lookup covers both XDP ingress features.
+/// The same per-interface entry also carries the uRPF mode and the Suricata
+/// per-interface inspection flag so a single BPF map entry covers all three
+/// XDP per-interface features.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 pub struct FibConfig {
     pub mode: u32,
     pub urpf_mode: u32,
-    pub _pad: [u32; 2],
+    pub inspect_enabled: u32,
+    pub _pad: u32,
 }
 
 impl FibConfig {

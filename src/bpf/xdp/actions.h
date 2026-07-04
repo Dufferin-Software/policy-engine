@@ -27,16 +27,26 @@
  * JSON.  The EveConsumer writes DROP verdicts to flow_verdict_cache; the
  * next packet on this flow is then dropped at the XDP verdict-cache check.
  *
+ * Inspection requires both the node-global mode (inspect_config) and the
+ * per-interface enable flag (fib_config_map[ingress ifindex].inspect_enabled)
+ * — packets arriving on interfaces without the flag are never marked, so
+ * their flows never reach Suricata.  Both lookups live in this cold outlined
+ * helper, off the per-packet hot path.
+ *
  * Returns 1 if inspection is enabled (caller must then also write the
  * temporary PASS verdict via xdp_write_inspect_pass_verdict), 0 if disabled.
  */
 static __noinline int xdp_mark_flow_for_inspect(struct global_stats *gs,
                                                 const struct flow_key *flow_key,
-                                                __u64 now_ns) {
+                                                __u64 now_ns, __u32 ifindex) {
   __u32 cfg_key = 0;
   const struct inspect_config *cfg =
       bpf_map_lookup_elem(&inspect_config, &cfg_key);
   if (!cfg || cfg->mode == INSPECT_MODE_DISABLED)
+    return 0;
+
+  const struct fib_config *fc = bpf_map_lookup_elem(&fib_config_map, &ifindex);
+  if (!fc || fc->inspect_enabled != INSPECT_IF_ENABLED)
     return 0;
 
   if (gs)
@@ -146,7 +156,8 @@ static __always_inline __u32 process_rule_actions(
        * and is overwritten with a DROP by the EVE consumer; never seed a
        * non-expiring policy verdict over it. */
       *cacheable = 0;
-      if (xdp_mark_flow_for_inspect(gs, flow_key, now_ns))
+      if (xdp_mark_flow_for_inspect(gs, flow_key, now_ns,
+                                    ctx->ingress_ifindex))
         xdp_write_inspect_pass_verdict(flow_key, ctx->ingress_ifindex, now_ns);
       if (final_verdict != XDP_DROP)
         final_verdict = XDP_PASS;

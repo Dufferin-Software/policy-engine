@@ -88,6 +88,12 @@ query GetInspectStatus {
     mirrorInterface
     mirrorIfindex
     flowVerdictCount
+    enabledInterfaces
+    customRuleFiles {
+      filename
+      ruleCount
+      sha256
+    }
   }
 }
 
@@ -213,6 +219,13 @@ mutation ConfigureInspect($mode: GqlInspectMode!) {
 
 mutation DisableInspect {
   disableInspect {
+    success
+    message
+  }
+}
+
+mutation SetInspectInterface($interface: String!, $enabled: Boolean!) {
+  setInspectInterface(interface: $interface, enabled: $enabled) {
     success
     message
   }

@@ -95,6 +95,15 @@ static __always_inline int tc_process_rule_actions(
       if (!icfg || icfg->mode == INSPECT_MODE_DISABLED)
         break;
 
+      /* Per-interface gate: only mark flows on interfaces with inspection
+       * enabled (fib_config_map is the XDP-owned per-interface config,
+       * shared into this skeleton via pin reuse). */
+      __u32 if_key = ctx->ifindex;
+      const struct fib_config *fc =
+          bpf_map_lookup_elem(&fib_config_map, &if_key);
+      if (!fc || fc->inspect_enabled != INSPECT_IF_ENABLED)
+        break;
+
       if (gs)
         gs->inspect_redirects++;
 

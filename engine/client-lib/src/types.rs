@@ -391,6 +391,27 @@ pub struct InspectStatusOutput {
     pub flow_verdict_count: i64,
     pub suricata_version: Option<String>,
     pub ruleset_version: Option<String>,
+    /// Custom rule files in the policy-engine rules directory.  Rule lines
+    /// are not fetched by the default status query — only names, counts and
+    /// digests (see `CustomRuleFileOutput::rules`).
+    #[serde(default)]
+    pub custom_rule_files: Vec<CustomRuleFileOutput>,
+    /// Interfaces with per-interface inspection enabled.
+    #[serde(default)]
+    pub enabled_interfaces: Vec<String>,
+}
+
+/// Metadata for one custom Suricata rule file on the server.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomRuleFileOutput {
+    pub filename: String,
+    pub rule_count: i32,
+    /// Hex SHA-256 over the raw file bytes (fleet drift-detection digest).
+    pub sha256: String,
+    /// Individual rule lines; empty unless explicitly selected by the query.
+    #[serde(default)]
+    pub rules: Vec<String>,
 }
 
 /// Suricata alert output (only available on IPS/IDS servers)
