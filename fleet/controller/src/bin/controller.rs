@@ -403,7 +403,15 @@ async fn main() -> Result<()> {
             }
         };
         tonic::transport::Server::builder()
-            .add_service(NodeManagementServiceServer::new(management_service))
+            .add_service(
+                NodeManagementServiceServer::new(management_service)
+                    .max_decoding_message_size(
+                        policy_controller_proto::MAX_MANAGEMENT_MESSAGE_BYTES,
+                    )
+                    .max_encoding_message_size(
+                        policy_controller_proto::MAX_MANAGEMENT_MESSAGE_BYTES,
+                    ),
+            )
             .serve_with_incoming(incoming)
             .await
             .expect("gRPC management server failed");

@@ -47,6 +47,7 @@ message AgentMessage {
         ConfigConfirm           config_confirm         = 10;
         RuleLifecycleBatch      rule_lifecycle_events  = 11;
         FlowVerdictSnapshot     flow_verdict_snapshot  = 12;
+        SuricataAlertBatch      suricata_alerts        = 13;
     }
 }
 
@@ -70,8 +71,13 @@ message AgentHello {
 // reference sources no node in the fleet can produce. Immutable per agent
 // process; refreshed on reconnect.
 message Capabilities {
-    // Optional cargo features compiled in (e.g. "tpm", "xdp_fib_forwarding").
-    // Empty today — placeholder for future feature gating.
+    // Optional engine cargo features compiled in. Known values:
+    //   "suricata" — local engine supports IPS/IDS (SetInspectMode,
+    //                SetInspectInterface, SuricataRulesetPush are valid).
+    // The controller must gate feature-specific pushes on this list; agents
+    // built before a feature existed advertise nothing and silently drop
+    // unknown message types, which would otherwise strand a pending
+    // generation until its deadline.
     repeated string features = 1;
     // Engine library version this agent is linked against.
     string engine_version = 2;
@@ -101,6 +107,23 @@ message StateSnapshot {
     // Per-interface uRPF mode (ingress only). Key = interface name, value = mode
     // (1 = loose, 2 = strict). Interfaces with uRPF off are omitted.
     map<string, uint32> urpf_interfaces = 7;
+    // Node-global Suricata inspect mode: 0 = disabled, 1 = IPS, 2 = IDS.
+    // Always 0 on engines built without the suricata feature.
+    uint32 inspect_mode = 8;
+    // Digests of every .rules file in the engine's Suricata rules directory —
+    // both fleet-managed ("fleet-*.rules") and locally-managed files. The
+    // controller uses the fleet-prefixed subset for ruleset drift detection.
+    repeated SuricataRuleFileDigest suricata_rule_files = 9;
+    // Interfaces with per-interface inspection enabled. Disabled interfaces
+    // are omitted (mirrors urpf_interfaces reporting style).
+    repeated string inspect_enabled_interfaces = 10;
+}
+
+// Digest of one Suricata .rules file on the node, for drift detection.
+message SuricataRuleFileDigest {
+    string filename   = 1;
+    string sha256     = 2;  // hex digest over the raw file bytes
+    uint32 rule_count = 3;  // non-comment, non-empty lines
 }
 
 message PersistedRule {
@@ -125,6 +148,15 @@ message EventBatch {
     uint64         timestamp_ns = 1;
     string         node_id      = 2;  // Annotated by agent for aggregation on controller
     repeated bytes events_json  = 3;  // One JSON-encoded BPF event per entry
+}
+
+// Suricata EVE alerts forwarded from the local policy-engine /ws/alerts stream.
+// Only sent by agents whose local engine is built with the suricata feature
+// (capability "suricata" / source "suricata_alerts").
+message SuricataAlertBatch {
+    uint64         timestamp_ns = 1;
+    string         node_id      = 2;  // Annotated by agent for aggregation on controller
+    repeated bytes alerts_json  = 3;  // One JSON-encoded SuricataAlert per entry
 }
 
 // Rule lifecycle events forwarded from the local policy-engine /ws/rule-events stream.
@@ -203,6 +235,9 @@ message ControllerMessage {
         SetMetricsInterval set_metrics_interval = 10;
         SetUrpf            set_urpf       = 11;
         FlowVerdictQuery   flow_verdict_query = 12;
+        SetInspectMode     set_inspect_mode      = 13;
+        SetInspectInterface set_inspect_interface = 14;
+        SuricataRulesetPush suricata_ruleset_push = 15;
     }
 }
 
@@ -273,6 +308,48 @@ message SetUrpf {
     uint32 mode                = 2;
     string generation_id       = 10;  // ULID; empty means legacy push with no gating
     uint32 confirm_deadline_ms = 11;  // Agent must confirm within this window
+}
+
+// Set the node-global Suricata inspect mode. Which interfaces are actually
+// inspected is controlled separately via SetInspectInterface; both the mode
+// and the per-interface flag must be set for traffic to reach Suricata.
+//   mode: 0 = disabled, 1 = IPS (alerts block), 2 = IDS (alerts log only)
+// Requires an engine built with the suricata feature — the controller must
+// gate on the node's advertised "suricata" capability before sending.
+message SetInspectMode {
+    uint32 mode                = 1;
+    string generation_id       = 10;  // ULID; empty means legacy push with no gating
+    uint32 confirm_deadline_ms = 11;  // Agent must confirm within this window
+}
+
+// Enable or disable Suricata inspection on a single interface. Only takes
+// effect while a node-global inspect mode is active (SetInspectMode != 0).
+message SetInspectInterface {
+    string interface_name      = 1;
+    bool   enabled             = 2;
+    string generation_id       = 10;  // ULID; empty means legacy push with no gating
+    uint32 confirm_deadline_ms = 11;  // Agent must confirm within this window
+}
+
+// Desired-state sync of fleet-managed Suricata rule files. The agent writes
+// every file in `files` (after verifying its sha256), deletes any local
+// "fleet-*.rules" file not listed in `desired_filenames`, then reloads
+// Suricata once. Idempotent; not reverted on watchdog timeout — the
+// controller's snapshot-driven drift detection re-converges instead.
+// Files without the "fleet-" prefix are never touched.
+message SuricataRulesetPush {
+    repeated SuricataRuleFile files             = 1;  // only changed/new files
+    repeated string           desired_filenames = 2;  // complete fleet-managed set
+    string generation_id       = 10;  // ULID; empty means legacy push with no gating
+    uint32 confirm_deadline_ms = 11;  // Agent must confirm within this window
+}
+
+// One fleet-managed Suricata rule file.
+message SuricataRuleFile {
+    string filename   = 1;  // "fleet-<ruleset-name>.rules"
+    bytes  content    = 2;  // raw file bytes; capped at 4 MiB by the controller
+    string sha256     = 3;  // hex digest of content; agent verifies before write
+    uint32 rule_count = 4;  // non-comment, non-empty lines
 }
 
 // Delta-based config push. Contains only the changes to apply.

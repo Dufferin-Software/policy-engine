@@ -107,6 +107,7 @@ mod tests {
             per_interface_default_actions: Default::default(),
             stop_behavior: String::new(),
             urpf_interfaces: Default::default(),
+            ..Default::default()
         };
 
         detector.update_baseline(&snapshot);

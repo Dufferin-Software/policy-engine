@@ -743,6 +743,7 @@ mod tests {
             per_interface_default_actions: Default::default(),
             stop_behavior: String::new(),
             urpf_interfaces: Default::default(),
+            ..Default::default()
         };
 
         let delta = compute_delta(&desired, &actual);
@@ -762,6 +763,7 @@ mod tests {
             per_interface_default_actions: Default::default(),
             stop_behavior: String::new(),
             urpf_interfaces: Default::default(),
+            ..Default::default()
         };
 
         let delta = compute_delta(&desired, &actual);
@@ -783,6 +785,7 @@ mod tests {
             per_interface_default_actions: Default::default(),
             stop_behavior: String::new(),
             urpf_interfaces: Default::default(),
+            ..Default::default()
         };
 
         let delta = compute_delta(&desired, &actual);
@@ -907,6 +910,7 @@ mod tests {
             per_interface_default_actions: Default::default(),
             stop_behavior: String::new(),
             urpf_interfaces: Default::default(),
+            ..Default::default()
         }
     }
 

@@ -150,7 +150,9 @@ pub async fn connect(
 
     let (tx, rx_stream) = mpsc::channel::<AgentMessage>(64);
     let mut mgmt_client =
-        policy_controller_proto::controller::node_management_service_client::NodeManagementServiceClient::new(channel);
+        policy_controller_proto::controller::node_management_service_client::NodeManagementServiceClient::new(channel)
+            .max_decoding_message_size(policy_controller_proto::MAX_MANAGEMENT_MESSAGE_BYTES)
+            .max_encoding_message_size(policy_controller_proto::MAX_MANAGEMENT_MESSAGE_BYTES);
 
     let response = mgmt_client
         .agent_stream(ReceiverStream::new(rx_stream))
@@ -273,6 +275,11 @@ pub async fn run_stream_loop(
             }
         })
         .unwrap_or_default();
+    // Probed per connection (not cached across reconnects) so an engine that
+    // was down or upgraded since the last stream still advertises correctly.
+    let (features, sources) = probe_capabilities(local_server_graphql_url.as_deref()).await;
+    // Kept for post-hello decisions (e.g. whether to spawn the alert forwarder).
+    let suricata_capable = features.iter().any(|f| f == "suricata");
     let hello = AgentMessage {
         payload: Some(AgentPayload::Hello(AgentHello {
             node_id: node_id.clone(),
@@ -287,13 +294,9 @@ pub async fn run_stream_loop(
             dmi_sys_vendor,
             dmi_product_name,
             capabilities: Some(Capabilities {
-                // No optional features wired yet — placeholder for the
-                // forwarders/inspectors we'll gate behind cargo features.
-                features: vec![],
+                features,
                 engine_version: env!("CARGO_PKG_VERSION").to_string(),
-                // The only event stream agents produce today. Add to this
-                // list when ipfix/suricata/quic-inspect forwarders ship.
-                sources: vec!["policy_events".to_string()],
+                sources,
             }),
         })),
     };
@@ -1496,6 +1499,49 @@ async fn process_snapshot(
 ///
 /// On any error (e.g. policy-engine not yet attached), logs a warning and
 /// returns an empty snapshot so the controller can push the desired state.
+/// Probe the local engine's compile-time features and derive the capability
+/// advertisement for AgentHello: the `features` list gates which controller
+/// message types are valid for this node, and `sources` feeds the
+/// controller's alert-rule write-time validation.
+///
+/// The baseline (`policy_events`, no features) is returned when no local
+/// engine URL is configured or the engine is unreachable — a temporarily
+/// down engine must not be mistaken for one built without a feature, and
+/// the probe reruns on every reconnect so the advertisement heals itself.
+async fn probe_capabilities(graphql_url: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let mut features = Vec::new();
+    let mut sources = vec!["policy_events".to_string()];
+    let Some(url) = graphql_url else {
+        return (features, sources);
+    };
+
+    let url = url.to_string();
+    let probed = tokio::task::spawn_blocking(move || {
+        use policy_engine_dev::{ClientConfig, PolicyClient};
+        let client = PolicyClient::with_config(ClientConfig {
+            server_url: url,
+            ..Default::default()
+        });
+        client.server_features()
+    })
+    .await;
+
+    match probed {
+        Ok(Ok(f)) => {
+            if f.suricata {
+                features.push("suricata".to_string());
+                sources.push("suricata_alerts".to_string());
+            }
+        }
+        Ok(Err(e)) => log::warn!(
+            "Capability probe failed; advertising baseline capabilities: {:#}",
+            e
+        ),
+        Err(e) => log::warn!("Capability probe task panicked: {:#}", e),
+    }
+    (features, sources)
+}
+
 async fn fetch_state_snapshot(graphql_url: &str) -> StateSnapshot {
     match do_fetch_state_snapshot(graphql_url).await {
         Ok(s) => s,
@@ -2265,5 +2311,68 @@ mod tests {
             result.is_err(),
             "tick should surface the fetch error once unblocked"
         );
+    }
+
+    /// Serve exactly one canned GraphQL HTTP response on an ephemeral port.
+    /// Reads until the request headers are complete, then replies and closes.
+    fn one_shot_graphql_server(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}/graphql")
+    }
+
+    #[tokio::test]
+    async fn probe_capabilities_no_engine_url_advertises_baseline() {
+        let (features, sources) = probe_capabilities(None).await;
+        assert!(features.is_empty());
+        assert_eq!(sources, vec!["policy_events".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn probe_capabilities_unreachable_engine_advertises_baseline() {
+        // Nothing listens on port 1; the probe must degrade to baseline
+        // capabilities rather than fail the connection setup.
+        let (features, sources) = probe_capabilities(Some("http://127.0.0.1:1/graphql")).await;
+        assert!(features.is_empty());
+        assert_eq!(sources, vec!["policy_events".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn probe_capabilities_suricata_engine_advertises_feature_and_source() {
+        let url = one_shot_graphql_server(r#"{"data":{"serverFeatures":{"suricata":true}}}"#);
+        let (features, sources) = probe_capabilities(Some(&url)).await;
+        assert_eq!(features, vec!["suricata".to_string()]);
+        assert_eq!(
+            sources,
+            vec!["policy_events".to_string(), "suricata_alerts".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_capabilities_plain_engine_advertises_baseline() {
+        let url = one_shot_graphql_server(r#"{"data":{"serverFeatures":{"suricata":false}}}"#);
+        let (features, sources) = probe_capabilities(Some(&url)).await;
+        assert!(features.is_empty());
+        assert_eq!(sources, vec!["policy_events".to_string()]);
     }
 }
