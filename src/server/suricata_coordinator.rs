@@ -110,12 +110,16 @@ impl SuricataCoordinator {
         Ok(())
     }
 
-    /// Remove the generated config and systemd files, then restart (to pick up
-    /// the stock config or stop if no config remains).
+    /// Remove the generated config and systemd files, then stop the service.
+    ///
+    /// Must stop, not restart: without the policy-engine drop-in a restart
+    /// launches the stock distro unit with the default suricata.yaml
+    /// (af-packet on eth0), which crash-loops on hosts without that
+    /// interface. Suricata must only run while inspect mode is enabled.
     pub fn remove_config(&self) -> Result<()> {
         self.runtime.remove_systemd_env()?;
-        if let Err(e) = self.runtime.restart_service() {
-            log::warn!("Suricata restart after config removal failed: {}", e);
+        if let Err(e) = self.runtime.stop() {
+            log::warn!("Suricata stop after config removal failed: {}", e);
         }
         Ok(())
     }
@@ -128,7 +132,7 @@ impl SuricataCoordinator {
 
     pub fn remove_systemd_env(&self) -> Result<()> {
         self.runtime.remove_systemd_env()?;
-        self.runtime.restart_service()
+        self.runtime.stop()
     }
 
     /// Start the Suricata systemd service.

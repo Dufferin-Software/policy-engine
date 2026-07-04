@@ -139,6 +139,7 @@ impl SuricataRuntime for DefaultSuricataRuntime {
     }
 
     fn stop(&self) -> Result<()> {
+        Self::daemon_reload();
         let out = Command::new("systemctl")
             .args(["stop", "suricata"])
             .output()

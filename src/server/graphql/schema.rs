@@ -3294,9 +3294,10 @@ mod tests {
         rt.expect_is_running().returning(|| false);
         rt.expect_get_version().returning(|| None);
         rt.expect_get_ruleset_version().returning(|| None);
-        // remove_config calls remove_systemd_env then restart_service
+        // remove_config calls remove_systemd_env then stop (never restart:
+        // that would launch the stock unit with the distro default config)
         rt.expect_remove_systemd_env().times(1).returning(|| Ok(()));
-        rt.expect_restart_service().times(1).returning(|| Ok(()));
+        rt.expect_stop().times(1).returning(|| Ok(()));
         rt.expect_disable_update_timer()
             .times(1)
             .returning(|| Ok(()));
@@ -3331,7 +3332,7 @@ mod tests {
         rt.expect_get_version().returning(|| None);
         rt.expect_get_ruleset_version().returning(|| None);
         rt.expect_remove_systemd_env().times(1).returning(|| Ok(()));
-        rt.expect_restart_service().times(1).returning(|| Ok(()));
+        rt.expect_stop().times(1).returning(|| Ok(()));
         rt.expect_disable_update_timer()
             .times(1)
             .returning(|| Ok(()));
@@ -3362,7 +3363,7 @@ mod tests {
         rt.expect_get_ruleset_version().returning(|| None);
         // Must call remove_config as part of DISABLED teardown
         rt.expect_remove_systemd_env().times(1).returning(|| Ok(()));
-        rt.expect_restart_service().times(1).returning(|| Ok(()));
+        rt.expect_stop().times(1).returning(|| Ok(()));
         rt.expect_disable_update_timer()
             .times(1)
             .returning(|| Ok(()));
@@ -3397,7 +3398,7 @@ mod tests {
         rt.expect_get_version().returning(|| None);
         rt.expect_get_ruleset_version().returning(|| None);
         rt.expect_remove_systemd_env().times(1).returning(|| Ok(()));
-        rt.expect_restart_service().times(1).returning(|| Ok(()));
+        rt.expect_stop().times(1).returning(|| Ok(()));
         rt.expect_disable_update_timer()
             .times(1)
             .returning(|| Ok(()));

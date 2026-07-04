@@ -68,14 +68,15 @@ fn write_env_delegates_to_runtime() {
 }
 
 #[test]
-fn remove_env_delegates_and_restarts() {
+fn remove_env_delegates_and_stops() {
     let mut mock = MockRuntime::new();
     mock.expect_remove_systemd_env()
         .times(1)
         .returning(|| Ok(()));
 
-    // Expect restart after removing env
-    mock.expect_restart_service().times(1).returning(|| Ok(()));
+    // Expect stop (not restart — that would launch the stock unit) after
+    // removing the env
+    mock.expect_stop().times(1).returning(|| Ok(()));
 
     let runtime: Arc<dyn SuricataRuntime> = Arc::new(mock);
     let coord = SuricataCoordinator::new_with_runtime(
@@ -432,13 +433,13 @@ fn test_apply_config_write_env_fails_returns_err() {
 }
 
 #[test]
-fn test_remove_config_removes_env_and_restarts() {
+fn test_remove_config_removes_env_and_stops() {
     let rules_dir = make_tmp_rules_dir("remove_config");
     let mut mock = MockRuntime::new();
     mock.expect_remove_systemd_env()
         .times(1)
         .returning(|| Ok(()));
-    mock.expect_restart_service().times(1).returning(|| Ok(()));
+    mock.expect_stop().times(1).returning(|| Ok(()));
 
     let coord = make_coord(mock, rules_dir.clone());
     assert!(coord.remove_config().is_ok());
@@ -446,13 +447,13 @@ fn test_remove_config_removes_env_and_restarts() {
 }
 
 #[test]
-fn test_remove_config_restart_failure_is_ok() {
-    let rules_dir = make_tmp_rules_dir("remove_config_restart_fail");
+fn test_remove_config_stop_failure_is_ok() {
+    let rules_dir = make_tmp_rules_dir("remove_config_stop_fail");
     let mut mock = MockRuntime::new();
     mock.expect_remove_systemd_env()
         .times(1)
         .returning(|| Ok(()));
-    mock.expect_restart_service()
+    mock.expect_stop()
         .times(1)
         .returning(|| Err(anyhow::anyhow!("systemctl not found")));
 
@@ -641,13 +642,13 @@ fn test_write_systemd_env_compat_delegates_and_restarts() {
 }
 
 #[test]
-fn test_remove_systemd_env_compat_delegates_and_restarts() {
+fn test_remove_systemd_env_compat_delegates_and_stops() {
     let rules_dir = make_tmp_rules_dir("remove_env_compat");
     let mut mock = MockRuntime::new();
     mock.expect_remove_systemd_env()
         .times(1)
         .returning(|| Ok(()));
-    mock.expect_restart_service().times(1).returning(|| Ok(()));
+    mock.expect_stop().times(1).returning(|| Ok(()));
 
     let coord = make_coord(mock, rules_dir.clone());
     assert!(coord.remove_systemd_env().is_ok());

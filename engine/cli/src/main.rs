@@ -629,6 +629,33 @@ where
     }
 }
 
+/// Like handle_operation, but accumulates the result instead of printing it,
+/// so multi-step commands can emit a single JSON object at the end.
+/// In JSON mode errors become failed results; otherwise they propagate.
+fn collect_operation<F>(
+    operation: F,
+    json_output: bool,
+    results: &mut Vec<OperationResult>,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<OperationResult>,
+{
+    match operation() {
+        Ok(result) => results.push(result),
+        Err(e) => {
+            if json_output {
+                results.push(OperationResult {
+                    success: false,
+                    message: e.to_string(),
+                });
+            } else {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Helper to handle errors for generic operations when json_output is true
 /// Returns Ok(Some(value)) on success, Ok(None) if error was handled as JSON, or Err if error should propagate
 fn try_operation_json<T, F>(operation: F, json_output: bool) -> Result<Option<T>>
@@ -1058,24 +1085,61 @@ fn handle_inspect(client: &PolicyClient, cmd: InspectCommand, json_output: bool)
         InspectCommand::Enable { mode, interface } => {
             let inspect_mode: GqlInspectMode =
                 mode.parse().map_err(|e: anyhow::Error| anyhow!("{}", e))?;
-            handle_operation(|| client.configure_inspect(inspect_mode), json_output)?;
+
+            // JSON consumers expect exactly one object on stdout, so collect
+            // every step's result and emit a single aggregate at the end.
+            let mut results: Vec<OperationResult> = Vec::new();
+            collect_operation(
+                || client.configure_inspect(inspect_mode),
+                json_output,
+                &mut results,
+            )?;
 
             // Inspection only happens on interfaces with the per-interface
             // flag set.  Explicit --interface flags win; otherwise enable on
             // every XDP-attached interface for compatibility with the old
             // node-global behaviour.
             let targets: Vec<String> = if interface.is_empty() {
-                client
-                    .list_interfaces()?
-                    .into_iter()
-                    .filter(|i| i.direction.eq_ignore_ascii_case("ingress"))
-                    .map(|i| i.interface)
-                    .collect()
+                match client.list_interfaces() {
+                    Ok(ifaces) => ifaces
+                        .into_iter()
+                        .filter(|i| i.direction.eq_ignore_ascii_case("ingress"))
+                        .map(|i| i.interface)
+                        .collect(),
+                    Err(e) if json_output => {
+                        results.push(OperationResult {
+                            success: false,
+                            message: e.to_string(),
+                        });
+                        Vec::new()
+                    }
+                    Err(e) => return Err(e),
+                }
             } else {
                 interface
             };
             for iface in targets {
-                handle_operation(|| client.set_inspect_interface(&iface, true), json_output)?;
+                collect_operation(
+                    || client.set_inspect_interface(&iface, true),
+                    json_output,
+                    &mut results,
+                )?;
+            }
+
+            if json_output {
+                let combined = OperationResult {
+                    success: results.iter().all(|r| r.success),
+                    message: results
+                        .iter()
+                        .map(|r| r.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                };
+                print_result(&combined, true)?;
+            } else {
+                for result in &results {
+                    print_result(result, false)?;
+                }
             }
         }
 
@@ -2174,6 +2238,39 @@ mod tests {
         // Ensure serialization doesn't panic
         let result = serde_json::to_string_pretty(&status);
         assert!(result.is_ok());
+    }
+
+    /// collect_operation accumulates results in JSON mode, including errors,
+    /// so multi-step commands can emit a single JSON object
+    #[test]
+    fn test_collect_operation_json_mode() {
+        let mut results = Vec::new();
+        collect_operation(
+            || {
+                Ok(OperationResult {
+                    success: true,
+                    message: "step one".to_string(),
+                })
+            },
+            true,
+            &mut results,
+        )
+        .unwrap();
+        collect_operation(|| Err(anyhow!("step two failed")), true, &mut results).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].success);
+        assert!(!results[1].success);
+        assert_eq!(results[1].message, "step two failed");
+    }
+
+    /// collect_operation propagates errors in non-JSON mode
+    #[test]
+    fn test_collect_operation_text_mode_propagates_error() {
+        let mut results = Vec::new();
+        let err = collect_operation(|| Err(anyhow!("boom")), false, &mut results);
+        assert!(err.is_err());
+        assert!(results.is_empty());
     }
 
     /// Test that combined stats response (for show stats --json) works
