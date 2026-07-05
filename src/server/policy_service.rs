@@ -244,6 +244,17 @@ pub struct PolicyService {
 
 /// Default IP-forwarding control: the real sysctl writer in production, a no-op
 /// in unit-test builds so no test can write the host's forwarding sysctls.
+/// Reject policy operations targeting the engine's own inspect veth pair.
+fn ensure_not_internal(interface: &str) -> Result<()> {
+    if crate::types::is_internal_interface(interface) {
+        anyhow::bail!(
+            "Interface {} is reserved for internal use by the policy engine",
+            interface
+        );
+    }
+    Ok(())
+}
+
 fn default_forwarding_control() -> Box<dyn ForwardingControl> {
     #[cfg(test)]
     return Box::new(crate::server::ip_forwarding::NoopForwardingControl);
@@ -554,6 +565,7 @@ impl PolicyService {
 
     /// Attach ingress program to an interface with automatic mode selection
     pub fn attach_ingress_auto(&mut self, interface: &str) -> Result<OperationResult> {
+        ensure_not_internal(interface)?;
         self.ensure_xdp_loaded()?;
 
         let modes_to_try = [
@@ -603,6 +615,7 @@ impl PolicyService {
 
     /// Attach ingress program to an interface with specific mode
     pub fn attach_ingress(&mut self, interface: &str, mode: XdpMode) -> Result<OperationResult> {
+        ensure_not_internal(interface)?;
         self.ensure_xdp_loaded()?;
 
         self.bpf_ops
@@ -713,6 +726,7 @@ impl PolicyService {
 
     /// Attach egress program to an interface
     pub fn attach_tc(&mut self, interface: &str) -> Result<OperationResult> {
+        ensure_not_internal(interface)?;
         self.ensure_tc_loaded()?;
 
         self.bpf_ops
@@ -5318,6 +5332,36 @@ mod tests {
             let ev = rx.try_recv().expect("should have a deleted event");
             assert_eq!(ev.event_type, "deleted");
             assert_eq!(ev.rule_id, rule_id);
+        }
+    }
+
+    // ── Internal (inspect veth) interfaces are rejected by attach ops ────────
+
+    mod internal_interface_guard {
+        use super::*;
+
+        #[test]
+        fn attach_ops_reject_inspect_veth() {
+            // No expectations set: the guard must fire before any BPF call,
+            // otherwise mockall panics on the unexpected call.
+            let mock = MockBpfOperations::new();
+            let mut service = PolicyService::new(Box::new(mock));
+
+            for iface in ["pe-inspect0", "pe-inspect1"] {
+                assert!(service.attach_ingress(iface, XdpMode::Native).is_err());
+                assert!(service.attach_ingress_auto(iface).is_err());
+                assert!(service.attach_tc(iface).is_err());
+            }
+        }
+
+        #[test]
+        fn is_internal_interface_matches_only_veth_pair() {
+            use crate::types::is_internal_interface;
+            assert!(is_internal_interface("pe-inspect0"));
+            assert!(is_internal_interface("pe-inspect1"));
+            assert!(!is_internal_interface("eth0"));
+            assert!(!is_internal_interface("pe-inspect"));
+            assert!(!is_internal_interface("lo"));
         }
     }
 }

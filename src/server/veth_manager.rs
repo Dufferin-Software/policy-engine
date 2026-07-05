@@ -101,19 +101,14 @@ impl Default for VethManager {
 
 impl VethManager {
     pub fn new() -> Self {
-        Self {
-            veth_name: "pe-inspect0".to_string(),
-            peer_name: "pe-inspect1".to_string(),
-            created: false,
-            ops: Arc::new(SystemVethOps),
-        }
+        Self::new_with_ops(Arc::new(SystemVethOps))
     }
 
     /// Construct with injected VethOps (used in unit tests).
     pub fn new_with_ops(ops: Arc<dyn VethOps>) -> Self {
         Self {
-            veth_name: "pe-inspect0".to_string(),
-            peer_name: "pe-inspect1".to_string(),
+            veth_name: crate::types::INSPECT_VETH_LOCAL.to_string(),
+            peer_name: crate::types::INSPECT_VETH_PEER.to_string(),
             created: false,
             ops,
         }

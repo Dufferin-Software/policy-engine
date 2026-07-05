@@ -293,6 +293,9 @@ impl QueryRoot {
             .map_err(|e| async_graphql::Error::new(format!("Failed to list interfaces: {}", e)))?;
         for entry in entries.flatten() {
             if let Ok(name) = entry.file_name().into_string() {
+                if crate::types::is_internal_interface(&name) {
+                    continue;
+                }
                 interfaces.push(name);
             }
         }

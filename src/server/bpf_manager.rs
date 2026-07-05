@@ -954,6 +954,9 @@ impl BpfManager {
         if let Ok(entries) = fs::read_dir("/sys/class/net") {
             for entry in entries.flatten() {
                 if let Ok(name) = entry.file_name().into_string() {
+                    if crate::types::is_internal_interface(&name) {
+                        continue;
+                    }
                     if let Some(filter) = filter_ifname {
                         if name != filter {
                             continue;

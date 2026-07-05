@@ -44,6 +44,18 @@ pub mod tail_call_features {
 /// Maximum interfaces we track
 pub const MAX_INTERFACES: u32 = 256;
 
+/// Local endpoint of the inspect veth pair (TC clone-redirect target).
+pub const INSPECT_VETH_LOCAL: &str = "pe-inspect0";
+/// Peer endpoint of the inspect veth pair (Suricata listens here).
+pub const INSPECT_VETH_PEER: &str = "pe-inspect1";
+
+/// True for interfaces that belong to the engine itself (the inspect veth
+/// pair). These are hidden from interface discovery and rejected by policy
+/// attach operations — the controller must never see or manage them.
+pub fn is_internal_interface(name: &str) -> bool {
+    name == INSPECT_VETH_LOCAL || name == INSPECT_VETH_PEER
+}
+
 /// Maximum actions per rule
 pub const MAX_ACTIONS_PER_RULE: u32 = 4;
 

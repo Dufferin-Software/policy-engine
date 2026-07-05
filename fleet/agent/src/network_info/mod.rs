@@ -75,6 +75,15 @@ pub struct InterfaceInfo {
     pub ifindex: u32,
 }
 
+/// True for interfaces internal to the policy engine that must be hidden
+/// from discovery (and therefore from the controller): the pe-inspect0/
+/// pe-inspect1 veth pair the engine creates in IPS/IDS mode to mirror
+/// traffic to Suricata. Mirrors `is_internal_interface` in the engine's
+/// `types.rs` — keep the two in sync.
+pub fn is_internal_interface(name: &str) -> bool {
+    name == "pe-inspect0" || name == "pe-inspect1"
+}
+
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 /// Abstraction over network interface discovery.
@@ -84,4 +93,18 @@ pub struct InterfaceInfo {
 pub trait NetworkInfo: Send + Sync {
     /// Return all network interfaces on this host.
     fn list_interfaces(&self) -> Result<Vec<InterfaceInfo>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_interfaces_are_the_inspect_veth_pair() {
+        assert!(is_internal_interface("pe-inspect0"));
+        assert!(is_internal_interface("pe-inspect1"));
+        assert!(!is_internal_interface("eth0"));
+        assert!(!is_internal_interface("lo"));
+        assert!(!is_internal_interface("pe-inspect"));
+    }
 }

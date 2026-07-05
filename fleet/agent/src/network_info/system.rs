@@ -28,6 +28,9 @@ impl NetworkInfo for SystemNetworkInfo {
         let addrs = getifaddrs().context("getifaddrs failed")?;
         for ifaddr in addrs {
             let name = ifaddr.interface_name.clone();
+            if super::is_internal_interface(&name) {
+                continue;
+            }
             let entry = ifaces.entry(name.clone()).or_insert_with(|| InterfaceInfo {
                 name: name.clone(),
                 addresses: Vec::new(),
