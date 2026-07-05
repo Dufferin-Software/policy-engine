@@ -77,6 +77,8 @@ pub fn alert_to_flow_verdict_key(alert: &SuricataAlert) -> Result<FlowVerdictKey
         "tcp" => libc::IPPROTO_TCP as u8,
         "udp" => libc::IPPROTO_UDP as u8,
         "icmp" => libc::IPPROTO_ICMP as u8,
+        // Suricata's EVE proto string for ICMPv6.
+        "ipv6-icmp" | "icmpv6" => libc::IPPROTO_ICMPV6 as u8,
         _ => 0,
     };
 
@@ -162,6 +164,8 @@ mod tests {
             dest_ip: dest_ip.to_string(),
             src_port,
             dest_port,
+            icmp_type: None,
+            icmp_code: None,
             proto: proto.to_string(),
             event_type: "alert".to_string(),
             alert: None,
@@ -211,6 +215,17 @@ mod tests {
         let key = alert_to_flow_verdict_key(&alert).unwrap();
         let proto = key.protocol;
         assert_eq!(proto, libc::IPPROTO_ICMP as u8);
+    }
+
+    #[cfg(feature = "suricata")]
+    #[test]
+    fn key_ipv6_icmpv6() {
+        let alert = make_alert("fd00::1", "fd00::2", 128, 0, "IPv6-ICMP");
+        let key = alert_to_flow_verdict_key(&alert).unwrap();
+        let proto = key.protocol;
+        let af = key.af;
+        assert_eq!(proto, libc::IPPROTO_ICMPV6 as u8);
+        assert_eq!(af, AF_INET6);
     }
 
     #[cfg(feature = "suricata")]

@@ -24,8 +24,18 @@ pub struct SuricataAlert {
     pub timestamp: String,
     pub src_ip: String,
     pub dest_ip: String,
+    /// Absent in EVE records for portless protocols (ICMP carries
+    /// icmp_type/icmp_code instead).  `process_line` fills these from
+    /// icmp_type/icmp_code so the flow-verdict key matches the BPF
+    /// convention of ICMP type/code as pseudo-ports.
+    #[serde(default)]
     pub src_port: u16,
+    #[serde(default)]
     pub dest_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icmp_type: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icmp_code: Option<u16>,
     pub proto: String,
     #[serde(default)]
     pub event_type: String,
@@ -168,7 +178,14 @@ impl EveConsumer {
             Ok(value) => {
                 if value.get("event_type").and_then(|v| v.as_str()) == Some("alert") {
                     match serde_json::from_value::<SuricataAlert>(value) {
-                        Ok(alert) => {
+                        Ok(mut alert) => {
+                            // ICMP EVE records carry no ports; the BPF flow key
+                            // uses type/code as pseudo-ports, so mirror that
+                            // here or IPS DROP verdicts never match the flow.
+                            if let Some(t) = alert.icmp_type {
+                                alert.src_port = t;
+                                alert.dest_port = alert.icmp_code.unwrap_or(0);
+                            }
                             debug!(
                                 "EVE alert: sig_id={}, action={}",
                                 alert.alert.as_ref().map(|a| a.signature_id).unwrap_or(0),
@@ -180,7 +197,7 @@ impl EveConsumer {
                             );
                             let _ = alert_tx.send(alert);
                         }
-                        Err(e) => debug!("Failed to parse EVE alert: {}", e),
+                        Err(e) => warn!("Dropping unparseable EVE alert: {}", e),
                     }
                 }
             }
@@ -268,6 +285,8 @@ mod tests {
             dest_ip: "10.0.0.2".to_string(),
             src_port: 1234,
             dest_port: 80,
+            icmp_type: None,
+            icmp_code: None,
             proto: "TCP".to_string(),
             event_type: "alert".to_string(),
             alert: None,
@@ -332,6 +351,28 @@ mod tests {
         let ai = alert.alert.expect("alert info should be present");
         assert_eq!(ai.signature_id, 2100498);
         assert_eq!(ai.action, "blocked");
+    }
+
+    #[test]
+    fn test_process_line_icmp_alert_without_ports() {
+        // Real-shape EVE record for an ICMP alert: no src_port/dest_port,
+        // icmp_type/icmp_code instead.  Must parse (regression: required
+        // port fields silently dropped every ICMP alert) and map type/code
+        // into the pseudo-port fields used by the BPF flow-verdict key.
+        let (tx, mut rx) = broadcast::channel(16);
+        let line = concat!(
+            r#"{"timestamp":"2026-07-05T18:00:05.457514+0100","flow_id":1,"in_iface":"pe-inspect1","#,
+            r#""event_type":"alert","src_ip":"10.0.0.2","dest_ip":"10.0.0.1","proto":"ICMP","#,
+            r#""icmp_type":8,"icmp_code":0,"#,
+            r#""alert":{"action":"allowed","gid":1,"signature_id":1000001,"rev":1,"#,
+            r#""signature":"TEST ICMP Ping","category":"","severity":3}}"#
+        );
+        EveConsumer::process_line(line, &tx);
+        let alert = rx.try_recv().expect("ICMP alert should be broadcast");
+        assert_eq!(alert.proto, "ICMP");
+        assert_eq!(alert.src_port, 8, "icmp_type must become src_port");
+        assert_eq!(alert.dest_port, 0, "icmp_code must become dest_port");
+        assert_eq!(alert.alert.unwrap().signature_id, 1000001);
     }
 
     #[tokio::test]
@@ -567,6 +608,8 @@ mod tests {
             dest_ip: "5.6.7.8".to_string(),
             src_port: 1234,
             dest_port: 80,
+            icmp_type: None,
+            icmp_code: None,
             proto: "TCP".to_string(),
             event_type: "alert".to_string(),
             alert: Some(AlertInfo {
