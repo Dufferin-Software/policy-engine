@@ -1,8 +1,6 @@
 #!/bin/bash
 set -e
 
-#DEBHELPER#
-
 # The daemon runs as the unprivileged policy-engine user (see
 # policy-engine.service).  ReadWritePaths= in the unit only lifts the
 # ProtectSystem=strict read-only remount — regular file permissions still
@@ -11,13 +9,20 @@ set -e
 #   /etc/suricata                        — policy-engine.yaml + env file
 #   /etc/suricata/rules/policy-engine    — deployed detection rules
 #   /etc/systemd/system/suricata.service.d — generated drop-in
-# This must run after the debhelper token above (never spell it out here —
-# dh_installdeb expands it anywhere in the file, comments included): its
-# sysusers.d snippet creates the policy-engine group on a fresh install.
+# This block must run BEFORE the debhelper token below (never spell the
+# token out here — dh_installdeb expands it anywhere in the file, comments
+# included): the token starts policy-engine.service, and ReadWritePaths=
+# bind mounts are set up once, at service start.  The suricata.service.d
+# entry is `-` prefixed, so if the directory does not exist yet it is
+# silently skipped and the path stays read-only (EROFS) inside the service
+# until the next restart.  The policy-engine group is already present at
+# this point: preinst creates it.
 mkdir -p /etc/systemd/system/suricata.service.d /etc/suricata/rules
 chgrp policy-engine /etc/suricata /etc/suricata/rules /etc/systemd/system/suricata.service.d
 chmod g+w /etc/suricata /etc/suricata/rules /etc/systemd/system/suricata.service.d
 install -d -o policy-engine -g policy-engine -m 0755 /etc/suricata/rules/policy-engine
+
+#DEBHELPER#
 
 # The generated Suricata env file used to live in /etc/default; it now lives
 # in /etc/suricata where the policy-engine user can manage it.
