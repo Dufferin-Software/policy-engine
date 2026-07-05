@@ -107,6 +107,14 @@ export const FEATURE_BADGES: Record<string, { label: string; title: string }> = 
   suricata: { label: 'IPS', title: 'Suricata IPS/IDS inspection supported (feature: suricata)' },
 }
 
+export function parseAddresses(json: string): { address: string; prefix_len: number; family: string }[] {
+  try {
+    return JSON.parse(json)
+  } catch {
+    return []
+  }
+}
+
 export function statusColor(status: string): string {
   switch (status) {
     case 'active':

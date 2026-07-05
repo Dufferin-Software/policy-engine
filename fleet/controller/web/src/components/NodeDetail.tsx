@@ -218,12 +218,13 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
   const [logAuditEntry] = useMutation(LOG_AUDIT_ENTRY)
   const [setNodeStopBehavior] = useMutation(SET_STOP_BEHAVIOR)
   const [setInspectModeMutation] = useMutation(SET_INSPECT_MODE)
-  const [stopBehaviorPending, setStopBehaviorPending] = useState(false)
-  const [inspectModePending, setInspectModePending] = useState(false)
   const [clearAllPolicyStats] = useMutation(CLEAR_ALL_POLICY_STATS)
   const [setNodeMetricsInterval] = useMutation(SET_METRICS_INTERVAL)
-  // Mirrors the node's configured interval; empty string means "agent default".
+  // Local (unapplied) node settings; committed together via the Apply button.
   const [metricsInterval, setMetricsInterval] = useState<string>('')
+  const [stopBehaviorSel, setStopBehaviorSel] = useState<string>('clear-state')
+  const [inspectModeSel, setInspectModeSel] = useState<string>('disabled')
+  const [settingsApplying, setSettingsApplying] = useState(false)
 
   // Stats live in the node's engine and are scraped periodically, so cleared
   // counters surface on the next metrics refresh rather than instantly.
@@ -268,30 +269,66 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
     setTimeout(() => setMsg(null), 4000)
   }
 
-  // Keep the input in sync with the persisted value as the node refetches.
+  // Keep the settings controls in sync with persisted values as the node
+  // refetches (a remote change or an agent confirm shows up on the next poll).
   useEffect(() => {
     setMetricsInterval(node?.metricsIntervalSecs != null ? String(node.metricsIntervalSecs) : '')
   }, [node?.metricsIntervalSecs])
+  useEffect(() => {
+    setStopBehaviorSel(node?.stopBehavior ?? 'clear-state')
+  }, [node?.stopBehavior])
+  useEffect(() => {
+    setInspectModeSel(node?.inspectMode || 'disabled')
+  }, [node?.inspectMode])
 
-  async function handleSetMetricsInterval() {
-    const trimmed = metricsInterval.trim()
+  // Per-setting dirty flags: Apply only sends mutations for values that differ
+  // from what the controller last reported.
+  const stopBehaviorDirty = !!node && stopBehaviorSel !== (node.stopBehavior ?? 'clear-state')
+  const inspectModeDirty = !!node && suricataCapable && inspectModeSel !== (node.inspectMode || 'disabled')
+  const metricsDirty =
+    !!node && metricsInterval.trim() !== (node.metricsIntervalSecs != null ? String(node.metricsIntervalSecs) : '')
+  const settingsDirty = stopBehaviorDirty || inspectModeDirty || metricsDirty
+
+  function handleResetSettings() {
+    if (!node) return
+    setStopBehaviorSel(node.stopBehavior ?? 'clear-state')
+    setInspectModeSel(node.inspectMode || 'disabled')
+    setMetricsInterval(node.metricsIntervalSecs != null ? String(node.metricsIntervalSecs) : '')
+  }
+
+  async function handleApplySettings() {
+    if (!node || !settingsDirty) return
     // Empty clears the override so the agent reverts to its local default.
+    const trimmed = metricsInterval.trim()
     const seconds = trimmed === '' ? null : Number(trimmed)
-    if (seconds !== null && (!Number.isInteger(seconds) || seconds < 5 || seconds > 3600)) {
+    if (metricsDirty && seconds !== null && (!Number.isInteger(seconds) || seconds < 5 || seconds > 3600)) {
       flash('Metrics interval must be a whole number of seconds between 5 and 3600')
       return
     }
+    setSettingsApplying(true)
+    const failures: string[] = []
     try {
-      const res = await setNodeMetricsInterval({ variables: { nodeId, seconds } })
-      const r = res.data?.setNodeMetricsInterval
-      if (r?.success) {
-        flash(r.message ?? (seconds === null ? 'Reverted to default metrics interval' : `Metrics interval set to ${seconds}s`))
-        refetch()
-      } else {
-        flash(r?.message ?? 'Failed to set metrics interval')
+      if (stopBehaviorDirty) {
+        const res = await setNodeStopBehavior({ variables: { nodeId, behavior: stopBehaviorSel } })
+        const r = res.data?.setNodeStopBehavior
+        if (!r?.success) failures.push(r?.message ?? 'Stop behavior update failed')
       }
+      if (inspectModeDirty) {
+        const res = await setInspectModeMutation({ variables: { nodeId, mode: inspectModeSel } })
+        const r = res.data?.setInspectMode
+        if (!r?.success) failures.push(r?.message ?? 'IPS/IDS mode update failed')
+      }
+      if (metricsDirty) {
+        const res = await setNodeMetricsInterval({ variables: { nodeId, seconds } })
+        const r = res.data?.setNodeMetricsInterval
+        if (!r?.success) failures.push(r?.message ?? 'Metrics interval update failed')
+      }
+      flash(failures.length > 0 ? failures.join('; ') : 'Settings applied.')
+      refetch()
     } catch (e) {
       flash(String(e).replace(/^ApolloError:\s*/, ''))
+    } finally {
+      setSettingsApplying(false)
     }
   }
 
@@ -391,34 +428,6 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
       flash(String(e).replace(/^ApolloError:\s*/, ''))
       setAttachPending((prev) => { const next = new Map(prev); next.delete(key); return next })
       handlePendingChange(false)
-    }
-  }
-
-  async function handleInspectModeChange(mode: string) {
-    setInspectModePending(true)
-    try {
-      const res = await setInspectModeMutation({ variables: { nodeId, mode } })
-      const r = res.data?.setInspectMode
-      if (!r?.success) flash(r?.message ?? 'Inspect mode update failed')
-      else refetch()
-    } catch (e) {
-      flash(String(e).replace(/^ApolloError:\s*/, ''))
-    } finally {
-      setInspectModePending(false)
-    }
-  }
-
-  async function handleStopBehaviorChange(behavior: string) {
-    setStopBehaviorPending(true)
-    try {
-      const res = await setNodeStopBehavior({ variables: { nodeId, behavior: behavior || null } })
-      const r = res.data?.setNodeStopBehavior
-      if (!r?.success) flash(r?.message ?? 'Stop behavior update failed')
-      else refetch()
-    } catch (e) {
-      flash(String(e).replace(/^ApolloError:\s*/, ''))
-    } finally {
-      setStopBehaviorPending(false)
     }
   }
 
@@ -559,79 +568,90 @@ export default function NodeDetail({ nodeId, onBack, initialTab }: Props) {
                         </div>
                       ))}
                     </dl>
-                    <div className="flex items-center justify-between">
-                      <span className="text-gray-500" title="What the engine does with its BPF programs and maps when the daemon stops — controls whether packet filtering keeps running across a restart. See each option for details.">Stop behavior</span>
-                      <span className={`inline-flex rounded overflow-hidden text-xs border border-gray-600 ${stopBehaviorPending ? 'opacity-40 pointer-events-none' : ''}`}>
-                        <button
-                          onClick={() => handleStopBehaviorChange('clear-state')}
-                          disabled={stopBehaviorPending}
-                          className={`px-2 py-0.5 ${(node.stopBehavior ?? 'clear-state') === 'clear-state' ? 'bg-blue-700 text-white' : 'bg-gray-700 text-gray-400 hover:bg-gray-600'}`}
-                          title="On shutdown: detaches all XDP/TC programs and removes pinned maps. Next start restores from state.json. Enforcement stops until the daemon restarts. (Default)"
+                    {/* Node settings: staged locally, committed together via Apply. */}
+                    <div className={`mt-3 pt-2 border-t border-gray-700 space-y-2 ${settingsApplying ? 'opacity-50 pointer-events-none' : ''}`}>
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Settings</h4>
+                        {settingsDirty && !settingsApplying && (
+                          <span className="text-[10px] text-amber-400">unsaved changes</span>
+                        )}
+                      </div>
+                      <div className="flex items-center justify-between gap-4">
+                        <span
+                          className="text-gray-500"
+                          title="What the engine does with its BPF programs and maps when the daemon stops. clear-state (default): detach programs and remove pinned maps — enforcement stops until restart, state restored from state.json. preserve-state: leave programs attached — enforcement continues with zero gap across daemon restarts (a crash always preserves state regardless)."
                         >
-                          clear-state
-                        </button>
-                        <button
-                          onClick={() => handleStopBehaviorChange('preserve-state')}
-                          disabled={stopBehaviorPending}
-                          className={`px-2 py-0.5 ${node.stopBehavior === 'preserve-state' ? 'bg-yellow-700 text-white' : 'bg-gray-700 text-gray-400 hover:bg-gray-600'}`}
-                          title="On shutdown: leaves XDP/TC programs attached and maps in the kernel. Enforcement continues with zero gap across daemon restarts. Note: a crash (kill -9) always preserves state regardless of this setting."
+                          Stop behavior
+                        </span>
+                        <select
+                          value={stopBehaviorSel}
+                          onChange={(e) => setStopBehaviorSel(e.target.value)}
+                          disabled={settingsApplying}
+                          className={`bg-gray-900 border rounded px-2 py-1 text-xs text-gray-200 ${stopBehaviorDirty ? 'border-amber-600' : 'border-gray-600'}`}
                         >
-                          preserve-state
-                        </button>
-                      </span>
-                    </div>
-                    {(() => {
-                      // IPS/IDS mode selector — only for nodes whose agent
-                      // advertised the "suricata" capability.
-                      if (!suricataCapable) return null
-                      const mode = node.inspectMode || 'disabled'
-                      const btn = (value: string, label: string, activeCls: string, tip: string) => (
-                        <button
-                          key={value}
-                          onClick={() => handleInspectModeChange(value)}
-                          disabled={inspectModePending}
-                          className={`px-2 py-0.5 ${mode === value ? activeCls : 'bg-gray-700 text-gray-400 hover:bg-gray-600'}`}
-                          title={tip}
-                        >
-                          {label}
-                        </button>
-                      )
-                      return (
-                        <div className="flex items-center justify-between">
-                          <span className="text-gray-500" title="Suricata inspection mode for this node. Traffic is only inspected on interfaces with inspection enabled (see the Interfaces page) and only for flows matched by INSPECT rules.">
+                          <option value="clear-state">clear-state (default)</option>
+                          <option value="preserve-state">preserve-state</option>
+                        </select>
+                      </div>
+                      {suricataCapable && (
+                        <div className="flex items-center justify-between gap-4">
+                          <span
+                            className="text-gray-500"
+                            title="Suricata inspection mode for this node. IDS: alerts are logged but traffic is never blocked. IPS: alerts install DROP verdicts that block the offending flow at line rate. Traffic is only inspected on interfaces with inspection enabled (see Interfaces → Configure) and only for flows matched by INSPECT rules."
+                          >
                             IPS/IDS mode
                           </span>
-                          <span className={`inline-flex rounded overflow-hidden text-xs border border-gray-600 ${inspectModePending ? 'opacity-40 pointer-events-none' : ''}`}>
-                            {btn('disabled', 'off', 'bg-blue-700 text-white', 'Disable Suricata inspection on this node.')}
-                            {btn('ids', 'IDS', 'bg-yellow-700 text-white', 'Detection only: Suricata alerts are logged but traffic is never blocked.')}
-                            {btn('ips', 'IPS', 'bg-red-700 text-white', 'Prevention: Suricata alerts install DROP verdicts that block the offending flow at line rate.')}
-                          </span>
+                          <select
+                            value={inspectModeSel}
+                            onChange={(e) => setInspectModeSel(e.target.value)}
+                            disabled={settingsApplying}
+                            className={`bg-gray-900 border rounded px-2 py-1 text-xs text-gray-200 ${inspectModeDirty ? 'border-amber-600' : 'border-gray-600'}`}
+                          >
+                            <option value="disabled">off</option>
+                            <option value="ids">IDS — detect only</option>
+                            <option value="ips">IPS — block flows</option>
+                          </select>
                         </div>
-                      )
-                    })()}
-                    <div className="flex items-center justify-between">
-                      <span className="text-gray-500" title="How often the node's agent scrapes the local engine and forwards metrics to the controller. Empty = agent default.">
-                        Metrics interval
-                      </span>
-                      <span className="inline-flex items-center gap-1 text-xs">
-                        <input
-                          type="number"
-                          min={5}
-                          max={3600}
-                          value={metricsInterval}
-                          onChange={(e) => setMetricsInterval(e.target.value)}
-                          placeholder="default"
-                          className="w-20 bg-gray-900 border border-gray-600 rounded px-1 py-0.5 text-gray-200 text-right"
-                        />
-                        <span className="text-gray-500">s</span>
-                        <button
-                          onClick={handleSetMetricsInterval}
-                          className="px-2 py-0.5 bg-gray-700 text-gray-200 rounded hover:bg-blue-700"
-                          title="Apply the metrics scrape interval to this node. Empty reverts to the agent default."
+                      )}
+                      <div className="flex items-center justify-between gap-4">
+                        <span
+                          className="text-gray-500"
+                          title="How often the node's agent scrapes the local engine and forwards metrics to the controller. Empty = agent default."
                         >
-                          Apply
+                          Metrics interval
+                        </span>
+                        <span className="inline-flex items-center gap-1 text-xs">
+                          <input
+                            type="number"
+                            min={5}
+                            max={3600}
+                            value={metricsInterval}
+                            onChange={(e) => setMetricsInterval(e.target.value)}
+                            disabled={settingsApplying}
+                            placeholder="default"
+                            className={`w-20 bg-gray-900 border rounded px-1 py-0.5 text-gray-200 text-right ${metricsDirty ? 'border-amber-600' : 'border-gray-600'}`}
+                          />
+                          <span className="text-gray-500">s</span>
+                        </span>
+                      </div>
+                      <div className="flex justify-end gap-2 pt-1">
+                        <button
+                          onClick={handleResetSettings}
+                          disabled={!settingsDirty || settingsApplying}
+                          className="px-3 py-1 rounded text-xs bg-gray-700 text-gray-300 hover:bg-gray-600 disabled:opacity-40 disabled:cursor-not-allowed"
+                          title="Discard unapplied changes"
+                        >
+                          Reset
                         </button>
-                      </span>
+                        <button
+                          onClick={handleApplySettings}
+                          disabled={!settingsDirty || settingsApplying}
+                          className="px-3 py-1 rounded text-xs bg-blue-700 text-white hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed"
+                          title="Apply the changed settings to this node"
+                        >
+                          {settingsApplying ? 'Applying…' : 'Apply'}
+                        </button>
+                      </div>
                     </div>
                   </>
                 )}

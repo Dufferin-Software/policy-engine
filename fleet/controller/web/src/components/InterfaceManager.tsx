@@ -3,7 +3,8 @@
 
 import React, { useState, useEffect, useRef } from 'react'
 import { useMutation, gql } from '@apollo/client'
-import { NodeInterfaceOutput, RuleOutput } from './types.ts'
+import { NodeInterfaceOutput, RuleOutput, parseAddresses } from './types.ts'
+import InterfaceConfigDialog from './InterfaceConfigDialog.tsx'
 
 const TAG_INTERFACE = gql`
   mutation TagInterface($nodeId: ID!, $interfaceName: String!, $tag: String!) {
@@ -53,6 +54,14 @@ const SET_URPF = gql`
   }
 `
 
+const SET_DEFAULT_ACTION = gql`
+  mutation SetInterfaceDefaultActionCfg($nodeId: ID!, $interfaceName: String!, $direction: String!, $action: String!) {
+    setInterfaceDefaultAction(nodeId: $nodeId, interfaceName: $interfaceName, direction: $direction, action: $action) {
+      success message
+    }
+  }
+`
+
 // Durable view of the node's single in-flight config op, polled from the
 // controller. Lets the per-control spinner survive navigation: after a remount
 // the local optimistic state is gone, but this still pins a spinner to the
@@ -86,14 +95,6 @@ function linkStateColor(state: string): string {
   }
 }
 
-function parseAddresses(json: string): { address: string; prefix_len: number; family: string }[] {
-  try {
-    return JSON.parse(json)
-  } catch {
-    return []
-  }
-}
-
 function Spinner() {
   return (
     <svg className="animate-spin h-3.5 w-3.5 text-blue-400 inline-block" viewBox="0 0 24 24" fill="none">
@@ -120,7 +121,10 @@ export default function InterfaceManager({
   const [setFibForwarding] = useMutation(SET_FIB_FORWARDING)
   const [setUrpf] = useMutation(SET_URPF)
   const [setInspectInterface] = useMutation(SET_INSPECT)
+  const [setInterfaceDefaultAction] = useMutation(SET_DEFAULT_ACTION)
   const [editingTag, setEditingTag] = useState<{ name: string; value: string } | null>(null)
+  // Interface currently open in the configure dialog (null = closed).
+  const [configuring, setConfiguring] = useState<string | null>(null)
   // Map key: "ifname:dir", value: expected attached state after op completes
   const [pending, setPending] = useState<Map<string, boolean>>(new Map())
   // Map key: ifname, value: expected fibForwarding state after op completes
@@ -129,11 +133,14 @@ export default function InterfaceManager({
   const [urpfPending, setUrpfPending] = useState<Map<string, string>>(new Map())
   // Map key: ifname, value: expected inspectEnabled state after op completes
   const [inspectPending, setInspectPending] = useState<Map<string, boolean>>(new Map())
+  // Map key: "ifname:dir", value: expected default action ("pass"/"drop") after op completes
+  const [actionPending, setActionPending] = useState<Map<string, string>>(new Map())
   const [error, setError] = useState<string | null>(null)
   const prevPendingSizeRef = useRef(0)
   const prevFibPendingSizeRef = useRef(0)
   const prevUrpfPendingSizeRef = useRef(0)
   const prevInspectPendingSizeRef = useRef(0)
+  const prevActionPendingSizeRef = useRef(0)
 
   // Clear pending entries once the interface state reflects the expected outcome.
   useEffect(() => {
@@ -141,7 +148,8 @@ export default function InterfaceManager({
       pending.size === 0 &&
       fibPending.size === 0 &&
       urpfPending.size === 0 &&
-      inspectPending.size === 0
+      inspectPending.size === 0 &&
+      actionPending.size === 0
     )
       return
 
@@ -182,6 +190,17 @@ export default function InterfaceManager({
       if (iface.inspectEnabled === expected) { nextInspect.delete(ifaceName); inspectChanged = true }
     }
     if (inspectChanged) setInspectPending(nextInspect)
+
+    let actionChanged = false
+    const nextAction = new Map(actionPending)
+    for (const [key, expected] of actionPending) {
+      const [ifaceName, dir] = key.split(':')
+      const iface = interfaces.find((i) => i.name === ifaceName)
+      if (!iface) continue
+      const actual = ((dir === 'ingress' ? iface.ingressDefaultAction : iface.egressDefaultAction) ?? 'pass').toLowerCase()
+      if (actual === expected) { nextAction.delete(key); actionChanged = true }
+    }
+    if (actionChanged) setActionPending(nextAction)
     // Intentionally re-evaluates only when fresh interface state arrives; the
     // pending maps are read, not watched (a pending entry clears the moment the
     // interface it targets reaches the expected value).
@@ -230,6 +249,16 @@ export default function InterfaceManager({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inspectPending])
 
+  // Clear pending-confirm badge when the default-action spinner resolves.
+  useEffect(() => {
+    const prevSize = prevActionPendingSizeRef.current
+    prevActionPendingSizeRef.current = actionPending.size
+    if (prevSize > 0 && actionPending.size === 0) {
+      onPendingChange?.(false)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [actionPending])
+
   async function handleSaveTag(interfaceName: string, tag: string) {
     if (tag.trim()) {
       await tagInterface({ variables: { nodeId, interfaceName, tag: tag.trim() } })
@@ -267,6 +296,14 @@ export default function InterfaceManager({
 
   function isUrpfPending(ifaceName: string): boolean {
     return urpfPending.has(ifaceName) || serverPending(ifaceName, 'set_urpf')
+  }
+
+  function isActionPending(ifaceName: string, dir: string): boolean {
+    if (actionPending.has(`${ifaceName}:${dir}`)) return true
+    return !!pendingGeneration
+      && pendingGeneration.opKind === 'set_default_action'
+      && pendingGeneration.interfaceName === ifaceName
+      && pendingGeneration.direction === dir
   }
 
   function clearError() { setError(null) }
@@ -363,6 +400,27 @@ export default function InterfaceManager({
     }
   }
 
+  async function handleSetDefaultAction(ifaceName: string, dir: string, action: string) {
+    const key = `${ifaceName}:${dir}`
+    setError(null)
+    onPendingChange?.(true, 'set_default_action')
+    setActionPending((prev) => new Map(prev).set(key, action))
+    try {
+      const res = await setInterfaceDefaultAction({ variables: { nodeId, interfaceName: ifaceName, direction: dir, action } })
+      const r = res.data?.setInterfaceDefaultAction
+      if (!r?.success) {
+        setError(r?.message ?? 'Default action change failed')
+        setActionPending((prev) => { const next = new Map(prev); next.delete(key); return next })
+        onPendingChange?.(false)
+      }
+      // On success: badge clears via the actionPending→empty useEffect
+    } catch (e) {
+      setError(String(e).replace(/^ApolloError:\s*/, ''))
+      setActionPending((prev) => { const next = new Map(prev); next.delete(key); return next })
+      onPendingChange?.(false)
+    }
+  }
+
   async function handleSetUrpf(ifaceName: string, mode: string) {
     setError(null)
     onPendingChange?.(true, 'set_urpf')
@@ -383,6 +441,10 @@ export default function InterfaceManager({
     }
   }
 
+  // Live row for the interface open in the configure dialog, so refetches
+  // (and agent confirms) update the dialog's controls in place.
+  const configuringIface = configuring != null ? (interfaces.find((i) => i.name === configuring) ?? null) : null
+
   if (interfaces.length === 0) {
     return (
       <div className="text-sm text-gray-600 py-4 px-4">
@@ -402,8 +464,8 @@ export default function InterfaceManager({
       <table className="w-full text-xs">
         <thead className="text-gray-500 uppercase bg-gray-900/50">
           <tr>
-            {['Interface', 'Link', 'Addresses', 'Ingress', 'Egress'].map((h) => (
-              <th key={h} className="px-3 py-1.5 text-left font-medium">{h}</th>
+            {['Interface', 'Link', 'Addresses', 'Ingress', 'Egress', ''].map((h, i) => (
+              <th key={i} className="px-3 py-1.5 text-left font-medium">{h}</th>
             ))}
           </tr>
         </thead>
@@ -468,40 +530,41 @@ export default function InterfaceManager({
                     : addrs.map((a) => `${a.address}/${a.prefix_len}`).join(', ')}
                 </td>
                 <td className="px-3 py-1.5">
-                  <AttachCell
+                  <StatusCell
                     attached={iface.xdpAttached}
-                    pending={isPending(iface.name, 'ingress')}
-                    hasRules={hasIngressRules}
-                    labelTitle={
-                      iface.fibForwarding && iface.xdpAttached
-                        ? 'Ingress enabled with express FIB forwarding. ' +
-                          'Allowed transit packets are forwarded at line rate via bpf_fib_lookup — ' +
-                          'they bypass the kernel stack entirely, which also means egress filtering ' +
-                          'on the outbound interface is NOT applied to forwarded traffic.'
-                        : undefined
+                    pending={
+                      isPending(iface.name, 'ingress') ||
+                      isFibPending(iface.name) ||
+                      isUrpfPending(iface.name) ||
+                      isInspectPending(iface.name) ||
+                      isActionPending(iface.name, 'ingress')
                     }
-                    onAttach={() => handleAttach(iface.name, 'ingress')}
-                    onDetach={() => handleDetach(iface.name, 'ingress')}
-                    attachTitle="Enable ingress filtering"
-                    detachTitle="Disable ingress filtering"
-                    extra={
+                    hasRules={hasIngressRules}
+                    chips={
                       iface.xdpAttached ? (
                         <>
-                          <FibToggle
-                            enabled={iface.fibForwarding}
-                            pending={isFibPending(iface.name)}
-                            onToggle={(v) => handleToggleFib(iface.name, v)}
-                          />
-                          <UrpfControl
-                            mode={iface.urpfMode ?? 'off'}
-                            pending={isUrpfPending(iface.name)}
-                            onChange={(m) => handleSetUrpf(iface.name, m)}
-                          />
-                          {suricataCapable && (
-                            <InspectToggle
-                              enabled={iface.inspectEnabled}
-                              pending={isInspectPending(iface.name)}
-                              onToggle={(v) => handleToggleInspect(iface.name, v)}
+                          {(iface.ingressDefaultAction ?? 'pass').toLowerCase() === 'drop' && (
+                            <Chip label="default DROP" cls="bg-red-900/40 border-red-700 text-red-300" title="Unmatched ingress packets are dropped" />
+                          )}
+                          {iface.fibForwarding && (
+                            <Chip
+                              label="FWD"
+                              cls="bg-amber-900/40 border-amber-700 text-amber-300"
+                              title="FIB forwarding enabled — transit traffic forwarded via bpf_fib_lookup, bypassing the kernel stack and egress filtering"
+                            />
+                          )}
+                          {(iface.urpfMode ?? 'off').toLowerCase() !== 'off' && (
+                            <Chip
+                              label={`uRPF ${iface.urpfMode.toLowerCase()}`}
+                              cls="bg-purple-900/40 border-purple-700 text-purple-300"
+                              title="uRPF drops source-spoofed ingress traffic"
+                            />
+                          )}
+                          {suricataCapable && iface.inspectEnabled && (
+                            <Chip
+                              label="IDS"
+                              cls="bg-purple-900/40 border-purple-700 text-purple-300"
+                              title="Suricata inspection enabled — INSPECT-matched flows are mirrored to Suricata"
                             />
                           )}
                         </>
@@ -510,180 +573,101 @@ export default function InterfaceManager({
                   />
                 </td>
                 <td className="px-3 py-1.5">
-                  <AttachCell
+                  <StatusCell
                     attached={iface.tcAttached}
-                    pending={isPending(iface.name, 'egress')}
+                    pending={isPending(iface.name, 'egress') || isActionPending(iface.name, 'egress')}
                     hasRules={hasEgressRules}
-                    onAttach={() => handleAttach(iface.name, 'egress')}
-                    onDetach={() => handleDetach(iface.name, 'egress')}
-                    attachTitle="Enable egress filtering"
-                    detachTitle="Disable egress filtering"
+                    chips={
+                      iface.tcAttached && (iface.egressDefaultAction ?? 'pass').toLowerCase() === 'drop' ? (
+                        <Chip label="default DROP" cls="bg-red-900/40 border-red-700 text-red-300" title="Unmatched egress packets are dropped" />
+                      ) : null
+                    }
                   />
+                </td>
+                <td className="px-3 py-1.5 text-right">
+                  <button
+                    onClick={() => setConfiguring(iface.name)}
+                    className="px-2 py-0.5 rounded text-xs border border-gray-600 text-blue-400 hover:text-blue-300 hover:border-blue-600"
+                    title={`Configure ${iface.name}: filtering, default action, FIB forwarding, uRPF and IDS inspection`}
+                  >
+                    Configure
+                  </button>
                 </td>
               </tr>
             )
           })}
         </tbody>
       </table>
+      {configuringIface && (
+        <InterfaceConfigDialog
+          iface={configuringIface}
+          suricataCapable={suricataCapable}
+          hasIngressRules={hasRules(configuringIface.name, 'ingress')}
+          hasEgressRules={hasRules(configuringIface.name, 'egress')}
+          error={error}
+          onClearError={clearError}
+          attachPending={(dir) => isPending(configuringIface.name, dir)}
+          actionPending={(dir) => isActionPending(configuringIface.name, dir)}
+          fibPending={isFibPending(configuringIface.name)}
+          urpfPending={isUrpfPending(configuringIface.name)}
+          inspectPending={isInspectPending(configuringIface.name)}
+          onAttach={(dir) => handleAttach(configuringIface.name, dir)}
+          onDetach={(dir) => handleDetach(configuringIface.name, dir)}
+          onSetDefaultAction={(dir, action) => handleSetDefaultAction(configuringIface.name, dir, action)}
+          onToggleFib={(v) => handleToggleFib(configuringIface.name, v)}
+          onSetUrpf={(m) => handleSetUrpf(configuringIface.name, m)}
+          onToggleInspect={(v) => handleToggleInspect(configuringIface.name, v)}
+          onClose={() => setConfiguring(null)}
+        />
+      )}
     </div>
   )
 }
 
-function AttachCell({
-  attached,
-  pending,
-  hasRules,
-  labelTitle,
-  onAttach,
-  onDetach,
-  attachTitle,
-  detachTitle,
-  extra,
-}: {
-  attached: boolean
-  pending: boolean
-  hasRules: boolean
-  labelTitle?: string
-  onAttach: () => void
-  onDetach: () => void
-  attachTitle: string
-  detachTitle: string
-  extra?: React.ReactNode
-}) {
-  if (pending) {
-    return <Spinner />
-  }
-
-  if (attached) {
-    return (
-      <span className="inline-flex items-center gap-1">
-        <span className="w-2 h-2 rounded-full bg-green-400 inline-block" title={labelTitle} />
-        {hasRules && (
-          <span className="text-green-500 text-[10px]" title="Policy rules active">P</span>
-        )}
-        <button
-          onClick={onDetach}
-          className="text-red-500 hover:text-red-400"
-          title={detachTitle}
-        >
-          Detach
-        </button>
-        {extra}
-      </span>
-    )
-  }
-
+function Chip({ label, cls, title }: { label: string; cls: string; title?: string }) {
   return (
-    <span className="inline-flex items-center gap-1">
-      <span className="w-2 h-2 rounded-full bg-gray-600 inline-block" title="Not attached" />
-      <button
-        onClick={onAttach}
-        className="text-blue-400 hover:text-blue-300"
-        title={attachTitle}
-      >
-        Attach
-      </button>
+    <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium border whitespace-nowrap ${cls}`} title={title}>
+      {label}
     </span>
   )
 }
 
-function InspectToggle({
-  enabled,
+/** Read-only per-direction summary: attach state dot, rules badge and the
+ *  active feature chips. All changes go through the Configure dialog. */
+function StatusCell({
+  attached,
   pending,
-  onToggle,
+  hasRules,
+  chips,
 }: {
-  enabled: boolean
+  attached: boolean
   pending: boolean
-  onToggle: (v: boolean) => void
+  hasRules: boolean
+  chips?: React.ReactNode
 }) {
   if (pending) {
     return <Spinner />
   }
-  const title = enabled
-    ? 'Suricata inspection enabled on this interface — INSPECT-matched flows are mirrored ' +
-      'to Suricata while the node inspect mode (IPS/IDS) is active. Click to disable.'
-    : 'Enable Suricata inspection on this interface. Requires an active node inspect mode ' +
-      '(IPS/IDS) and INSPECT rules to select traffic.'
-  return (
-    <button
-      onClick={() => onToggle(!enabled)}
-      className={`ml-1 px-1.5 py-0.5 rounded text-[10px] font-medium border ${
-        enabled
-          ? 'bg-purple-900/40 border-purple-700 text-purple-300 hover:bg-purple-900/60'
-          : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-gray-200'
-      }`}
-      title={title}
-    >
-      IDS {enabled ? 'on' : 'off'}
-    </button>
-  )
-}
 
-function FibToggle({
-  enabled,
-  pending,
-  onToggle,
-}: {
-  enabled: boolean
-  pending: boolean
-  onToggle: (v: boolean) => void
-}) {
-  if (pending) {
-    return <Spinner />
-  }
-  const title = enabled
-    ? 'FIB forwarding enabled — transit traffic forwarded via bpf_fib_lookup. ' +
-      'Bypasses the kernel stack, so egress filtering on the outbound interface is NOT applied. Click to disable.'
-    : 'Enable FIB forwarding on this ingress interface. Allowed transit packets will be ' +
-      'forwarded at line rate, bypassing the kernel stack and any egress filtering.'
   return (
-    <button
-      onClick={() => onToggle(!enabled)}
-      className={`ml-1 px-1.5 py-0.5 rounded text-[10px] font-medium border ${
-        enabled
-          ? 'bg-amber-900/40 border-amber-700 text-amber-300 hover:bg-amber-900/60'
-          : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-gray-200'
-      }`}
-      title={title}
-    >
-      FWD {enabled ? 'on' : 'off'}
-    </button>
-  )
-}
-
-function UrpfControl({
-  mode,
-  pending,
-  onChange,
-}: {
-  mode: string
-  pending: boolean
-  onChange: (mode: string) => void
-}) {
-  if (pending) {
-    return <Spinner />
-  }
-  const m = (mode || 'off').toLowerCase()
-  const on = m !== 'off'
-  return (
-    <select
-      value={m}
-      onChange={(e) => onChange(e.target.value)}
-      title={
-        'uRPF (unicast Reverse Path Filtering) drops source-spoofed ingress traffic. ' +
-        'Loose: drop only if no route to the source exists. ' +
-        'Strict: drop unless the route back to the source exits via this interface. ' +
-        'Ingress-only; never applied on egress.'
-      }
-      className={`ml-1 px-1 py-0.5 rounded text-[10px] font-medium border bg-gray-900 ${
-        on
-          ? 'border-purple-700 text-purple-300'
-          : 'border-gray-700 text-gray-400'
-      }`}
-    >
-      <option value="off">uRPF off</option>
-      <option value="loose">uRPF loose</option>
-      <option value="strict">uRPF strict</option>
-    </select>
+    <span className="inline-flex items-center gap-1.5 flex-wrap">
+      <span
+        className={`w-2 h-2 rounded-full inline-block ${attached ? 'bg-green-400' : 'bg-gray-600'}`}
+        title={attached ? 'Program attached — filtering active' : 'Not attached'}
+      />
+      <span className={attached ? 'text-gray-300' : 'text-gray-600'}>{attached ? 'on' : 'off'}</span>
+      {hasRules && attached && (
+        <span className="text-green-500 text-[10px]" title="Policy rules active">P</span>
+      )}
+      {hasRules && !attached && (
+        <span
+          className="text-amber-400"
+          title="Rules exist but the program is not attached — they are not enforced"
+        >
+          ⚠
+        </span>
+      )}
+      {chips}
+    </span>
   )
 }

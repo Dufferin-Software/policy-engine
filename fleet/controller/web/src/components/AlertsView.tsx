@@ -101,7 +101,6 @@ export default function AlertsView() {
       }
     }
     return () => ws.close()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeFilter, minSeverity])
 
   const historical = data?.suricataAlerts ?? []
