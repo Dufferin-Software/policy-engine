@@ -1745,45 +1745,81 @@ async fn process_snapshot(
 ///
 /// On any error (e.g. policy-engine not yet attached), logs a warning and
 /// returns an empty snapshot so the controller can push the desired state.
+/// How many times [`probe_capabilities`] attempts to reach the local engine,
+/// and the pause between attempts. The advertisement is sent once per stream
+/// and only heals on reconnect, so losing the boot race against the engine's
+/// GraphQL bind (`policy-engine.service` is `Type=simple` — systemd ordering
+/// does not wait for the socket) would leave the node advertised as vanilla
+/// indefinitely. Retrying for a few seconds covers that window without
+/// stalling connection setup when the engine is genuinely down.
+const CAPABILITY_PROBE_ATTEMPTS: u32 = 5;
+const CAPABILITY_PROBE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Probe the local engine's compile-time features and derive the capability
 /// advertisement for AgentHello: the `features` list gates which controller
 /// message types are valid for this node, and `sources` feeds the
 /// controller's alert-rule write-time validation.
 ///
 /// The baseline (`policy_events`, no features) is returned when no local
-/// engine URL is configured or the engine is unreachable — a temporarily
-/// down engine must not be mistaken for one built without a feature, and
-/// the probe reruns on every reconnect so the advertisement heals itself.
+/// engine URL is configured or the engine stays unreachable across all
+/// attempts — a temporarily down engine must not be mistaken for one built
+/// without a feature, and the probe reruns on every reconnect so the
+/// advertisement heals itself.
 async fn probe_capabilities(graphql_url: Option<&str>) -> (Vec<String>, Vec<String>) {
+    probe_capabilities_with_retry(
+        graphql_url,
+        CAPABILITY_PROBE_ATTEMPTS,
+        CAPABILITY_PROBE_RETRY_DELAY,
+    )
+    .await
+}
+
+async fn probe_capabilities_with_retry(
+    graphql_url: Option<&str>,
+    attempts: u32,
+    retry_delay: std::time::Duration,
+) -> (Vec<String>, Vec<String>) {
     let mut features = Vec::new();
     let mut sources = vec!["policy_events".to_string()];
     let Some(url) = graphql_url else {
         return (features, sources);
     };
 
-    let url = url.to_string();
-    let probed = tokio::task::spawn_blocking(move || {
-        use policy_engine_dev::{ClientConfig, PolicyClient};
-        let client = PolicyClient::with_config(ClientConfig {
-            server_url: url,
-            ..Default::default()
-        });
-        client.server_features()
-    })
-    .await;
+    for attempt in 1..=attempts {
+        let url = url.to_string();
+        let probed = tokio::task::spawn_blocking(move || {
+            use policy_engine_dev::{ClientConfig, PolicyClient};
+            let client = PolicyClient::with_config(ClientConfig {
+                server_url: url,
+                ..Default::default()
+            });
+            client.server_features()
+        })
+        .await;
 
-    match probed {
-        Ok(Ok(f)) => {
-            if f.suricata {
-                features.push("suricata".to_string());
-                sources.push("suricata_alerts".to_string());
+        match probed {
+            Ok(Ok(f)) => {
+                if f.suricata {
+                    features.push("suricata".to_string());
+                    sources.push("suricata_alerts".to_string());
+                }
+                return (features, sources);
+            }
+            Ok(Err(e)) if attempt < attempts => {
+                log::info!(
+                    "Capability probe attempt {attempt}/{attempts} failed, retrying in {}s: {e:#}",
+                    retry_delay.as_secs_f32()
+                );
+                tokio::time::sleep(retry_delay).await;
+            }
+            Ok(Err(e)) => log::warn!(
+                "Capability probe failed after {attempts} attempts; advertising baseline capabilities: {e:#}"
+            ),
+            Err(e) => {
+                log::warn!("Capability probe task panicked: {:#}", e);
+                break;
             }
         }
-        Ok(Err(e)) => log::warn!(
-            "Capability probe failed; advertising baseline capabilities: {:#}",
-            e
-        ),
-        Err(e) => log::warn!("Capability probe task panicked: {:#}", e),
     }
     (features, sources)
 }
@@ -2631,11 +2667,61 @@ mod tests {
 
     #[tokio::test]
     async fn probe_capabilities_unreachable_engine_advertises_baseline() {
-        // Nothing listens on port 1; the probe must degrade to baseline
-        // capabilities rather than fail the connection setup.
-        let (features, sources) = probe_capabilities(Some("http://127.0.0.1:1/graphql")).await;
+        // Nothing listens on port 1; the probe must exhaust its retries and
+        // degrade to baseline capabilities rather than fail connection setup.
+        let (features, sources) = probe_capabilities_with_retry(
+            Some("http://127.0.0.1:1/graphql"),
+            2,
+            std::time::Duration::from_millis(10),
+        )
+        .await;
         assert!(features.is_empty());
         assert_eq!(sources, vec!["policy_events".to_string()]);
+    }
+
+    /// Refuse the first connection (accept + immediate close, no response),
+    /// then serve one canned GraphQL response — the engine winning its
+    /// GraphQL bind race between two probe attempts.
+    fn flaky_then_graphql_server(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}/graphql")
+    }
+
+    #[tokio::test]
+    async fn probe_capabilities_retries_until_engine_is_reachable() {
+        let url = flaky_then_graphql_server(r#"{"data":{"serverFeatures":{"suricata":true}}}"#);
+        let (features, sources) =
+            probe_capabilities_with_retry(Some(&url), 3, std::time::Duration::from_millis(10))
+                .await;
+        assert_eq!(features, vec!["suricata".to_string()]);
+        assert_eq!(
+            sources,
+            vec!["policy_events".to_string(), "suricata_alerts".to_string()]
+        );
     }
 
     #[tokio::test]
