@@ -542,7 +542,8 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
-    /// Query persisted policy match events (newest first, cursor paginated).
+    /// Query buffered policy match events (newest first, cursor paginated).
+    /// Events live in a bounded in-memory buffer — not persisted to disk.
     #[graphql(guard = "Require::new(\"event:read\")")]
     async fn events(
         &self,
@@ -554,7 +555,7 @@ impl QueryRoot {
         resolve_events(ctx, filter, limit, cursor).await
     }
 
-    /// Aggregate persisted events into time/dimension buckets.
+    /// Aggregate buffered events into time/dimension buckets.
     #[graphql(guard = "Require::new(\"event:read\")")]
     async fn event_aggregate(
         &self,
@@ -2116,6 +2117,17 @@ impl MutationRoot {
         crate::graphql::suricata::resolve_clear_suricata_alerts(ctx, node_id).await
     }
 
+    /// Empty the tenant's in-memory policy-event buffer, optionally scoped
+    /// to one node. Events are never persisted, so this is irreversible.
+    #[graphql(guard = "Require::new(\"event:delete\")")]
+    async fn clear_events(
+        &self,
+        ctx: &Context<'_>,
+        node_id: Option<ID>,
+    ) -> Result<OperationResult> {
+        crate::graphql::events::resolve_clear_events(ctx, node_id).await
+    }
+
     /// Force a gated ruleset sync of one node and wait for the agent's
     /// confirm. Returns success with a note when the node is already in sync.
     #[graphql(guard = "Require::new(\"node:write\")")]
@@ -2791,7 +2803,6 @@ async fn drive_pending(
 pub type ControllerSchema = Schema<QueryRoot, MutationRoot, EmptySubscription>;
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn build_schema(
     registry: Arc<NodeRegistry>,
     store: Arc<dyn ControllerStore>,
@@ -2801,6 +2812,7 @@ pub fn build_schema(
     metrics_store: Arc<MetricsStore>,
     rule_lifecycle_bus: Arc<RuleLifecycleBus>,
     tenant_scope: Arc<TenantScope>,
+    events: Arc<crate::event_pipeline::EventStore>,
     alert_rule_bus: Arc<AlertRuleBus>,
     api_token_store: Arc<ApiTokenStore>,
     operator_store: Arc<crate::operators::OperatorStore>,
@@ -2817,6 +2829,7 @@ pub fn build_schema(
         .data(metrics_store)
         .data(rule_lifecycle_bus)
         .data(tenant_scope)
+        .data(events)
         .data(alert_rule_bus)
         .data(api_token_store)
         .data(operator_store)
@@ -2934,6 +2947,7 @@ mod tests {
         pending: Arc<PendingRegistry>,
         flow_queries: Arc<FlowQueryRegistry>,
         metrics_store: Arc<MetricsStore>,
+        events: Arc<crate::event_pipeline::EventStore>,
     }
 
     async fn make_harness() -> TestHarness {
@@ -2971,6 +2985,7 @@ mod tests {
             let rbac = Arc::new(crate::rbac::RbacStore::new(pool));
             (scope, tokens, ops, rbac)
         };
+        let events = Arc::new(crate::event_pipeline::EventStore::new());
         let schema = build_schema(
             Arc::clone(&registry),
             Arc::clone(&store),
@@ -2980,6 +2995,7 @@ mod tests {
             Arc::clone(&metrics_store),
             Arc::new(crate::rule_lifecycle_bus::RuleLifecycleBus::new()),
             tenant_scope,
+            Arc::clone(&events),
             Arc::new(AlertRuleBus::new()),
             api_token_store,
             operator_store,
@@ -2996,11 +3012,72 @@ mod tests {
             pending,
             flow_queries,
             metrics_store,
+            events,
         }
     }
 
     async fn make_schema() -> ControllerSchema {
         make_harness().await.schema
+    }
+
+    #[tokio::test]
+    async fn events_query_and_clear_events_round_trip() {
+        use crate::event_pipeline::types::{Action, Direction, PolicyEvent};
+
+        fn evt(node: &str) -> PolicyEvent {
+            PolicyEvent {
+                ts_ns: 1_700_000_000_000_000_000,
+                node_id: node.to_string(),
+                rule_id: 7,
+                action: Action::Drop,
+                verdict: 1,
+                direction: Direction::Ingress,
+                ifindex: 2,
+                proto: 6,
+                src_ip: vec![10, 0, 0, 1],
+                dst_ip: vec![10, 0, 0, 2],
+                sport: 1000,
+                dport: 22,
+                pkt_len: 64,
+                flags: None,
+                sni: None,
+            }
+        }
+
+        let h = make_harness().await;
+        // test_admin principal is tenant_id 1 (the bootstrapped default).
+        h.events.insert_batch(1, &[evt("n1"), evt("n2")]);
+
+        let res = h
+            .schema
+            .execute("{ events { items { nodeId action } nextCursor } }")
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let v = res.data.into_json().unwrap();
+        assert_eq!(v["events"]["items"].as_array().unwrap().len(), 2);
+
+        // Node-scoped clear only removes that node's events.
+        let res = h
+            .schema
+            .execute(r#"mutation { clearEvents(nodeId: "n1") { success message } }"#)
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+
+        let res = h.schema.execute("{ events { items { nodeId } } }").await;
+        let v = res.data.into_json().unwrap();
+        let items = v["events"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["nodeId"], "n2");
+
+        // Tenant-wide clear empties the buffer.
+        let res = h
+            .schema
+            .execute("mutation { clearEvents { success } }")
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let res = h.schema.execute("{ events { items { id } } }").await;
+        let v = res.data.into_json().unwrap();
+        assert!(v["events"]["items"].as_array().unwrap().is_empty());
     }
 
     /// Upsert a minimal active node in the default tenant. Required by the

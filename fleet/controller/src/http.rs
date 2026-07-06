@@ -463,6 +463,7 @@ fn build_filter(q: &EventsRestQuery) -> std::result::Result<EventFilter, String>
 
 async fn rest_events_handler(
     tenant_scope: Data<Arc<TenantScope>>,
+    events: Data<Arc<EventStore>>,
     query: Query<EventsRestQuery>,
 ) -> HttpResponse {
     let q = query.into_inner();
@@ -471,11 +472,7 @@ async fn rest_events_handler(
         Err(e) => return HttpResponse::BadRequest().body(e),
     };
     let limit = q.limit.unwrap_or(100).clamp(1, 10_000);
-    let store = EventStore::new(&tenant_scope);
-    let rows = match store.list(&filter, limit).await {
-        Ok(r) => r,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("{e:#}")),
-    };
+    let rows = events.list(tenant_scope.tenant_id(), &filter, limit);
 
     match q.format.as_deref() {
         Some("logs") => HttpResponse::Ok().json(rows_as_logs(&rows)),
@@ -574,6 +571,7 @@ fn parse_group_by(s: &str) -> std::result::Result<GroupBy, String> {
 
 async fn rest_events_aggregate_handler(
     tenant_scope: Data<Arc<TenantScope>>,
+    events: Data<Arc<EventStore>>,
     query: Query<AggregateRestQuery>,
 ) -> HttpResponse {
     let q = query.into_inner();
@@ -585,11 +583,7 @@ async fn rest_events_aggregate_handler(
         Ok(f) => f,
         Err(e) => return HttpResponse::BadRequest().body(e),
     };
-    let store = EventStore::new(&tenant_scope);
-    let buckets = match store.aggregate(&filter, gb).await {
-        Ok(b) => b,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("{e:#}")),
-    };
+    let buckets = events.aggregate(tenant_scope.tenant_id(), &filter, gb);
 
     match q.format.as_deref() {
         Some("timeseries") => {
@@ -823,13 +817,14 @@ mod rest_tests {
     use actix_web::{test, App};
     use sqlx::sqlite::SqlitePool;
 
-    async fn setup_scope_with_rows() -> Arc<TenantScope> {
+    async fn setup_scope_with_rows() -> (Arc<TenantScope>, Arc<EventStore>) {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         let scope = Arc::new(bootstrap_default_tenant(pool).await.unwrap());
-        let store = EventStore::new(&scope);
-        store
-            .insert_batch(&[
+        let events = Arc::new(EventStore::new());
+        events.insert_batch(
+            scope.tenant_id(),
+            &[
                 PolicyEvent {
                     ts_ns: 1_700_000_000_000_000_000,
                     node_id: "n1".into(),
@@ -864,18 +859,18 @@ mod rest_tests {
                     flags: None,
                     sni: None,
                 },
-            ])
-            .await
-            .unwrap();
-        scope
+            ],
+        );
+        (scope, events)
     }
 
     #[actix_web::test]
     async fn rest_events_returns_table() {
-        let scope = setup_scope_with_rows().await;
+        let (scope, events) = setup_scope_with_rows().await;
         let app = test::init_service(
             App::new()
                 .app_data(Data::new(scope))
+                .app_data(Data::new(events))
                 .route("/api/v1/events", web::get().to(rest_events_handler)),
         )
         .await;
@@ -888,10 +883,11 @@ mod rest_tests {
 
     #[actix_web::test]
     async fn rest_events_filters_action() {
-        let scope = setup_scope_with_rows().await;
+        let (scope, events) = setup_scope_with_rows().await;
         let app = test::init_service(
             App::new()
                 .app_data(Data::new(scope))
+                .app_data(Data::new(events))
                 .route("/api/v1/events", web::get().to(rest_events_handler)),
         )
         .await;
@@ -911,7 +907,7 @@ mod rest_tests {
             AlertStore, NewAlertHistory, NewAlertRule, NewReceiver,
         };
 
-        let scope = setup_scope_with_rows().await;
+        let (scope, _events) = setup_scope_with_rows().await;
         let astore = AlertStore::new(&scope);
         let r = astore
             .create_receiver(NewReceiver {
@@ -983,7 +979,7 @@ mod rest_tests {
             AlertStore, NewAlertHistory, NewAlertRule, NewReceiver,
         };
 
-        let scope = setup_scope_with_rows().await;
+        let (scope, _events) = setup_scope_with_rows().await;
         let astore = AlertStore::new(&scope);
         let r = astore
             .create_receiver(NewReceiver {
@@ -1078,11 +1074,16 @@ mod rest_tests {
 
     #[actix_web::test]
     async fn rest_aggregate_by_action() {
-        let scope = setup_scope_with_rows().await;
-        let app = test::init_service(App::new().app_data(Data::new(scope)).route(
-            "/api/v1/events/aggregate",
-            web::get().to(rest_events_aggregate_handler),
-        ))
+        let (scope, events) = setup_scope_with_rows().await;
+        let app = test::init_service(
+            App::new()
+                .app_data(Data::new(scope))
+                .app_data(Data::new(events))
+                .route(
+                    "/api/v1/events/aggregate",
+                    web::get().to(rest_events_aggregate_handler),
+                ),
+        )
         .await;
 
         let req = test::TestRequest::get()
@@ -1090,7 +1091,7 @@ mod rest_tests {
             .to_request();
         let resp: serde_json::Value = test::call_and_read_body_json(&app, req).await;
         let rows = resp["rows"].as_array().unwrap();
-        // One bucket per action discriminator (1=drop, 2=log).
+        // One bucket per action (drop, log).
         assert_eq!(rows.len(), 2);
     }
 }
@@ -1378,6 +1379,7 @@ pub fn start_http_server(
     store: Arc<dyn ControllerStore>,
     sessions: Arc<NodeSessionManager>,
     tenant_scope: Arc<TenantScope>,
+    events: Arc<EventStore>,
     event_metrics: Arc<EventPipelineMetrics>,
     alert_metrics: Arc<crate::event_pipeline::alert_metrics::AlertPipelineMetrics>,
     bearer_auth_state: BearerAuthState,
@@ -1393,6 +1395,7 @@ pub fn start_http_server(
     let store_data = Data::new(store);
     let sessions_data = Data::new(sessions);
     let tenant_scope_data = Data::new(tenant_scope);
+    let events_data = Data::new(events);
     let event_metrics_data = Data::new(event_metrics);
     let alert_metrics_data = Data::new(alert_metrics);
     let bearer_auth_data = Data::new(bearer_auth_state);
@@ -1421,6 +1424,7 @@ pub fn start_http_server(
             .app_data(store_data.clone())
             .app_data(sessions_data.clone())
             .app_data(tenant_scope_data.clone())
+            .app_data(events_data.clone())
             .app_data(event_metrics_data.clone())
             .app_data(alert_metrics_data.clone())
             .app_data(bearer_auth_data.clone())

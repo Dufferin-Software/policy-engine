@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         metrics_store,
         rule_lifecycle,
         scope,
+        Arc::new(policy_controller::event_pipeline::EventStore::new()),
         alert_rule_bus,
         api_token_store,
         operator_store,

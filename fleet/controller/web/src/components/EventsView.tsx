@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { useQuery, gql } from '@apollo/client'
+import { useQuery, useMutation, gql } from '@apollo/client'
 import { shortId } from './types.ts'
 
 // ── GraphQL ────────────────────────────────────────────────────────────────
@@ -63,6 +63,12 @@ interface InterfaceIndexEntry {
 interface InterfacesIndexResp {
   allNodeInterfaces: InterfaceIndexEntry[]
 }
+
+const CLEAR_EVENTS = gql`
+  mutation ClearEvents {
+    clearEvents { success message }
+  }
+`
 
 const AGGREGATE_QUERY = gql`
   query EventAggregate(
@@ -424,7 +430,7 @@ export default function EventsView({ onNavigateToNode }: EventsViewProps = {}) {
     return Object.keys(rest).length === 0 ? undefined : rest
   }, [filterVar])
 
-  const { data: agg } = useQuery<AggregateResp>(AGGREGATE_QUERY, {
+  const { data: agg, refetch: refetchAgg } = useQuery<AggregateResp>(AGGREGATE_QUERY, {
     variables: {
       filter: aggregateFilter,
       groupBy: 'MINUTE',
@@ -433,6 +439,27 @@ export default function EventsView({ onNavigateToNode }: EventsViewProps = {}) {
     },
     fetchPolicy: 'network-only',
   })
+
+  // ── Clear (server-side buffer purge) ──
+  const [clearEvents, { loading: clearing }] = useMutation<{
+    clearEvents: { success: boolean; message: string | null }
+  }>(CLEAR_EVENTS)
+
+  const onClear = useCallback(async () => {
+    if (!confirm('Clear all buffered events across the fleet? This cannot be undone.')) return
+    try {
+      await clearEvents()
+      setItems([])
+      setLiveBuf([])
+      setCursor(null)
+      await Promise.all([
+        refetchPage({ filter: filterVar, limit: PAGE_SIZE, cursor: null }),
+        refetchAgg(),
+      ])
+    } catch {
+      // surfaced via pageError on the next refetch; nothing else to do
+    }
+  }, [clearEvents, refetchPage, refetchAgg, filterVar])
 
   // ── Live WS feed ──
   const wsRef = useRef<WebSocket | null>(null)
@@ -514,16 +541,26 @@ export default function EventsView({ onNavigateToNode }: EventsViewProps = {}) {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold text-gray-200">Events</h2>
-        <button
-          onClick={() => setLiveEnabled((v) => !v)}
-          className={`px-3 py-1.5 rounded text-sm font-medium ${
-            liveEnabled
-              ? 'bg-green-700 hover:bg-green-600 text-white'
-              : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
-          }`}
-        >
-          {liveEnabled ? '● Live' : '○ Live'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={onClear}
+            disabled={clearing}
+            className="px-3 py-1.5 rounded text-sm font-medium bg-gray-700 hover:bg-red-800 text-gray-200 disabled:opacity-40"
+            title="Clear all buffered events across the fleet"
+          >
+            Clear
+          </button>
+          <button
+            onClick={() => setLiveEnabled((v) => !v)}
+            className={`px-3 py-1.5 rounded text-sm font-medium ${
+              liveEnabled
+                ? 'bg-green-700 hover:bg-green-600 text-white'
+                : 'bg-gray-700 hover:bg-gray-600 text-gray-200'
+            }`}
+          >
+            {liveEnabled ? '● Live' : '○ Live'}
+          </button>
+        </div>
       </div>
 
       {/* Time-bucketed bar chart */}

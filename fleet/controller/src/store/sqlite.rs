@@ -1932,7 +1932,10 @@ mod tests {
         );
         // Tenant-wide ack skips already-acked rows and other tenants.
         assert_eq!(
-            store.ack_suricata_alerts("default", None, 200).await.unwrap(),
+            store
+                .ack_suricata_alerts("default", None, 200)
+                .await
+                .unwrap(),
             1
         );
 
@@ -1982,7 +1985,10 @@ mod tests {
         );
 
         // Tenant-wide clear leaves other tenants untouched.
-        assert_eq!(store.clear_suricata_alerts("default", None).await.unwrap(), 1);
+        assert_eq!(
+            store.clear_suricata_alerts("default", None).await.unwrap(),
+            1
+        );
         let remaining = store
             .list_suricata_alerts(&SuricataAlertFilter::default(), 10)
             .await

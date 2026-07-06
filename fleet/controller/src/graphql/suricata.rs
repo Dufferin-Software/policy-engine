@@ -284,7 +284,7 @@ pub async fn sync_node_now(
     }
 }
 
-async fn audit(
+pub(crate) async fn audit(
     store: &Arc<dyn ControllerStore>,
     principal: &Principal,
     action: &str,

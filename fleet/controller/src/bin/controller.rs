@@ -161,14 +161,19 @@ async fn main() -> Result<()> {
     }
 
     // ── Event pipeline tasks ───────────────────────────────────────────────────
+    // Policy events are held in a bounded in-memory buffer, never persisted.
+    let events = Arc::new(event_pipeline::EventStore::new());
     let _persister_handle = event_pipeline::spawn_persister(
         Arc::clone(&event_bus),
-        (*tenant_scope).clone(),
+        tenant_scope.tenant_id(),
+        Arc::clone(&events),
         Arc::clone(&event_metrics),
-        event_pipeline::PersisterConfig::default(),
     );
-    let _retention_handle =
-        event_pipeline::spawn_retention((*tenant_scope).clone(), Arc::clone(&event_metrics));
+    let _retention_handle = event_pipeline::spawn_retention(
+        (*tenant_scope).clone(),
+        Arc::clone(&events),
+        Arc::clone(&event_metrics),
+    );
     // Suricata alert persister: EVE alerts from the dedicated bus channel →
     // suricata_alerts table (via the ControllerStore trait).
     let _suricata_alert_handle =
@@ -215,6 +220,7 @@ async fn main() -> Result<()> {
         Arc::clone(&metrics_store),
         Arc::clone(&rule_lifecycle_bus),
         Arc::clone(&tenant_scope),
+        Arc::clone(&events),
         Arc::clone(&alert_rule_bus),
         Arc::clone(&api_token_store),
         Arc::clone(&operator_store),
@@ -235,6 +241,7 @@ async fn main() -> Result<()> {
         Arc::clone(&store),
         Arc::clone(&sessions),
         Arc::clone(&tenant_scope),
+        Arc::clone(&events),
         Arc::clone(&event_metrics),
         Arc::clone(&alert_metrics),
         bearer_auth_state,

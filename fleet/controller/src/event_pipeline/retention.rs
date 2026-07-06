@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
 
-//! Background retention task: deletes events older than the tenant's
-//! `retention_s`. Chunked to avoid long write locks on SQLite.
+//! Background retention task: deletes alert rows older than the tenant's
+//! `retention_s` (chunked to avoid long write locks on SQLite) and ages
+//! out buffered in-memory policy events on the same window.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,14 +22,15 @@ const CHUNK: i64 = 10_000;
 /// Spawn the retention loop. Runs forever until the runtime drops it.
 pub fn spawn_retention(
     scope: TenantScope,
+    events: Arc<EventStore>,
     metrics: Arc<EventPipelineMetrics>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run(scope, metrics).await;
+        run(scope, events, metrics).await;
     })
 }
 
-async fn run(scope: TenantScope, metrics: Arc<EventPipelineMetrics>) {
+async fn run(scope: TenantScope, events: Arc<EventStore>, metrics: Arc<EventPipelineMetrics>) {
     let mut ticker = time::interval(SWEEP_INTERVAL);
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
@@ -36,30 +38,23 @@ async fn run(scope: TenantScope, metrics: Arc<EventPipelineMetrics>) {
 
     loop {
         ticker.tick().await;
-        if let Err(e) = sweep_once(&scope, &metrics).await {
+        if let Err(e) = sweep_once(&scope, &events, &metrics).await {
             log::error!("event retention sweep failed: {e:#}");
         }
     }
 }
 
 /// Run a single retention pass. Pulled out for direct test coverage.
-pub async fn sweep_once(scope: &TenantScope, metrics: &Arc<EventPipelineMetrics>) -> Result<u64> {
+pub async fn sweep_once(
+    scope: &TenantScope,
+    events: &EventStore,
+    metrics: &Arc<EventPipelineMetrics>,
+) -> Result<u64> {
     let retention_s = retention_seconds(scope).await?;
     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let cutoff = now_ns.saturating_sub(retention_s.saturating_mul(1_000_000_000));
 
-    let store = EventStore::new(scope);
-    let mut total: u64 = 0;
-    // Chunk in a loop so a backlog drains without holding any single lock
-    // for long. Bound the loop so a misconfigured retention can't pin the
-    // task on this tenant.
-    for _ in 0..100 {
-        let removed = store.prune_older_than(cutoff, CHUNK).await?;
-        if removed == 0 {
-            break;
-        }
-        total += removed;
-    }
+    let mut total: u64 = events.prune_older_than(scope.tenant_id(), cutoff);
 
     // Suricata alerts share the tenant's retention window. Acked or not,
     // history past the cutoff goes — the UI "clear" only acknowledges.
@@ -183,20 +178,20 @@ mod tests {
     async fn sweep_deletes_old_keeps_recent() {
         // 1-second retention so "now - 10s" is past the cutoff.
         let scope = scope_with_retention(1).await;
-        let store = EventStore::new(&scope);
+        let events = EventStore::new();
         let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap();
-        store
-            .insert_batch(&[
+        events.insert_batch(
+            scope.tenant_id(),
+            &[
                 old_event(now_ns - 10_000_000_000), // 10s old
                 old_event(now_ns),                  // just now
-            ])
-            .await
-            .unwrap();
+            ],
+        );
 
         let metrics = Arc::new(EventPipelineMetrics::new());
-        let pruned = sweep_once(&scope, &metrics).await.unwrap();
+        let pruned = sweep_once(&scope, &events, &metrics).await.unwrap();
         assert_eq!(pruned, 1);
-        let remaining = store.list(&EventFilter::default(), 10).await.unwrap();
+        let remaining = events.list(scope.tenant_id(), &EventFilter::default(), 10);
         assert_eq!(remaining.len(), 1);
     }
 
@@ -237,7 +232,9 @@ mod tests {
         }
 
         let metrics = Arc::new(EventPipelineMetrics::new());
-        let pruned = sweep_once(&scope, &metrics).await.unwrap();
+        let pruned = sweep_once(&scope, &EventStore::new(), &metrics)
+            .await
+            .unwrap();
         assert_eq!(pruned, 1);
         let remaining: Vec<String> =
             sqlx::query_scalar("SELECT group_key FROM alert_history ORDER BY id")
@@ -265,7 +262,9 @@ mod tests {
         }
 
         let metrics = Arc::new(EventPipelineMetrics::new());
-        let pruned = sweep_once(&scope, &metrics).await.unwrap();
+        let pruned = sweep_once(&scope, &EventStore::new(), &metrics)
+            .await
+            .unwrap();
         assert_eq!(pruned, 1);
         let remaining: Vec<String> =
             sqlx::query_scalar("SELECT node_id FROM suricata_alerts ORDER BY id")

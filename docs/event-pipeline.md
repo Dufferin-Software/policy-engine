@@ -7,6 +7,17 @@ notifications when configurable conditions are met.
 This document is the source of truth for the implementation work that follows.
 Out-of-scope items are listed explicitly so they don't sneak in.
 
+> **Status update (2026-07):** policy match events are no longer persisted to
+> SQLite. The `events` table was removed; the persister now appends to a
+> bounded per-tenant **in-memory ring buffer** (`event_pipeline::store`,
+> default 100k events/tenant, evict-oldest) that backs the same GraphQL
+> (`events`, `eventAggregate`, `clearEvents`) and REST query surface. The
+> buffer is emptied on controller restart, aged by the tenant `retention_s`
+> sweep, and can be purged by operators via the `clearEvents` mutation
+> (guard: `event:delete`). Suricata alerts and alert history remain in
+> SQLite. Sections below describing the events DB schema/persistence are
+> retained for history but superseded by this note.
+
 ## Scope
 
 In scope (v1):

@@ -8,7 +8,7 @@
 //! types and the translation between GraphQL inputs and
 //! [`crate::event_pipeline::store::EventFilter`].
 
-use async_graphql::{Context, Enum, InputObject, Result, SimpleObject};
+use async_graphql::{Context, Enum, InputObject, Result, SimpleObject, ID};
 use chrono::{DateTime, TimeZone, Utc};
 use std::sync::Arc;
 
@@ -16,16 +16,11 @@ use crate::{
     event_pipeline::{
         store::{AggregateBucket, EventFilter, EventStore, GroupBy, StoredEvent},
         types::Action,
-        TenantScope,
     },
     rbac::Principal,
 };
 
-fn scope_for(ctx: &Context<'_>) -> Result<TenantScope> {
-    let base = ctx.data::<Arc<TenantScope>>()?;
-    let principal = ctx.data::<Arc<Principal>>()?;
-    Ok(base.for_principal(principal))
-}
+use super::schema::OperationResult;
 
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
 pub enum EventAction {
@@ -88,13 +83,8 @@ pub struct EventFilterInput {
     pub sni_like: Option<String>,
 }
 
-fn parse_ip_filter(field: &str, s: &str) -> async_graphql::Result<Vec<u8>> {
-    use std::net::IpAddr;
-    s.parse::<IpAddr>()
-        .map(|ip| match ip {
-            IpAddr::V4(v4) => v4.octets().to_vec(),
-            IpAddr::V6(v6) => v6.octets().to_vec(),
-        })
+fn parse_ip_filter(field: &str, s: &str) -> async_graphql::Result<std::net::IpAddr> {
+    s.parse()
         .map_err(|e| async_graphql::Error::new(format!("Invalid {field}: {e}")))
 }
 
@@ -209,7 +199,8 @@ pub async fn resolve_events(
     limit: Option<i32>,
     cursor: Option<String>,
 ) -> Result<EventConnection> {
-    let scope = scope_for(ctx)?;
+    let events = ctx.data::<Arc<EventStore>>()?;
+    let principal = ctx.data::<Arc<Principal>>()?;
     let filter = filter.unwrap_or_default();
     let cursor_id = cursor
         .map(|c| c.parse::<i64>())
@@ -217,7 +208,7 @@ pub async fn resolve_events(
         .map_err(|e| async_graphql::Error::new(format!("Invalid cursor: {e}")))?;
     let limit = limit.unwrap_or(100).clamp(1, MAX_LIMIT) as i64;
     let internal = filter.to_internal(cursor_id)?;
-    let rows = EventStore::new(&scope).list(&internal, limit).await?;
+    let rows = events.list(principal.tenant_id, &internal, limit);
     let next_cursor = rows.last().map(|r| r.id.to_string());
     Ok(EventConnection {
         items: rows.into_iter().map(EventOutput::from).collect(),
@@ -232,15 +223,39 @@ pub async fn resolve_event_aggregate(
     since: DateTime<Utc>,
     until: DateTime<Utc>,
 ) -> Result<Vec<AggregateBucketOutput>> {
-    let scope = scope_for(ctx)?;
+    let events = ctx.data::<Arc<EventStore>>()?;
+    let principal = ctx.data::<Arc<Principal>>()?;
     let mut filter = filter.unwrap_or_default();
     // Spec: `since` and `until` on the aggregate call are required and
     // override any time bounds the caller put in `filter`.
     filter.since = Some(since);
     filter.until = Some(until);
     let internal = filter.to_internal(None)?;
-    let buckets = EventStore::new(&scope)
-        .aggregate(&internal, group_by.as_internal())
-        .await?;
+    let buckets = events.aggregate(principal.tenant_id, &internal, group_by.as_internal());
     Ok(buckets.into_iter().map(Into::into).collect())
+}
+
+/// Empty the tenant's in-memory event buffer, optionally scoped to one node.
+/// Backs the "Clear" action on the global Events page.
+pub async fn resolve_clear_events(
+    ctx: &Context<'_>,
+    node_id: Option<ID>,
+) -> Result<OperationResult> {
+    let events = ctx.data::<Arc<EventStore>>()?;
+    let store = ctx.data::<Arc<dyn crate::store::ControllerStore>>()?;
+    let principal = ctx.data::<Arc<Principal>>()?;
+    let node_id = node_id.map(|n| n.0);
+    let removed = events.clear(principal.tenant_id, node_id.as_deref());
+    crate::graphql::suricata::audit(
+        store,
+        principal,
+        "events_cleared",
+        node_id,
+        format!("removed={removed}"),
+    )
+    .await;
+    Ok(OperationResult {
+        success: true,
+        message: Some(format!("Cleared {removed} event(s)")),
+    })
 }

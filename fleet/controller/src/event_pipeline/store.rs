@@ -1,19 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
 
-//! DB accessors for the `events` table.
+//! In-memory, per-tenant policy-event buffer.
 //!
-//! All entry points take a [`TenantScope`] so multi-tenant isolation cannot
-//! be forgotten at a call site.
+//! Policy match events are deliberately NOT persisted: they are operational
+//! telemetry, not audit data. Each tenant gets a bounded ring buffer — the
+//! oldest events are evicted once [`EventStore::capacity`] is reached, and
+//! everything is gone on controller restart. The GraphQL `events` /
+//! `eventAggregate` queries and the Grafana REST projections all read from
+//! this buffer, so their filter/pagination semantics match the old
+//! SQLite-backed store.
 
-use anyhow::{Context, Result};
-use sqlx::{Row, Sqlite, Transaction};
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
+use std::sync::Mutex;
 
-use super::tenant::TenantScope;
 use super::types::{Action, Direction, PolicyEvent};
 
-/// One row read back from the `events` table.
+/// Default per-tenant buffer capacity. At roughly 150 bytes per event this
+/// bounds the controller to a few tens of MB per tenant worst-case.
+pub const DEFAULT_EVENT_CAPACITY: usize = 100_000;
+
+/// One buffered event.
 #[derive(Debug, Clone)]
 pub struct StoredEvent {
     pub id: i64,
@@ -47,13 +55,111 @@ pub struct EventFilter {
     pub sport: Option<i64>,
     pub dport: Option<i64>,
     pub proto: Option<i64>,
-    /// Exact-match src IP, encoded as the on-disk blob (4 or 16 bytes).
-    pub src_ip: Option<Vec<u8>>,
-    /// Exact-match dst IP, encoded as the on-disk blob (4 or 16 bytes).
-    pub dst_ip: Option<Vec<u8>>,
+    pub src_ip: Option<IpAddr>,
+    pub dst_ip: Option<IpAddr>,
+    /// SQL-LIKE pattern (`%`/`_` wildcards, case-insensitive) on the SNI.
     pub sni_like: Option<String>,
     /// Pagination: only rows with id < cursor (descending order).
     pub cursor: Option<i64>,
+}
+
+impl EventFilter {
+    fn matches(&self, e: &StoredEvent) -> bool {
+        if let Some(v) = self.since_ns {
+            if e.ts_ns < v {
+                return false;
+            }
+        }
+        if let Some(v) = self.until_ns {
+            if e.ts_ns >= v {
+                return false;
+            }
+        }
+        if let Some(a) = self.action {
+            if e.action != a {
+                return false;
+            }
+        }
+        if let Some(v) = self.rule_id {
+            if e.rule_id != v {
+                return false;
+            }
+        }
+        if let Some(ref v) = self.node_id {
+            if e.node_id != *v {
+                return false;
+            }
+        }
+        if let Some(v) = self.sport {
+            if e.sport != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.dport {
+            if e.dport != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.proto {
+            if e.proto != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.src_ip {
+            if e.src_ip != v {
+                return false;
+            }
+        }
+        if let Some(v) = self.dst_ip {
+            if e.dst_ip != v {
+                return false;
+            }
+        }
+        if let Some(ref pat) = self.sni_like {
+            match e.sni.as_deref() {
+                Some(sni) => {
+                    if !like_match(pat, sni) {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        if let Some(c) = self.cursor {
+            if e.id >= c {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Case-insensitive SQL LIKE: `%` matches any run, `_` any single char.
+/// Greedy match with backtracking on the last `%`.
+fn like_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let t: Vec<char> = text.to_lowercase().chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Grouping axis for [`EventStore::aggregate`].
@@ -69,340 +175,196 @@ pub enum GroupBy {
 }
 
 impl GroupBy {
-    /// Convert the raw SQL group key into the user-facing label. Action stays
-    /// as the wire-format string (`drop`/`log`) instead of the on-disk int;
-    /// IPs come back from `hex(blob)` and need to be re-parsed into addresses.
-    /// Other variants pass through unchanged.
-    pub fn label_key(self, raw: &str) -> String {
+    fn key(self, e: &StoredEvent) -> String {
         match self {
-            GroupBy::Action => raw
-                .parse::<i64>()
-                .ok()
-                .and_then(Action::from_db)
-                .map(|a| a.as_str().to_string())
-                .unwrap_or_else(|| raw.to_string()),
-            GroupBy::SrcIp | GroupBy::DstIp => {
-                hex_to_ip_string(raw).unwrap_or_else(|| raw.to_string())
-            }
-            _ => raw.to_string(),
+            GroupBy::RuleId => e.rule_id.to_string(),
+            GroupBy::Action => e.action.as_str().to_string(),
+            GroupBy::NodeId => e.node_id.clone(),
+            GroupBy::SrcIp => e.src_ip.to_string(),
+            GroupBy::DstIp => e.dst_ip.to_string(),
+            // ts_ns is nanoseconds since epoch; bucket index in that unit.
+            GroupBy::Minute => (e.ts_ns / 60_000_000_000).to_string(),
+            GroupBy::Hour => (e.ts_ns / 3_600_000_000_000).to_string(),
         }
-    }
-}
-
-fn hex_to_ip_string(hex: &str) -> Option<String> {
-    if !hex.len().is_multiple_of(2) {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for chunk in hex.as_bytes().chunks(2) {
-        let pair = std::str::from_utf8(chunk).ok()?;
-        bytes.push(u8::from_str_radix(pair, 16).ok()?);
-    }
-    match bytes.len() {
-        4 => {
-            let a: [u8; 4] = bytes.try_into().ok()?;
-            Some(IpAddr::from(a).to_string())
-        }
-        16 => {
-            let a: [u8; 16] = bytes.try_into().ok()?;
-            Some(IpAddr::from(a).to_string())
-        }
-        _ => None,
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct AggregateBucket {
     /// User-facing group key (rule ID, action name, dotted IP, or bucket
-    /// index for `minute`/`hour`). Already labelised by [`GroupBy::label_key`]
-    /// so callers can pass it through to the wire format unchanged.
+    /// index for `minute`/`hour`).
     pub key: String,
     pub count: i64,
 }
 
-/// Newtype for the [`TenantScope`]-wrapped event accessors. Keeping it a
-/// struct (rather than a bag of free functions) makes "you forgot the scope"
-/// a compile error rather than a runtime one.
-pub struct EventStore<'a> {
-    scope: &'a TenantScope,
+/// Counters returned by [`EventStore::insert_batch`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InsertStats {
+    pub inserted: usize,
+    /// Oldest events evicted to stay within capacity.
+    pub evicted: usize,
 }
 
-impl<'a> EventStore<'a> {
-    pub fn new(scope: &'a TenantScope) -> Self {
-        Self { scope }
+#[derive(Default)]
+struct TenantBuf {
+    next_id: i64,
+    buf: VecDeque<StoredEvent>,
+}
+
+/// Process-wide event buffer, shared via `Arc`. All methods take the caller's
+/// tenant id explicitly so multi-tenant isolation cannot be forgotten at a
+/// call site.
+pub struct EventStore {
+    tenants: Mutex<HashMap<i64, TenantBuf>>,
+    capacity: usize,
+}
+
+impl Default for EventStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventStore {
+    pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_EVENT_CAPACITY)
     }
 
-    /// Insert a batch of events in a single transaction. Returns the row
-    /// count inserted (== `events.len()` on success).
-    pub async fn insert_batch(&self, events: &[PolicyEvent]) -> Result<usize> {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            tenants: Mutex::new(HashMap::new()),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Append a batch of parsed events. Events with malformed IP payloads
+    /// are skipped (they should never survive [`super::types::parse_policy_event`]).
+    pub fn insert_batch(&self, tenant_id: i64, events: &[PolicyEvent]) -> InsertStats {
+        let mut stats = InsertStats::default();
         if events.is_empty() {
-            return Ok(0);
+            return stats;
         }
-        let mut tx: Transaction<'_, Sqlite> = self
-            .scope
-            .pool()
-            .begin()
-            .await
-            .context("Failed to begin events insert tx")?;
-        let tenant_id = self.scope.tenant_id();
-
+        let mut tenants = self.tenants.lock().unwrap();
+        let t = tenants.entry(tenant_id).or_default();
         for ev in events {
-            sqlx::query(
-                r#"
-                INSERT INTO events
-                    (tenant_id, node_id, ts_ns, rule_id, action, verdict, direction,
-                     ifindex, proto, src_ip, dst_ip, sport, dport, pkt_len, flags, sni)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(tenant_id)
-            .bind(&ev.node_id)
-            .bind(ev.ts_ns)
-            .bind(ev.rule_id)
-            .bind(ev.action as i64)
-            .bind(ev.verdict)
-            .bind(ev.direction as i64)
-            .bind(ev.ifindex)
-            .bind(ev.proto)
-            .bind(ev.src_ip.as_slice())
-            .bind(ev.dst_ip.as_slice())
-            .bind(ev.sport)
-            .bind(ev.dport)
-            .bind(ev.pkt_len)
-            .bind(ev.flags)
-            .bind(ev.sni.as_deref())
-            .execute(&mut *tx)
-            .await
-            .context("Failed to insert event row")?;
+            let (Some(src_ip), Some(dst_ip)) = (blob_to_ip(&ev.src_ip), blob_to_ip(&ev.dst_ip))
+            else {
+                continue;
+            };
+            t.next_id += 1;
+            t.buf.push_back(StoredEvent {
+                id: t.next_id,
+                tenant_id,
+                node_id: ev.node_id.clone(),
+                ts_ns: ev.ts_ns,
+                rule_id: ev.rule_id,
+                action: ev.action,
+                verdict: ev.verdict,
+                direction: ev.direction,
+                ifindex: ev.ifindex,
+                proto: ev.proto,
+                src_ip,
+                dst_ip,
+                sport: ev.sport,
+                dport: ev.dport,
+                pkt_len: ev.pkt_len,
+                flags: ev.flags,
+                sni: ev.sni.clone(),
+            });
+            stats.inserted += 1;
+            if t.buf.len() > self.capacity {
+                t.buf.pop_front();
+                stats.evicted += 1;
+            }
         }
-
-        tx.commit().await.context("Failed to commit events batch")?;
-        Ok(events.len())
+        stats
     }
 
-    /// Read events matching `filter`, newest first.
-    pub async fn list(&self, filter: &EventFilter, limit: i64) -> Result<Vec<StoredEvent>> {
-        let mut q = String::from(
-            "SELECT id, tenant_id, node_id, ts_ns, rule_id, action, verdict, direction, \
-                    ifindex, proto, src_ip, dst_ip, sport, dport, pkt_len, flags, sni \
-             FROM events WHERE tenant_id = ?",
-        );
-        push_filter_sql(&mut q, filter);
-        q.push_str(" ORDER BY id DESC LIMIT ?");
-
-        let mut query = sqlx::query(&q).bind(self.scope.tenant_id());
-        query = bind_filter(query, filter);
-        let rows = query
-            .bind(limit)
-            .fetch_all(self.scope.pool())
-            .await
-            .context("Failed to list events")?;
-
-        rows.into_iter().map(row_to_event).collect()
+    /// Events matching `filter`, newest first (descending id).
+    pub fn list(&self, tenant_id: i64, filter: &EventFilter, limit: i64) -> Vec<StoredEvent> {
+        let limit = limit.max(0) as usize;
+        let tenants = self.tenants.lock().unwrap();
+        let Some(t) = tenants.get(&tenant_id) else {
+            return Vec::new();
+        };
+        t.buf
+            .iter()
+            .rev()
+            .filter(|e| filter.matches(e))
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
-    /// Bucket events by `group_by` between `[since_ns, until_ns)`.
-    pub async fn aggregate(
+    /// Bucket events matching `filter` by `group_by`, keys ascending.
+    pub fn aggregate(
         &self,
+        tenant_id: i64,
         filter: &EventFilter,
         group_by: GroupBy,
-    ) -> Result<Vec<AggregateBucket>> {
-        let key_expr = match group_by {
-            GroupBy::RuleId => "CAST(rule_id AS TEXT)",
-            GroupBy::Action => "CAST(action AS TEXT)",
-            GroupBy::NodeId => "node_id",
-            GroupBy::SrcIp => "hex(src_ip)",
-            GroupBy::DstIp => "hex(dst_ip)",
-            // ts_ns is nanoseconds since epoch; divide to seconds then bucket.
-            GroupBy::Minute => "CAST(ts_ns / 60000000000 AS TEXT)",
-            GroupBy::Hour => "CAST(ts_ns / 3600000000000 AS TEXT)",
+    ) -> Vec<AggregateBucket> {
+        let tenants = self.tenants.lock().unwrap();
+        let Some(t) = tenants.get(&tenant_id) else {
+            return Vec::new();
         };
-        let mut q = format!(
-            "SELECT {key_expr} AS k, COUNT(*) AS c \
-             FROM events WHERE tenant_id = ?"
-        );
-        push_filter_sql(&mut q, filter);
-        q.push_str(" GROUP BY k ORDER BY k ASC");
-
-        let mut query = sqlx::query(&q).bind(self.scope.tenant_id());
-        query = bind_filter(query, filter);
-        let rows = query
-            .fetch_all(self.scope.pool())
-            .await
-            .context("Failed to aggregate events")?;
-
-        Ok(rows
+        let mut counts: std::collections::BTreeMap<String, i64> = Default::default();
+        for e in t.buf.iter().filter(|e| filter.matches(e)) {
+            *counts.entry(group_by.key(e)).or_insert(0) += 1;
+        }
+        counts
             .into_iter()
-            .map(|r| {
-                let raw = r.try_get::<String, _>("k").unwrap_or_default();
-                AggregateBucket {
-                    key: group_by.label_key(&raw),
-                    count: r.try_get::<i64, _>("c").unwrap_or(0),
-                }
-            })
-            .collect())
+            .map(|(key, count)| AggregateBucket { key, count })
+            .collect()
     }
 
-    /// Delete up to `chunk` events older than `cutoff_ns`. Returns rows
-    /// affected; caller loops until the result is zero.
-    pub async fn prune_older_than(&self, cutoff_ns: i64, chunk: i64) -> Result<u64> {
-        // SQLite supports DELETE … LIMIT only if compiled with
-        // SQLITE_ENABLE_UPDATE_DELETE_LIMIT, which the bundled sqlx feature
-        // doesn't guarantee. Use the portable rowid IN (SELECT … LIMIT) form.
-        let res = sqlx::query(
-            "DELETE FROM events WHERE id IN ( \
-                SELECT id FROM events \
-                WHERE tenant_id = ? AND ts_ns < ? \
-                ORDER BY id ASC LIMIT ? \
-             )",
-        )
-        .bind(self.scope.tenant_id())
-        .bind(cutoff_ns)
-        .bind(chunk)
-        .execute(self.scope.pool())
-        .await
-        .context("Failed to prune events")?;
-        Ok(res.rows_affected())
+    /// Drop events older than `cutoff_ns`. Returns the number removed.
+    pub fn prune_older_than(&self, tenant_id: i64, cutoff_ns: i64) -> u64 {
+        let mut tenants = self.tenants.lock().unwrap();
+        let Some(t) = tenants.get_mut(&tenant_id) else {
+            return 0;
+        };
+        let before = t.buf.len();
+        t.buf.retain(|e| e.ts_ns >= cutoff_ns);
+        (before - t.buf.len()) as u64
+    }
+
+    /// Empty the tenant's buffer, optionally only events from one node.
+    /// Returns the number removed.
+    pub fn clear(&self, tenant_id: i64, node_id: Option<&str>) -> u64 {
+        let mut tenants = self.tenants.lock().unwrap();
+        let Some(t) = tenants.get_mut(&tenant_id) else {
+            return 0;
+        };
+        let before = t.buf.len();
+        match node_id {
+            Some(n) => t.buf.retain(|e| e.node_id != n),
+            None => t.buf.clear(),
+        }
+        (before - t.buf.len()) as u64
     }
 }
 
-fn push_filter_sql(q: &mut String, f: &EventFilter) {
-    if f.since_ns.is_some() {
-        q.push_str(" AND ts_ns >= ?");
-    }
-    if f.until_ns.is_some() {
-        q.push_str(" AND ts_ns < ?");
-    }
-    if f.action.is_some() {
-        q.push_str(" AND action = ?");
-    }
-    if f.rule_id.is_some() {
-        q.push_str(" AND rule_id = ?");
-    }
-    if f.node_id.is_some() {
-        q.push_str(" AND node_id = ?");
-    }
-    if f.sport.is_some() {
-        q.push_str(" AND sport = ?");
-    }
-    if f.dport.is_some() {
-        q.push_str(" AND dport = ?");
-    }
-    if f.proto.is_some() {
-        q.push_str(" AND proto = ?");
-    }
-    if f.src_ip.is_some() {
-        q.push_str(" AND src_ip = ?");
-    }
-    if f.dst_ip.is_some() {
-        q.push_str(" AND dst_ip = ?");
-    }
-    if f.sni_like.is_some() {
-        q.push_str(" AND sni LIKE ?");
-    }
-    if f.cursor.is_some() {
-        q.push_str(" AND id < ?");
-    }
-}
-
-fn bind_filter<'q>(
-    mut query: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
-    f: &'q EventFilter,
-) -> sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
-    if let Some(v) = f.since_ns {
-        query = query.bind(v);
-    }
-    if let Some(v) = f.until_ns {
-        query = query.bind(v);
-    }
-    if let Some(a) = f.action {
-        query = query.bind(a as i64);
-    }
-    if let Some(v) = f.rule_id {
-        query = query.bind(v);
-    }
-    if let Some(ref v) = f.node_id {
-        query = query.bind(v.as_str());
-    }
-    if let Some(v) = f.sport {
-        query = query.bind(v);
-    }
-    if let Some(v) = f.dport {
-        query = query.bind(v);
-    }
-    if let Some(v) = f.proto {
-        query = query.bind(v);
-    }
-    if let Some(ref v) = f.src_ip {
-        query = query.bind(v.as_slice());
-    }
-    if let Some(ref v) = f.dst_ip {
-        query = query.bind(v.as_slice());
-    }
-    if let Some(ref v) = f.sni_like {
-        query = query.bind(v.as_str());
-    }
-    if let Some(v) = f.cursor {
-        query = query.bind(v);
-    }
-    query
-}
-
-fn row_to_event(row: sqlx::sqlite::SqliteRow) -> Result<StoredEvent> {
-    let src_blob: Vec<u8> = row.try_get("src_ip")?;
-    let dst_blob: Vec<u8> = row.try_get("dst_ip")?;
-    let action_i: i64 = row.try_get("action")?;
-    let direction_i: i64 = row.try_get("direction")?;
-    Ok(StoredEvent {
-        id: row.try_get("id")?,
-        tenant_id: row.try_get("tenant_id")?,
-        node_id: row.try_get("node_id")?,
-        ts_ns: row.try_get("ts_ns")?,
-        rule_id: row.try_get("rule_id")?,
-        action: Action::from_db(action_i)
-            .ok_or_else(|| anyhow::anyhow!("Unknown action discriminator {action_i}"))?,
-        verdict: row.try_get("verdict")?,
-        direction: Direction::from_db(direction_i)
-            .ok_or_else(|| anyhow::anyhow!("Unknown direction discriminator {direction_i}"))?,
-        ifindex: row.try_get("ifindex")?,
-        proto: row.try_get("proto")?,
-        src_ip: blob_to_ip(&src_blob)?,
-        dst_ip: blob_to_ip(&dst_blob)?,
-        sport: row.try_get("sport")?,
-        dport: row.try_get("dport")?,
-        pkt_len: row.try_get("pkt_len")?,
-        flags: row.try_get("flags").ok(),
-        sni: row.try_get("sni").ok(),
-    })
-}
-
-fn blob_to_ip(b: &[u8]) -> Result<IpAddr> {
+fn blob_to_ip(b: &[u8]) -> Option<IpAddr> {
     match b.len() {
         4 => {
             let mut a = [0u8; 4];
             a.copy_from_slice(b);
-            Ok(IpAddr::from(a))
+            Some(IpAddr::from(a))
         }
         16 => {
             let mut a = [0u8; 16];
             a.copy_from_slice(b);
-            Ok(IpAddr::from(a))
+            Some(IpAddr::from(a))
         }
-        n => Err(anyhow::anyhow!("Unexpected IP blob length: {n}")),
+        _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_pipeline::tenant::bootstrap_default_tenant;
-    use sqlx::sqlite::SqlitePool;
 
-    async fn scope() -> TenantScope {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        bootstrap_default_tenant(pool).await.unwrap()
-    }
+    const TENANT: i64 = 1;
 
     fn evt(ts_ns: i64, action: Action) -> PolicyEvent {
         PolicyEvent {
@@ -424,148 +386,229 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn insert_then_list_round_trips() {
-        let scope = scope().await;
-        let store = EventStore::new(&scope);
-        let n = store
-            .insert_batch(&[evt(1000, Action::Drop), evt(2000, Action::Log)])
-            .await
-            .unwrap();
-        assert_eq!(n, 2);
-        let rows = store.list(&EventFilter::default(), 10).await.unwrap();
+    #[test]
+    fn insert_then_list_round_trips() {
+        let store = EventStore::new();
+        let stats = store.insert_batch(TENANT, &[evt(1000, Action::Drop), evt(2000, Action::Log)]);
+        assert_eq!(stats.inserted, 2);
+        assert_eq!(stats.evicted, 0);
+        let rows = store.list(TENANT, &EventFilter::default(), 10);
         assert_eq!(rows.len(), 2);
         // Newest first.
         assert_eq!(rows[0].ts_ns, 2000);
     }
 
-    #[tokio::test]
-    async fn list_filters_by_action() {
-        let scope = scope().await;
-        let store = EventStore::new(&scope);
-        store
-            .insert_batch(&[evt(1, Action::Drop), evt(2, Action::Log)])
-            .await
-            .unwrap();
-        let drops = store
-            .list(
-                &EventFilter {
-                    action: Some(Action::Drop),
-                    ..Default::default()
-                },
-                10,
-            )
-            .await
-            .unwrap();
+    #[test]
+    fn list_filters_by_action() {
+        let store = EventStore::new();
+        store.insert_batch(TENANT, &[evt(1, Action::Drop), evt(2, Action::Log)]);
+        let drops = store.list(
+            TENANT,
+            &EventFilter {
+                action: Some(Action::Drop),
+                ..Default::default()
+            },
+            10,
+        );
         assert_eq!(drops.len(), 1);
         assert_eq!(drops[0].action, Action::Drop);
     }
 
-    #[tokio::test]
-    async fn list_filters_by_src_and_dst_ip() {
-        let scope = scope().await;
-        let store = EventStore::new(&scope);
+    #[test]
+    fn list_filters_by_src_and_dst_ip() {
+        let store = EventStore::new();
         let mut e_other = evt(1, Action::Drop);
         e_other.src_ip = vec![192, 168, 1, 1];
         e_other.dst_ip = vec![192, 168, 1, 2];
-        store
-            .insert_batch(&[evt(2, Action::Drop), e_other])
-            .await
-            .unwrap();
+        store.insert_batch(TENANT, &[evt(2, Action::Drop), e_other]);
 
-        let by_src = store
-            .list(
-                &EventFilter {
-                    src_ip: Some(vec![10, 0, 0, 1]),
-                    ..Default::default()
-                },
-                10,
-            )
-            .await
-            .unwrap();
+        let by_src = store.list(
+            TENANT,
+            &EventFilter {
+                src_ip: Some("10.0.0.1".parse().unwrap()),
+                ..Default::default()
+            },
+            10,
+        );
         assert_eq!(by_src.len(), 1);
         assert_eq!(by_src[0].src_ip.to_string(), "10.0.0.1");
 
-        let by_dst = store
-            .list(
-                &EventFilter {
-                    dst_ip: Some(vec![192, 168, 1, 2]),
-                    ..Default::default()
-                },
-                10,
-            )
-            .await
-            .unwrap();
+        let by_dst = store.list(
+            TENANT,
+            &EventFilter {
+                dst_ip: Some("192.168.1.2".parse().unwrap()),
+                ..Default::default()
+            },
+            10,
+        );
         assert_eq!(by_dst.len(), 1);
         assert_eq!(by_dst[0].dst_ip.to_string(), "192.168.1.2");
     }
 
-    #[tokio::test]
-    async fn aggregate_by_action_buckets() {
-        let scope = scope().await;
-        let store = EventStore::new(&scope);
-        store
-            .insert_batch(&[
+    #[test]
+    fn cursor_paginates_descending() {
+        let store = EventStore::new();
+        store.insert_batch(
+            TENANT,
+            &[
+                evt(1, Action::Drop),
+                evt(2, Action::Drop),
+                evt(3, Action::Drop),
+            ],
+        );
+        let page1 = store.list(TENANT, &EventFilter::default(), 2);
+        assert_eq!(page1.len(), 2);
+        let cursor = page1.last().unwrap().id;
+        let page2 = store.list(
+            TENANT,
+            &EventFilter {
+                cursor: Some(cursor),
+                ..Default::default()
+            },
+            2,
+        );
+        assert_eq!(page2.len(), 1);
+        assert!(page2[0].id < cursor);
+    }
+
+    #[test]
+    fn aggregate_by_action_buckets() {
+        let store = EventStore::new();
+        store.insert_batch(
+            TENANT,
+            &[
                 evt(1, Action::Drop),
                 evt(2, Action::Drop),
                 evt(3, Action::Log),
-            ])
-            .await
-            .unwrap();
-        let buckets = store
-            .aggregate(&EventFilter::default(), GroupBy::Action)
-            .await
-            .unwrap();
-        let map: std::collections::HashMap<_, _> =
-            buckets.into_iter().map(|b| (b.key, b.count)).collect();
+            ],
+        );
+        let buckets = store.aggregate(TENANT, &EventFilter::default(), GroupBy::Action);
+        let map: HashMap<_, _> = buckets.into_iter().map(|b| (b.key, b.count)).collect();
         assert_eq!(map.get("drop").copied(), Some(2));
         assert_eq!(map.get("log").copied(), Some(1));
     }
 
-    #[tokio::test]
-    async fn aggregate_by_src_ip_returns_dotted_string() {
-        let scope = scope().await;
-        let store = EventStore::new(&scope);
-        store
-            .insert_batch(&[evt(1, Action::Drop), evt(2, Action::Drop)])
-            .await
-            .unwrap();
-        let buckets = store
-            .aggregate(&EventFilter::default(), GroupBy::SrcIp)
-            .await
-            .unwrap();
-        // evt() in this test module always uses 10.0.0.1 as the source.
+    #[test]
+    fn aggregate_by_src_ip_returns_dotted_string() {
+        let store = EventStore::new();
+        store.insert_batch(TENANT, &[evt(1, Action::Drop), evt(2, Action::Drop)]);
+        let buckets = store.aggregate(TENANT, &EventFilter::default(), GroupBy::SrcIp);
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].key, "10.0.0.1");
         assert_eq!(buckets[0].count, 2);
     }
 
     #[test]
-    fn label_key_passthrough_and_conversions() {
-        assert_eq!(GroupBy::RuleId.label_key("42"), "42");
-        assert_eq!(GroupBy::NodeId.label_key("n1"), "n1");
-        assert_eq!(GroupBy::Minute.label_key("28333333"), "28333333");
-        assert_eq!(GroupBy::Action.label_key("1"), "drop");
-        assert_eq!(GroupBy::Action.label_key("2"), "log");
-        // Unknown action code stays as-is rather than blowing up.
-        assert_eq!(GroupBy::Action.label_key("99"), "99");
-        assert_eq!(GroupBy::SrcIp.label_key("0A000001"), "10.0.0.1");
-        // Malformed hex falls through unchanged.
-        assert_eq!(GroupBy::SrcIp.label_key("notahex"), "notahex");
+    fn aggregate_by_minute_buckets_by_index() {
+        let store = EventStore::new();
+        // Two events in minute 1, one in minute 2.
+        store.insert_batch(
+            TENANT,
+            &[
+                evt(60_000_000_000, Action::Drop),
+                evt(61_000_000_000, Action::Drop),
+                evt(120_000_000_000, Action::Drop),
+            ],
+        );
+        let buckets = store.aggregate(TENANT, &EventFilter::default(), GroupBy::Minute);
+        assert_eq!(buckets.len(), 2);
+        assert_eq!((buckets[0].key.as_str(), buckets[0].count), ("1", 2));
+        assert_eq!((buckets[1].key.as_str(), buckets[1].count), ("2", 1));
     }
 
-    #[tokio::test]
-    async fn prune_deletes_old_rows() {
-        let scope = scope().await;
-        let store = EventStore::new(&scope);
-        store
-            .insert_batch(&[evt(100, Action::Drop), evt(200, Action::Drop)])
-            .await
-            .unwrap();
-        let removed = store.prune_older_than(150, 100).await.unwrap();
+    #[test]
+    fn capacity_evicts_oldest() {
+        let store = EventStore::with_capacity(2);
+        let stats = store.insert_batch(
+            TENANT,
+            &[
+                evt(1, Action::Drop),
+                evt(2, Action::Drop),
+                evt(3, Action::Drop),
+            ],
+        );
+        assert_eq!(stats.inserted, 3);
+        assert_eq!(stats.evicted, 1);
+        let rows = store.list(TENANT, &EventFilter::default(), 10);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].ts_ns, 3);
+        assert_eq!(rows[1].ts_ns, 2);
+    }
+
+    #[test]
+    fn prune_deletes_old_rows() {
+        let store = EventStore::new();
+        store.insert_batch(TENANT, &[evt(100, Action::Drop), evt(200, Action::Drop)]);
+        let removed = store.prune_older_than(TENANT, 150);
         assert_eq!(removed, 1);
-        let remaining = store.list(&EventFilter::default(), 10).await.unwrap();
+        let remaining = store.list(TENANT, &EventFilter::default(), 10);
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].ts_ns, 200);
+    }
+
+    #[test]
+    fn clear_empties_tenant_buffer() {
+        let store = EventStore::new();
+        store.insert_batch(TENANT, &[evt(1, Action::Drop), evt(2, Action::Drop)]);
+        store.insert_batch(2, &[evt(3, Action::Drop)]);
+        assert_eq!(store.clear(TENANT, None), 2);
+        assert!(store.list(TENANT, &EventFilter::default(), 10).is_empty());
+        // Other tenants untouched.
+        assert_eq!(store.list(2, &EventFilter::default(), 10).len(), 1);
+    }
+
+    #[test]
+    fn clear_scoped_to_node() {
+        let store = EventStore::new();
+        let mut e2 = evt(2, Action::Drop);
+        e2.node_id = "n2".into();
+        store.insert_batch(TENANT, &[evt(1, Action::Drop), e2]);
+        assert_eq!(store.clear(TENANT, Some("n1")), 1);
+        let rows = store.list(TENANT, &EventFilter::default(), 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].node_id, "n2");
+    }
+
+    #[test]
+    fn tenants_are_isolated() {
+        let store = EventStore::new();
+        store.insert_batch(1, &[evt(1, Action::Drop)]);
+        store.insert_batch(2, &[evt(2, Action::Drop), evt(3, Action::Drop)]);
+        assert_eq!(store.list(1, &EventFilter::default(), 10).len(), 1);
+        assert_eq!(store.list(2, &EventFilter::default(), 10).len(), 2);
+    }
+
+    #[test]
+    fn sni_like_matches_sql_semantics() {
+        let store = EventStore::new();
+        let mut e = evt(1, Action::Drop);
+        e.sni = Some("www.Example.com".into());
+        let mut e2 = evt(2, Action::Drop);
+        e2.sni = Some("api.other.net".into());
+        store.insert_batch(TENANT, &[e, e2]);
+
+        let f = |pat: &str| EventFilter {
+            sni_like: Some(pat.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(store.list(TENANT, &f("%example.com"), 10).len(), 1);
+        assert_eq!(store.list(TENANT, &f("www.%"), 10).len(), 1);
+        assert_eq!(store.list(TENANT, &f("%.com"), 10).len(), 1);
+        assert_eq!(store.list(TENANT, &f("api.other.ne_"), 10).len(), 1);
+        assert_eq!(store.list(TENANT, &f("%nomatch%"), 10).len(), 0);
+        // No-SNI events never match a LIKE filter.
+        store.insert_batch(TENANT, &[evt(3, Action::Drop)]);
+        assert_eq!(store.list(TENANT, &f("%"), 10).len(), 2);
+    }
+
+    #[test]
+    fn like_match_edge_cases() {
+        assert!(like_match("%", ""));
+        assert!(like_match("", ""));
+        assert!(!like_match("", "a"));
+        assert!(like_match("a%b%c", "aXXbYYc"));
+        assert!(!like_match("a%b%c", "aXXbYY"));
+        assert!(like_match("_", "x"));
+        assert!(!like_match("_", ""));
     }
 }

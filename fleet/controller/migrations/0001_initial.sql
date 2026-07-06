@@ -307,47 +307,11 @@ CREATE TABLE IF NOT EXISTS tenants (
 
 -- Bootstrap the singleton tenant. All existing rows in `nodes`, `rules`,
 -- `audit_log` carry tenant_id = 'default' (TEXT slug) — this row reifies
--- that string into a numeric ID for the events table.
+-- that string into a numeric ID for tenant-scoped tables.
+-- Policy match events are deliberately NOT persisted: they live in a
+-- bounded in-memory buffer on the controller (see event_pipeline::store).
 INSERT OR IGNORE INTO tenants (slug, name, retention_s, created_at)
 VALUES ('default', 'Default Tenant', 604800, strftime('%s', 'now'));
-
-CREATE TABLE IF NOT EXISTS events (
-    id          INTEGER PRIMARY KEY,
-    -- Denormalised numeric tenant ID. No FK — hot path; the tenants table
-    -- has so few rows the cache hit is irrelevant and a FK constraint check
-    -- per insert is wasted I/O.
-    tenant_id   INTEGER NOT NULL,
-    -- Node string ID (matches nodes.id). Kept as TEXT to avoid a join on
-    -- the hot path; node renames are not a concern.
-    node_id     TEXT NOT NULL,
-    ts_ns       INTEGER NOT NULL,
-    rule_id     INTEGER NOT NULL,
-    -- 1 = drop, 2 = log. PASS is intentionally not persisted (IPFIX will
-    -- cover the "every flow" use case later — see docs/event-pipeline.md).
-    action      INTEGER NOT NULL,
-    verdict     INTEGER NOT NULL,
-    -- 1 = ingress, 2 = egress.
-    direction   INTEGER NOT NULL,
-    ifindex     INTEGER NOT NULL,
-    -- Numeric IP protocol (6 = tcp, 17 = udp, 1 = icmp, ...).
-    proto       INTEGER NOT NULL,
-    -- 4 bytes for IPv4, 16 bytes for IPv6. Same column either way so a
-    -- single index covers both address families.
-    src_ip      BLOB NOT NULL,
-    dst_ip      BLOB NOT NULL,
-    sport       INTEGER NOT NULL,
-    dport       INTEGER NOT NULL,
-    pkt_len     INTEGER NOT NULL,
-    flags       INTEGER,
-    sni         TEXT
-);
-
-CREATE INDEX IF NOT EXISTS events_tenant_ts
-    ON events(tenant_id, ts_ns DESC);
-CREATE INDEX IF NOT EXISTS events_tenant_rule_ts
-    ON events(tenant_id, rule_id, ts_ns DESC);
-CREATE INDEX IF NOT EXISTS events_tenant_action_ts
-    ON events(tenant_id, action, ts_ns DESC);
 
 -- Suricata IPS/IDS alerts forwarded from nodes. Separate from `events`
 -- (which is BPF-event-shaped): alerts carry signature/category/severity.
@@ -567,7 +531,7 @@ INSERT OR IGNORE INTO role_permissions (role_id, permission) VALUES
     (2, 'interface:read'), (2, 'interface:write'),
     (2, 'enrollment:read'), (2, 'enrollment:write'), (2, 'enrollment:delete'),
     (2, 'alert:read'), (2, 'alert:write'), (2, 'alert:delete'),
-    (2, 'event:read'),
+    (2, 'event:read'), (2, 'event:delete'),
     (2, 'audit:read'),
     (2, 'token:read'),
     (2, 'tenant:read');
@@ -591,7 +555,7 @@ INSERT OR IGNORE INTO role_permissions (role_id, permission) VALUES
     (4, 'interface:read'), (4, 'interface:write'),
     (4, 'enrollment:read'), (4, 'enrollment:write'), (4, 'enrollment:delete'),
     (4, 'alert:read'), (4, 'alert:write'), (4, 'alert:delete'),
-    (4, 'event:read'),
+    (4, 'event:read'), (4, 'event:delete'),
     (4, 'audit:read'),
     (4, 'token:read'), (4, 'token:write'), (4, 'token:delete'),
     (4, 'iam:read'), (4, 'iam:write'), (4, 'iam:delete'),
