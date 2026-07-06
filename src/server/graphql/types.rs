@@ -803,14 +803,21 @@ pub struct ServerFeaturesOutput {
     pub ipfix: bool,
 }
 
-/// Processing-time percentile statistics
+/// Processing-time percentile statistics.
+///
+/// Computed over the packets processed since the previous poll of the same
+/// (interface, direction) — not the cumulative lifetime histogram — so the
+/// values track current behavior.  The first poll reports lifetime stats; an
+/// idle poll window repeats the previous window's values.
 #[derive(SimpleObject, Clone, Debug)]
 pub struct TimingStatsOutput {
     pub p50_ns: i64,
     pub p95_ns: i64,
     pub p99_ns: i64,
     pub p999_ns: i64,
+    /// Samples in the measured window
     pub total_samples: i64,
+    /// log2(ns) histogram buckets for the measured window
     pub buckets: Vec<i64>,
 }
 
