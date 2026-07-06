@@ -532,7 +532,7 @@ xdp_sni_write_verdict(const struct flow_key *flow, __u32 action, __u64 now_ns,
  * Callers must only invoke this for cacheable flows (pure PASS/DROP — see
  * process_rule_actions' cacheable flag).
  */
-static __noinline void
+static __always_inline void
 xdp_policy_write_verdict(const struct flow_key *flow, __u32 action,
                          __u64 rule_id, __u64 now_ns, __u32 ifindex) {
   struct flow_verdict_key fv_key = {};
@@ -930,14 +930,8 @@ check_flow_verdict_cache(struct global_stats *stats,
 
 /*
  * Build the flow_verdict_key and check the verdict cache.
- *
- * Marked __noinline so the 64-byte key lives in this subprogram's frame
- * instead of xdp_policy_main's: main's frame plus its deepest callee must fit
- * the 512-byte combined stack limit, and main is the frame every callee
- * stacks onto.  The lookup/branch state also re-converges at the call
- * boundary instead of forking across the LPM walk.
  */
-static __noinline int
+static __always_inline int
 xdp_flow_verdict_cache_check(struct global_stats *stats,
                              const struct flow_key *flow, __u32 ifindex,
                              __u32 pkt_len, __u64 t0) {
