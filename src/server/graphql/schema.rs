@@ -20,10 +20,12 @@ use crate::server::cpu_affinity::{self, DefaultNicSysIo, NicAffinityStore};
 use crate::server::policy_service::{AddRuleParams, DeleteRuleParams, PolicyService};
 use crate::server::rule_registry::{RuleLifecycleKind, RuleState};
 #[cfg(feature = "suricata")]
-use crate::server::{EveConsumer, SuricataCoordinator, VethManager};
+use crate::server::{EveConsumer, SuricataAlert, SuricataCoordinator, VethManager};
 #[cfg(feature = "suricata")]
 use crate::types::InspectMode;
 use crate::types::{ActionParams, Direction, PolicyAction};
+#[cfg(feature = "suricata")]
+use tokio::sync::broadcast;
 
 use super::types::*;
 
@@ -75,6 +77,13 @@ pub struct AppState {
     pub suricata_coordinator: Arc<SuricataCoordinator>,
     #[cfg(feature = "suricata")]
     pub eve_consumer: Arc<Mutex<EveConsumer>>,
+    /// Outbound Suricata alert stream served by `/ws/alerts`. Fed by the IPS
+    /// enforcement loop, which re-broadcasts every EVE alert after verdict
+    /// installation with `action` rewritten to "blocked" when the flow was
+    /// actually dropped (Suricata itself is never inline and always reports
+    /// "allowed").
+    #[cfg(feature = "suricata")]
+    pub alert_stream_tx: broadcast::Sender<SuricataAlert>,
     pub bandwidth_tracker: BandwidthTracker,
     pub affinity: Arc<AffinityPlan>,
     /// Tracks pre-attach NIC IRQ/RPS affinity snapshots so they can be restored on detach.
@@ -101,6 +110,7 @@ impl AppState {
             veth_manager: Arc::new(Mutex::new(veth_manager)),
             suricata_coordinator: Arc::new(suricata_coordinator),
             eve_consumer: Arc::new(Mutex::new(eve_consumer)),
+            alert_stream_tx: broadcast::channel(1024).0,
             bandwidth_tracker: BandwidthTracker::new(),
             affinity,
             nic_affinity_store: Mutex::new(NicAffinityStore::new()),

@@ -178,7 +178,21 @@ export default function AlertsView() {
                   {a.srcIp ?? '?'}:{a.srcPort ?? 0} → {a.destIp ?? '?'}:{a.destPort ?? 0}
                 </td>
                 <td className="px-2 py-1 text-gray-400">{a.protocol ?? '—'}</td>
-                <td className="px-2 py-1 text-gray-400">{a.action ?? '—'}</td>
+                <td className="px-2 py-1">
+                  {a.action ? (
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                        a.action === 'blocked'
+                          ? 'bg-red-900/60 text-red-300'
+                          : 'bg-gray-700 text-gray-300'
+                      }`}
+                    >
+                      {a.action}
+                    </span>
+                  ) : (
+                    <span className="text-gray-400">—</span>
+                  )}
+                </td>
                 <td className="px-2 py-1 font-mono text-gray-500">{a.nodeId.slice(0, 12)}</td>
               </tr>
             ))}

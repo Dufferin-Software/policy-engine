@@ -85,6 +85,83 @@ pub fn alert_to_flow_verdict_key(alert: &SuricataAlert) -> Result<FlowVerdictKey
     Ok(key)
 }
 
+/// Turn one Suricata EVE alert into DROP flow verdicts (IPS mode only).
+///
+/// Returns `true` when at least one verdict was installed — i.e. the flow is
+/// now blocked and the alert should be reported with `action: "blocked"`.
+/// Suricata is never inline (it sees mirrored traffic), so its own EVE action
+/// field always says "allowed"; only this enforcement path knows whether the
+/// flow was actually dropped. In IDS mode, or when the alert carries no
+/// usable flow key, nothing is installed and `false` is returned.
+#[cfg(feature = "suricata")]
+pub fn enforce_alert(
+    service: &mut PolicyService,
+    alert: &SuricataAlert,
+    verdict_ttl_ns: u64,
+) -> bool {
+    if alert.alert.is_none() {
+        return false;
+    }
+    let Ok(key) = alert_to_flow_verdict_key(alert) else {
+        return false;
+    };
+    let is_ips = service
+        .get_inspect_config(Direction::Ingress)
+        .map(|c| InspectMode::from(c.mode) == InspectMode::Ips)
+        .unwrap_or(false);
+    if !is_ips {
+        return false;
+    }
+
+    let now_ns = monotonic_now_ns();
+    let verdict = FlowVerdict {
+        action: PolicyAction::Drop as u32,
+        _pad: 0,
+        timestamp_ns: now_ns,
+        expires_ns: now_ns + verdict_ttl_ns,
+        packets: 0,
+        bytes: 0,
+        rule_id: 0,
+    };
+    // The verdict cache is scoped per-interface (flow_verdict_key.ifindex),
+    // but a Suricata alert carries no ifindex. Install the DROP on every
+    // attached interface for the matching direction so the flow is blocked
+    // wherever it ingresses/egresses. The interface set is tiny and stale
+    // entries are LRU-reclaimed, so the spray is cheap.
+    let interfaces = service.get_interfaces();
+    // Ingress key blocks the server→client direction; the reversed key
+    // blocks client→server on egress.
+    let mut egress_key = key;
+    egress_key.saddr.copy_from_slice(&key.daddr);
+    egress_key.daddr.copy_from_slice(&key.saddr);
+    egress_key.sport = key.dport;
+    egress_key.dport = key.sport;
+    let mut installed = false;
+    for iface in &interfaces {
+        let ifindex = iface.ifindex as u32;
+        if iface.direction.eq_ignore_ascii_case("ingress") {
+            let mut k = key;
+            k.ifindex = ifindex;
+            if service
+                .update_flow_verdict(&k, &verdict, Direction::Ingress)
+                .is_ok()
+            {
+                installed = true;
+            }
+        } else if iface.direction.eq_ignore_ascii_case("egress") {
+            let mut k = egress_key;
+            k.ifindex = ifindex;
+            if service
+                .update_flow_verdict(&k, &verdict, Direction::Egress)
+                .is_ok()
+            {
+                installed = true;
+            }
+        }
+    }
+    installed
+}
+
 /// Periodic evictor for expired flow verdict cache entries.
 ///
 /// Holds only the sweep cadence; it operates on the shared [`PolicyService`]
@@ -176,6 +253,38 @@ mod tests {
         PolicyService::new(Box::new(mock))
     }
 
+    #[cfg(feature = "suricata")]
+    fn make_full_alert() -> SuricataAlert {
+        let mut alert = make_alert("10.0.0.1", "192.168.1.1", 12345, 80, "TCP");
+        alert.alert = Some(super::super::eve_consumer::AlertInfo {
+            action: "allowed".to_string(),
+            signature_id: 2001,
+            signature: "ET SCAN".to_string(),
+            category: "Attempted Recon".to_string(),
+            severity: 2,
+        });
+        alert
+    }
+
+    #[cfg(feature = "suricata")]
+    fn inspect_config(mode: InspectMode) -> InspectConfig {
+        InspectConfig {
+            mode: mode as u32,
+            mirror_ifindex: 0,
+            _pad: [0; 2],
+        }
+    }
+
+    #[cfg(feature = "suricata")]
+    fn attachment(ifindex: i32, direction: &str) -> crate::shared_types::InterfaceAttachment {
+        crate::shared_types::InterfaceAttachment {
+            interface: format!("eth{ifindex}"),
+            ifindex,
+            mode: "native".to_string(),
+            direction: direction.to_string(),
+        }
+    }
+
     // ── alert_to_flow_verdict_key ─────────────────────────────────────────
 
     #[cfg(feature = "suricata")]
@@ -264,6 +373,83 @@ mod tests {
         let saddr = key.saddr;
         assert_eq!(af, AF_INET);
         assert_eq!(&saddr[..4], &[0, 0, 0, 0]);
+    }
+
+    // ── enforce_alert ─────────────────────────────────────────────────────
+
+    #[cfg(feature = "suricata")]
+    #[test]
+    fn enforce_ips_installs_verdicts_and_reports_blocked() {
+        let mut mock = MockBpfOperations::new();
+        mock.expect_get_inspect_config()
+            .returning(|_| Ok(inspect_config(InspectMode::Ips)));
+        mock.expect_get_attached_interfaces()
+            .returning(|| vec![attachment(2, "ingress"), attachment(3, "egress")]);
+        // Ingress: alert 5-tuple as-is on ifindex 2; egress: reversed on 3.
+        mock.expect_update_flow_verdict()
+            .withf(|key, verdict, direction| {
+                let (sport, dport, ifindex) = (key.sport, key.dport, key.ifindex);
+                let action = verdict.action;
+                action == PolicyAction::Drop as u32
+                    && match direction {
+                        Direction::Ingress => sport == 12345 && dport == 80 && ifindex == 2,
+                        Direction::Egress => sport == 80 && dport == 12345 && ifindex == 3,
+                    }
+            })
+            .times(2)
+            .returning(|_, _, _| Ok(()));
+
+        let mut service = make_service(mock);
+        assert!(enforce_alert(&mut service, &make_full_alert(), 1_000_000));
+    }
+
+    #[cfg(feature = "suricata")]
+    #[test]
+    fn enforce_ids_mode_installs_nothing() {
+        let mut mock = MockBpfOperations::new();
+        mock.expect_get_inspect_config()
+            .returning(|_| Ok(inspect_config(InspectMode::Ids)));
+        // update_flow_verdict must NOT be called.
+
+        let mut service = make_service(mock);
+        assert!(!enforce_alert(&mut service, &make_full_alert(), 1_000_000));
+    }
+
+    #[cfg(feature = "suricata")]
+    #[test]
+    fn enforce_without_alert_info_is_noop() {
+        // No mock expectations: an EVE record without an `alert` object must
+        // not even query the inspect config.
+        let mut service = make_service(MockBpfOperations::new());
+        let alert = make_alert("10.0.0.1", "192.168.1.1", 12345, 80, "TCP");
+        assert!(!enforce_alert(&mut service, &alert, 1_000_000));
+    }
+
+    #[cfg(feature = "suricata")]
+    #[test]
+    fn enforce_ips_without_interfaces_reports_allowed() {
+        let mut mock = MockBpfOperations::new();
+        mock.expect_get_inspect_config()
+            .returning(|_| Ok(inspect_config(InspectMode::Ips)));
+        mock.expect_get_attached_interfaces().returning(Vec::new);
+
+        let mut service = make_service(mock);
+        assert!(!enforce_alert(&mut service, &make_full_alert(), 1_000_000));
+    }
+
+    #[cfg(feature = "suricata")]
+    #[test]
+    fn enforce_ips_verdict_write_failure_reports_allowed() {
+        let mut mock = MockBpfOperations::new();
+        mock.expect_get_inspect_config()
+            .returning(|_| Ok(inspect_config(InspectMode::Ips)));
+        mock.expect_get_attached_interfaces()
+            .returning(|| vec![attachment(2, "ingress")]);
+        mock.expect_update_flow_verdict()
+            .returning(|_, _, _| Err(anyhow::anyhow!("map full")));
+
+        let mut service = make_service(mock);
+        assert!(!enforce_alert(&mut service, &make_full_alert(), 1_000_000));
     }
 
     #[cfg(feature = "suricata")]

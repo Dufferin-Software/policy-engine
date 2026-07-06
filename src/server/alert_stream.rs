@@ -8,8 +8,11 @@
 //! Close frame on the server shutdown signal so graceful shutdown is not
 //! held up by connected clients.
 //!
-//! The stream is fed by the [`EveConsumer`](super::eve_consumer::EveConsumer)
-//! broadcast channel, which exists (in `AppState`) from process start.  While
+//! The stream is fed by `AppState::alert_stream_tx`, which the IPS
+//! enforcement loop populates after processing each EVE alert: in IPS mode
+//! the alert's action is rewritten to "blocked" when a DROP verdict was
+//! installed (Suricata only sees mirrored traffic, so its own action field
+//! always says "allowed").  The channel exists from process start; while
 //! inspection is disabled the stream simply idles — clients can stay
 //! connected across enable/disable cycles.
 
@@ -31,7 +34,7 @@ pub async fn ws_alerts(
 ) -> actix_web::Result<HttpResponse> {
     let (response, mut session, mut msg_stream) = actix_ws::handle(&req, body)?;
 
-    let mut rx = state.eve_consumer.lock().await.subscribe();
+    let mut rx = state.alert_stream_tx.subscribe();
     // Each connection gets its own watch receiver so they track "seen" state
     // independently.  subscribe() always reflects the current sender value.
     let mut shutdown_rx = shutdown.subscribe();

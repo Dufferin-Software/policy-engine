@@ -21,9 +21,9 @@ use super::bpf_manager::BpfManager;
 #[cfg(feature = "suricata")]
 use super::eve_consumer::EveConsumer;
 use super::event_stream;
-use super::flow_verdict_manager::FlowVerdictManager;
 #[cfg(feature = "suricata")]
-use super::flow_verdict_manager::{alert_to_flow_verdict_key, monotonic_now_ns};
+use super::flow_verdict_manager::enforce_alert;
+use super::flow_verdict_manager::FlowVerdictManager;
 use super::graphql::{build_schema, AppState, PeerAddr, PolicyEngineSchema};
 use super::metrics::{self, MetricsFormatter, PrometheusFormatter};
 use super::policy_service::{PolicyService, QueueCmd};
@@ -34,8 +34,6 @@ use super::suricata_coordinator::SuricataCoordinator;
 #[cfg(feature = "suricata")]
 use super::veth_manager::VethManager;
 use crate::config::{AffinityPlan, ConfigProvider};
-#[cfg(feature = "suricata")]
-use crate::types::{Direction, FlowVerdict, InspectMode, PolicyAction};
 
 /// GraphQL endpoint handler
 async fn graphql_handler(
@@ -317,11 +315,14 @@ fn spawn_flow_verdict_cleanup_loop(state: Arc<AppState>) {
     });
 }
 
-/// Background loop: turn Suricata EVE alerts into DROP flow verdicts.
+/// Background loop: turn Suricata EVE alerts into DROP flow verdicts and
+/// re-broadcast every alert on the outbound stream served by `/ws/alerts`.
 ///
-/// A verdict is installed only in IPS mode; in IDS mode alerts are still received
-/// and broadcast but never block traffic. When dropping, both directions of the
-/// flow (server→client ingress and client→server egress) are blocked.
+/// A verdict is installed only in IPS mode; in IDS mode alerts are forwarded
+/// unmodified and never block traffic. When dropping, both directions of the
+/// flow (server→client ingress and client→server egress) are blocked and the
+/// alert's action is rewritten from "allowed" to "blocked" — Suricata sees
+/// only mirrored traffic, so its own EVE action never reflects enforcement.
 #[cfg(feature = "suricata")]
 fn spawn_ips_enforcement_loop(state: Arc<AppState>) {
     tokio::spawn(async move {
@@ -329,59 +330,17 @@ fn spawn_ips_enforcement_loop(state: Arc<AppState>) {
         let verdict_ttl_ns = std::time::Duration::from_secs(300).as_nanos() as u64;
         loop {
             match rx.recv().await {
-                Ok(alert) => {
-                    if alert.alert.is_some() {
-                        if let Ok(key) = alert_to_flow_verdict_key(&alert) {
-                            let mut service = state.service.lock().await;
-                            let is_ips = service
-                                .get_inspect_config(Direction::Ingress)
-                                .map(|c| InspectMode::from(c.mode) == InspectMode::Ips)
-                                .unwrap_or(false);
-                            if is_ips {
-                                let now_ns = monotonic_now_ns();
-                                let verdict = FlowVerdict {
-                                    action: PolicyAction::Drop as u32,
-                                    _pad: 0,
-                                    timestamp_ns: now_ns,
-                                    expires_ns: now_ns + verdict_ttl_ns,
-                                    packets: 0,
-                                    bytes: 0,
-                                    rule_id: 0,
-                                };
-                                // The verdict cache is scoped per-interface
-                                // (flow_verdict_key.ifindex), but a Suricata alert
-                                // carries no ifindex. Install the DROP on every
-                                // attached interface for the matching direction so
-                                // the flow is blocked wherever it ingresses/egresses.
-                                // The interface set is tiny and stale entries are
-                                // LRU-reclaimed, so the spray is cheap.
-                                let interfaces = service.get_interfaces();
-                                // Ingress key blocks the server→client direction;
-                                // the reversed key blocks client→server on egress.
-                                let mut egress_key = key;
-                                egress_key.saddr.copy_from_slice(&key.daddr);
-                                egress_key.daddr.copy_from_slice(&key.saddr);
-                                egress_key.sport = key.dport;
-                                egress_key.dport = key.sport;
-                                for iface in &interfaces {
-                                    let ifindex = iface.ifindex as u32;
-                                    if iface.direction.eq_ignore_ascii_case("ingress") {
-                                        let mut k = key;
-                                        k.ifindex = ifindex;
-                                        service
-                                            .update_flow_verdict(&k, &verdict, Direction::Ingress)
-                                            .ok();
-                                    } else if iface.direction.eq_ignore_ascii_case("egress") {
-                                        let mut k = egress_key;
-                                        k.ifindex = ifindex;
-                                        service
-                                            .update_flow_verdict(&k, &verdict, Direction::Egress)
-                                            .ok();
-                                    }
-                                }
-                            }
+                Ok(mut alert) => {
+                    let blocked = {
+                        let mut service = state.service.lock().await;
+                        enforce_alert(&mut service, &alert, verdict_ttl_ns)
+                    };
+                    if blocked {
+                        if let Some(info) = alert.alert.as_mut() {
+                            info.action = "blocked".to_string();
                         }
                     }
+                    let _ = state.alert_stream_tx.send(alert);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     log::warn!("IPS enforcement loop missed {} alerts", n);
