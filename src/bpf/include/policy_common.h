@@ -484,7 +484,31 @@ struct nonip_sender_stats {
 };
 
 /*
- * Global statistics per interface
+ * Per-protocol packet/byte counters (used standalone for the per-IP-protocol
+ * maps and embedded as the l3[]/quic[] arrays in struct global_stats)
+ */
+struct proto_stats {
+  __u64 packets;
+  __u64 bytes;
+} __attribute__((packed));
+
+/*
+ * Bucket counts for the stats arrays embedded in struct global_stats.
+ * Keep in sync with L3_BUCKETS / QUIC_SLOTS / HIST_BUCKETS in src/types.rs.
+ */
+#define L3_PROTO_BUCKETS 5   /* 0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other */
+#define QUIC_STATS_SLOTS 4   /* 0=unused, 1=v1, 2=v2, 3=other QUIC */
+#define PROC_HIST_BUCKETS 64 /* log2(ns) processing-time buckets */
+
+/*
+ * Global statistics per interface.
+ *
+ * The l3[]/quic[]/proc_hist[] arrays used to live in standalone PERCPU_ARRAY
+ * maps (per_l3_stats, quic_stats, processing_time_hist and their tc_
+ * mirrors).  They are embedded here so the datapath updates them through the
+ * global_stats pointer it already holds instead of paying one map lookup
+ * each per packet.  This also scopes them per-interface; userspace sums
+ * across interfaces to reproduce the old global view.
  */
 struct global_stats {
   __u64 rx_packets;
@@ -497,41 +521,27 @@ struct global_stats {
   __u64 policy_redirects;
   __u64 parse_errors;
   __u64 tail_calls;
-  __u64 bum_packets;           /* Broadcast/Unknown-unicast/Multicast (non-IP) */
-  __u64 non_ip_unicast;        /* Non-IP unicast (e.g., ARP replies) */
-  __u64 inspect_redirects;     /* Packets mirrored to Suricata via INSPECT action */
-  __u64 fragments;             /* Non-first IP fragments (no L4 header available) */
-  __u64 verdict_pass_packets;  /* Flow verdict cache: packets that hit a PASS
-                                  verdict */
-  __u64 verdict_pass_bytes;    /* Flow verdict cache: bytes that hit a PASS verdict
-                                */
-  __u64 verdict_drop_packets;  /* Flow verdict cache: packets that hit a DROP
-                                  verdict */
-  __u64 verdict_drop_bytes;    /* Flow verdict cache: bytes that hit a DROP verdict
-                                */
-  __u64 fib_forwarded_packets; /* Packets forwarded via XDP FIB redirect */
-  __u64 fib_forwarded_bytes;   /* Bytes forwarded via XDP FIB redirect */
-  __u64 fib_fallback_packets;  /* FIB lookup attempted but fell back to XDP_PASS */
-  __u64 urpf_drop_packets;     /* Packets dropped by the uRPF reverse-path check */
-  __u64 urpf_drop_bytes;       /* Bytes dropped by the uRPF reverse-path check */
+  __u64 bum_packets;                         /* Broadcast/Unknown-unicast/Multicast (non-IP) */
+  __u64 non_ip_unicast;                      /* Non-IP unicast (e.g., ARP replies) */
+  __u64 inspect_redirects;                   /* Packets mirrored to Suricata via INSPECT action */
+  __u64 fragments;                           /* Non-first IP fragments (no L4 header available) */
+  __u64 verdict_pass_packets;                /* Flow verdict cache: packets that hit a PASS
+                                                verdict */
+  __u64 verdict_pass_bytes;                  /* Flow verdict cache: bytes that hit a PASS verdict
+                                              */
+  __u64 verdict_drop_packets;                /* Flow verdict cache: packets that hit a DROP
+                                                verdict */
+  __u64 verdict_drop_bytes;                  /* Flow verdict cache: bytes that hit a DROP verdict
+                                              */
+  __u64 fib_forwarded_packets;               /* Packets forwarded via XDP FIB redirect */
+  __u64 fib_forwarded_bytes;                 /* Bytes forwarded via XDP FIB redirect */
+  __u64 fib_fallback_packets;                /* FIB lookup attempted but fell back to XDP_PASS */
+  __u64 urpf_drop_packets;                   /* Packets dropped by the uRPF reverse-path check */
+  __u64 urpf_drop_bytes;                     /* Bytes dropped by the uRPF reverse-path check */
+  struct proto_stats l3[L3_PROTO_BUCKETS];   /* per-L3-protocol counters */
+  struct proto_stats quic[QUIC_STATS_SLOTS]; /* per-QUIC-version (XDP only) */
+  __u64 proc_hist[PROC_HIST_BUCKETS];        /* log2 ns processing-time histogram */
 } __attribute__((packed));
-
-/*
- * Per-protocol packet/byte counters (indexed by IP protocol number 0-255)
- */
-struct proto_stats {
-  __u64 packets;
-  __u64 bytes;
-} __attribute__((packed));
-
-/*
- * Per-QUIC-version packet/byte counters.
- * Slots: 0=unused, 1=v1 (RFC 9000), 2=v2 (RFC 9369), 3=other QUIC
- */
-struct quic_stats_val {
-  __u64 packets;
-  __u64 bytes;
-};
 
 /*
  * Integer log2 helper for histogram bucket assignment.
@@ -563,6 +573,70 @@ static __always_inline __u32 log2_u64(__u64 v) {
     r += 1;
   }
   return r;
+}
+
+/*
+ * Update the per-L3-protocol counters embedded in global_stats, bucketed by
+ * ethertype (0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other).  Shared by the XDP
+ * ingress and TC egress programs; stats is the pre-looked-up per-CPU
+ * global_stats slot for the packet's interface.
+ */
+static __always_inline void update_l3_proto_stats(struct global_stats *stats,
+                                                  __u16 eth_proto,
+                                                  __u32 pkt_len) {
+  if (!stats)
+    return;
+  __u32 bucket = 4;
+  if (eth_proto == ETHERTYPE_IPV4)
+    bucket = 0;
+  else if (eth_proto == ETHERTYPE_IPV6)
+    bucket = 1;
+  else if (eth_proto == ETHERTYPE_ARP)
+    bucket = 2;
+  else if (eth_proto == ETHERTYPE_MPLS || eth_proto == ETHERTYPE_MPLS_MC)
+    bucket = 3;
+  stats->l3[bucket].packets++;
+  stats->l3[bucket].bytes += pkt_len;
+}
+
+/*
+ * Update the per-QUIC-version counters embedded in global_stats
+ * (slots: 1=v1 RFC 9000, 2=v2 RFC 9369, 3=other QUIC; slot 0 unused).
+ * XDP ingress only; the TC egress program does not classify QUIC.
+ */
+static __always_inline void update_quic_stats(struct global_stats *stats,
+                                              __u16 flags, __u32 pkt_len) {
+  if (!stats)
+    return;
+  __u32 slot;
+  if (flags & FLOW_FLAG_QUIC_V1)
+    slot = 1;
+  else if (flags & FLOW_FLAG_QUIC_V2)
+    slot = 2;
+  else
+    slot = 3;
+  stats->quic[slot].packets++;
+  stats->quic[slot].bytes += pkt_len;
+}
+
+/*
+ * Record elapsed processing time into the log2-ns histogram embedded in
+ * global_stats.  The _at variant takes a caller-provided 'now' so paths that
+ * already read the clock don't pay a second bpf_ktime_get_ns() call.
+ */
+static __always_inline void record_proc_time_at(struct global_stats *stats,
+                                                __u64 t0, __u64 now) {
+  if (!stats)
+    return;
+  __u32 slot = log2_u64(now - t0);
+  if (slot > PROC_HIST_BUCKETS - 1)
+    slot = PROC_HIST_BUCKETS - 1;
+  stats->proc_hist[slot]++;
+}
+
+static __always_inline void record_proc_time(struct global_stats *stats,
+                                             __u64 t0) {
+  record_proc_time_at(stats, t0, bpf_ktime_get_ns());
 }
 
 /*

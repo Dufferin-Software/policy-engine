@@ -3950,6 +3950,7 @@ mod tests {
                         fib_fallback_packets: 0,
                         urpf_drop_packets: 0,
                         urpf_drop_bytes: 0,
+                        ..Default::default()
                     })
                 });
 

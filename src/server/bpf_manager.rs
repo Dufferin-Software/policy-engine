@@ -615,13 +615,7 @@ impl BpfManager {
             ("pkt_scratch", &mut open_skel.maps.pkt_scratch),
             ("default_action", &mut open_skel.maps.default_action),
             ("fib_config_map", &mut open_skel.maps.fib_config_map),
-            (
-                "processing_time_hist",
-                &mut open_skel.maps.processing_time_hist,
-            ),
             ("per_proto_stats", &mut open_skel.maps.per_proto_stats),
-            ("per_l3_stats", &mut open_skel.maps.per_l3_stats),
-            ("quic_stats", &mut open_skel.maps.quic_stats),
             ("sni_rules", &mut open_skel.maps.sni_rules),
             ("mac_rules", &mut open_skel.maps.mac_rules),
         ];
@@ -713,12 +707,7 @@ impl BpfManager {
             ("tc_events", &mut open_skel.maps.tc_events),
             ("tc_pkt_scratch", &mut open_skel.maps.tc_pkt_scratch),
             ("tc_default_action", &mut open_skel.maps.tc_default_action),
-            (
-                "tc_processing_time_hist",
-                &mut open_skel.maps.tc_processing_time_hist,
-            ),
             ("tc_per_proto_stats", &mut open_skel.maps.tc_per_proto_stats),
-            ("tc_per_l3_stats", &mut open_skel.maps.tc_per_l3_stats),
             ("tc_sni_rules", &mut open_skel.maps.tc_sni_rules),
             ("tc_mac_rules", &mut open_skel.maps.tc_mac_rules),
         ];
@@ -857,10 +846,7 @@ impl BpfManager {
         pin_if_needed!(skel.maps.flow_verdict_cache, "flow_verdict_cache");
         #[cfg(feature = "suricata")]
         pin_if_needed!(skel.maps.inspect_config, "inspect_config");
-        pin_if_needed!(skel.maps.processing_time_hist, "processing_time_hist");
         pin_if_needed!(skel.maps.per_proto_stats, "per_proto_stats");
-        pin_if_needed!(skel.maps.per_l3_stats, "per_l3_stats");
-        pin_if_needed!(skel.maps.quic_stats, "quic_stats");
         // flows_to_inspect is pinned here (XDP skeleton owns it); TC reuses
         // it from this path via try_reuse_pinned_maps_tc.
         #[cfg(feature = "suricata")]
@@ -920,9 +906,7 @@ impl BpfManager {
         pin_if_needed!(skel.maps.tc_flow_verdict_cache, "tc_flow_verdict_cache");
         #[cfg(feature = "suricata")]
         pin_if_needed!(skel.maps.tc_inspect_config, "tc_inspect_config");
-        pin_if_needed!(skel.maps.tc_processing_time_hist, "tc_processing_time_hist");
         pin_if_needed!(skel.maps.tc_per_proto_stats, "tc_per_proto_stats");
-        pin_if_needed!(skel.maps.tc_per_l3_stats, "tc_per_l3_stats");
         pin_if_needed!(skel.maps.tc_sni_rules, "tc_sni_rules");
         pin_if_needed!(skel.maps.tc_mac_rules, "tc_mac_rules");
         pin_if_needed!(skel.maps.tc_quic_inspect_events, "tc_quic_inspect_events");
@@ -2132,30 +2116,7 @@ impl BpfManager {
                     let mut stats = GlobalStats::default();
                     plain::copy_from_bytes(&mut stats, &cpu_value)
                         .map_err(|e| anyhow!("Failed to parse stats: {:?}", e))?;
-
-                    total_stats.rx_packets += stats.rx_packets;
-                    total_stats.rx_bytes += stats.rx_bytes;
-                    total_stats.tx_packets += stats.tx_packets;
-                    total_stats.tx_bytes += stats.tx_bytes;
-                    total_stats.policy_matches += stats.policy_matches;
-                    total_stats.policy_drops += stats.policy_drops;
-                    total_stats.policy_pass += stats.policy_pass;
-                    total_stats.policy_redirects += stats.policy_redirects;
-                    total_stats.parse_errors += stats.parse_errors;
-                    total_stats.tail_calls += stats.tail_calls;
-                    total_stats.bum_packets += stats.bum_packets;
-                    total_stats.non_ip_unicast += stats.non_ip_unicast;
-                    total_stats.inspect_redirects += stats.inspect_redirects;
-                    total_stats.fragments += stats.fragments;
-                    total_stats.verdict_pass_packets += stats.verdict_pass_packets;
-                    total_stats.verdict_pass_bytes += stats.verdict_pass_bytes;
-                    total_stats.verdict_drop_packets += stats.verdict_drop_packets;
-                    total_stats.verdict_drop_bytes += stats.verdict_drop_bytes;
-                    total_stats.fib_forwarded_packets += stats.fib_forwarded_packets;
-                    total_stats.fib_forwarded_bytes += stats.fib_forwarded_bytes;
-                    total_stats.fib_fallback_packets += stats.fib_fallback_packets;
-                    total_stats.urpf_drop_packets += stats.urpf_drop_packets;
-                    total_stats.urpf_drop_bytes += stats.urpf_drop_bytes;
+                    total_stats.accumulate(&stats);
                 }
             }
         }
@@ -2163,33 +2124,43 @@ impl BpfManager {
         Ok(total_stats)
     }
 
-    /// Get processing-time histogram buckets (64 entries, summed across CPUs)
-    pub fn get_processing_time_hist(&self, direction: Direction) -> Result<Vec<u64>> {
-        let mut totals = vec![0u64; crate::types::HIST_BUCKETS];
+    /// Sum global_stats across all interface slots and CPUs for a direction.
+    /// Backs the l3/quic/proc_hist getters, which report engine-wide totals
+    /// for counters that are tracked per-interface inside struct global_stats.
+    fn sum_global_stats(&self, direction: Direction) -> Result<GlobalStats> {
+        let mut total_stats = GlobalStats::default();
         let map: Option<&dyn MapCore> = match direction {
             Direction::Ingress => self
                 .xdp_skel
                 .as_ref()
-                .map(|s| &s.maps.processing_time_hist as &dyn MapCore),
+                .map(|s| &s.maps.global_stats as &dyn MapCore),
             Direction::Egress => self
                 .tc_skel
                 .as_ref()
-                .map(|s| &s.maps.tc_processing_time_hist as &dyn MapCore),
+                .map(|s| &s.maps.tc_global_stats as &dyn MapCore),
         };
+
         if let Some(map) = map {
-            for slot in 0u32..crate::types::HIST_BUCKETS as u32 {
-                let key = slot.to_ne_bytes();
+            for ifslot in 0..MAX_INTERFACES {
+                let key = ifslot.to_ne_bytes();
                 if let Some(values) = map.lookup_percpu(&key, MapFlags::ANY)? {
-                    for cpu_val in values {
-                        if cpu_val.len() >= 8 {
-                            let v = u64::from_ne_bytes(cpu_val[..8].try_into().unwrap());
-                            totals[slot as usize] += v;
-                        }
+                    for cpu_value in values {
+                        let mut stats = GlobalStats::default();
+                        plain::copy_from_bytes(&mut stats, &cpu_value)
+                            .map_err(|e| anyhow!("Failed to parse stats: {:?}", e))?;
+                        total_stats.accumulate(&stats);
                     }
                 }
             }
         }
-        Ok(totals)
+
+        Ok(total_stats)
+    }
+
+    /// Get processing-time histogram buckets (64 entries, summed across CPUs
+    /// and interfaces)
+    pub fn get_processing_time_hist(&self, direction: Direction) -> Result<Vec<u64>> {
+        Ok(self.sum_global_stats(direction)?.proc_hist.to_vec())
     }
 
     /// Get per-protocol packet/byte stats (256 entries, summed across CPUs)
@@ -2223,69 +2194,29 @@ impl BpfManager {
         Ok(totals)
     }
 
-    /// Get L3 protocol stats (4 buckets: 0=IPv4, 1=IPv6, 2=ARP, 3=Other)
+    /// Get L3 protocol stats (5 buckets: 0=IPv4, 1=IPv6, 2=ARP, 3=MPLS,
+    /// 4=Other), summed across CPUs and interfaces
     pub fn get_l3_stats(&self, direction: Direction) -> Result<Vec<crate::types::ProtoStats>> {
-        use crate::types::ProtoStats;
-        let mut totals = vec![ProtoStats::default(); 5];
-        let map: Option<&dyn MapCore> = match direction {
-            Direction::Ingress => self
-                .xdp_skel
-                .as_ref()
-                .map(|s| &s.maps.per_l3_stats as &dyn MapCore),
-            Direction::Egress => self
-                .tc_skel
-                .as_ref()
-                .map(|s| &s.maps.tc_per_l3_stats as &dyn MapCore),
-        };
-        if let Some(map) = map {
-            for bucket in 0u32..5 {
-                let key = bucket.to_ne_bytes();
-                if let Some(values) = map.lookup_percpu(&key, MapFlags::ANY)? {
-                    for cpu_val in values {
-                        let mut ps = ProtoStats::default();
-                        if plain::copy_from_bytes(&mut ps, &cpu_val).is_ok() {
-                            totals[bucket as usize].packets += ps.packets;
-                            totals[bucket as usize].bytes += ps.bytes;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(totals)
+        Ok(self.sum_global_stats(direction)?.l3.to_vec())
     }
 
     /// Get per-QUIC-version packet/byte stats.
     /// Returns a Vec of (version_name, packets, bytes) triples.
     /// Only ingress (XDP) stats are collected; egress returns an empty vec.
     pub fn get_quic_stats(&self, direction: Direction) -> Result<Vec<(String, u64, u64)>> {
-        if direction == Direction::Egress {
+        if direction == Direction::Egress || self.xdp_skel.is_none() {
             return Ok(vec![]);
         }
-        let map: Option<&dyn MapCore> = self
-            .xdp_skel
-            .as_ref()
-            .map(|s| &s.maps.quic_stats as &dyn MapCore);
-        let Some(map) = map else {
-            return Ok(vec![]);
-        };
+        let totals = self.sum_global_stats(Direction::Ingress)?;
         let labels = ["v1", "v2", "other"];
-        let mut result = Vec::with_capacity(3);
-        for (i, label) in labels.iter().enumerate() {
-            let slot = (i as u32) + 1; // slots 1, 2, 3
-            let key = slot.to_ne_bytes();
-            let mut packets: u64 = 0;
-            let mut bytes: u64 = 0;
-            if let Some(values) = map.lookup_percpu(&key, MapFlags::ANY)? {
-                for cpu_val in values {
-                    if cpu_val.len() >= 16 {
-                        packets += u64::from_ne_bytes(cpu_val[0..8].try_into().unwrap_or([0; 8]));
-                        bytes += u64::from_ne_bytes(cpu_val[8..16].try_into().unwrap_or([0; 8]));
-                    }
-                }
-            }
-            result.push((label.to_string(), packets, bytes));
-        }
-        Ok(result)
+        Ok(labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let s = &totals.quic[i + 1]; // slots 1, 2, 3 (slot 0 unused)
+                (label.to_string(), s.packets, s.bytes)
+            })
+            .collect())
     }
 
     /// Get ethertype statistics for an interface

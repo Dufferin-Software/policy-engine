@@ -343,17 +343,6 @@ struct {
 } src_groups_v6 SEC(".maps");
 
 /*
- * Processing-time histogram (log2 ns buckets 0-63, summed across all
- * interfaces)
- */
-struct {
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 64);
-  __type(key, __u32);
-  __type(value, __u64);
-} processing_time_hist SEC(".maps");
-
-/*
  * Per-IP-protocol packet/byte counters (indexed by protocol number 0-255)
  */
 struct {
@@ -363,53 +352,9 @@ struct {
   __type(value, struct proto_stats);
 } per_proto_stats SEC(".maps");
 
-/*
- * Per-L3-protocol packet/byte counters (ingress).
- * Buckets: 0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other
- */
-struct {
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 5);
-  __type(key, __u32);
-  __type(value, struct proto_stats);
-} per_l3_stats SEC(".maps");
-
-/*
- * Per-QUIC-version packet/byte counters (ingress).
- * Slots: 0=unused, 1=v1 (RFC 9000), 2=v2 (RFC 9369), 3=other QUIC
- */
-struct {
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 4);
-  __type(key, __u32);
-  __type(value, struct quic_stats_val);
-} quic_stats SEC(".maps");
-
-/* Record elapsed ns into the log2 histogram (reads clock internally) */
-#define XDP_RECORD_TIMING(t0)                                         \
-  do {                                                                \
-    __u64 __delta = bpf_ktime_get_ns() - (t0);                        \
-    __u32 __slot = log2_u64(__delta);                                 \
-    if (__slot > 63)                                                  \
-      __slot = 63;                                                    \
-    __u64 *__h = bpf_map_lookup_elem(&processing_time_hist, &__slot); \
-    if (__h)                                                          \
-      (*__h)++;                                                       \
-  } while (0)
-
-/* Record elapsed ns using a pre-fetched 'now' timestamp — avoids an extra
- * bpf_ktime_get_ns() call on paths that already read the clock (e.g. the
- * verdict-cache check). */
-#define XDP_RECORD_TIMING_AT(t0, now)                                 \
-  do {                                                                \
-    __u64 __delta = (now) - (t0);                                     \
-    __u32 __slot = log2_u64(__delta);                                 \
-    if (__slot > 63)                                                  \
-      __slot = 63;                                                    \
-    __u64 *__h = bpf_map_lookup_elem(&processing_time_hist, &__slot); \
-    if (__h)                                                          \
-      (*__h)++;                                                       \
-  } while (0)
+/* Per-L3-protocol, per-QUIC-version, and processing-time-histogram counters
+ * live inside struct global_stats (see policy_common.h) — updated through the
+ * global_stats pointer the datapath already holds, no extra map lookups. */
 
 /*
  * Build a flow_verdict_cache key from a parsed flow_key.  Shared by the
@@ -587,7 +532,7 @@ int xdp_sni_inspect(struct xdp_md *ctx) {
     if (meta->sni_seen)
       xdp_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now,
                             ctx->ingress_ifindex);
-    XDP_RECORD_TIMING_AT(meta->t0, sni_now);
+    record_proc_time_at(sni_gs, meta->t0, sni_now);
     FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, XDP_PASS);
   }
 
@@ -705,7 +650,7 @@ int xdp_sni_inspect(struct xdp_md *ctx) {
     if (final_verdict == XDP_DROP) {
       xdp_sni_write_verdict(&meta->flow, ACTION_DROP, sni_now,
                             ctx->ingress_ifindex);
-      XDP_RECORD_TIMING_AT(meta->t0, sni_now);
+      record_proc_time_at(gs, meta->t0, sni_now);
       FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, rule_id, ACTION_DROP, XDP_DROP);
     }
     goto next_rule;
@@ -724,7 +669,7 @@ next_rule:
     if (meta->sni_seen)
       xdp_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now,
                             ctx->ingress_ifindex);
-    XDP_RECORD_TIMING_AT(meta->t0, sni_now);
+    record_proc_time_at(sni_gs, meta->t0, sni_now);
   }
   FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, XDP_PASS);
 }
@@ -756,6 +701,11 @@ int xdp_quic_initial_inspect(struct xdp_md *ctx) {
   struct pkt_meta *meta = bpf_map_lookup_elem(&pkt_scratch, &zero);
   if (!meta)
     return XDP_PASS;
+
+  /* For the processing-time histogram at pass_through (replaces the old
+   * standalone histogram map lookup — net-neutral cost). */
+  __u32 q_ifindex = ctx->ingress_ifindex % MAX_INTERFACES;
+  struct global_stats *q_gs = bpf_map_lookup_elem(&global_stats, &q_ifindex);
 
   void *data = (void *)(long)ctx->data;
   const void *data_end = (void *)(long)ctx->data_end;
@@ -862,7 +812,7 @@ int xdp_quic_initial_inspect(struct xdp_md *ctx) {
    * tail-call per packet, which is bounded (a handshake is <100 packets). */
 
 pass_through:
-  XDP_RECORD_TIMING(meta->t0);
+  record_proc_time(q_gs, meta->t0);
   FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, XDP_PASS);
 }
 
@@ -904,7 +854,7 @@ check_flow_verdict_cache(struct global_stats *stats,
         stats->policy_matches++;
     }
     /* Reuse 'now' already read above — avoids an extra clock call */
-    XDP_RECORD_TIMING_AT(t0, now);
+    record_proc_time_at(stats, t0, now);
     return XDP_DROP;
   } else if (fv->action == ACTION_PASS) {
     /* Cached PASS verdict: flow previously inspected and not flagged.
@@ -921,7 +871,7 @@ check_flow_verdict_cache(struct global_stats *stats,
       if (stats)
         stats->policy_matches++;
     }
-    XDP_RECORD_TIMING_AT(t0, now);
+    record_proc_time_at(stats, t0, now);
     return XDP_PASS;
   }
 
@@ -1057,7 +1007,7 @@ int xdp_policy_main(struct xdp_md *ctx) {
   if ((void *)(eth + 1) > data_end) {
     if (stats)
       stats->parse_errors++;
-    XDP_RECORD_TIMING(t0);
+    record_proc_time(stats, t0);
     return XDP_PASS;
   }
 
@@ -1075,12 +1025,12 @@ int xdp_policy_main(struct xdp_md *ctx) {
     /* Failed to parse ethertype - treat as parse error */
     if (stats)
       stats->parse_errors++;
-    XDP_RECORD_TIMING(t0);
+    record_proc_time(stats, t0);
     return XDP_PASS;
   }
 
   /* Classify L3 protocol (buckets: 0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other) */
-  update_l3_proto_stats(eth_proto, pkt_len);
+  update_l3_proto_stats(stats, eth_proto, pkt_len);
 
   /* Parse packet to extract flow key.
    * Returns >= 0 (L4 offset) on success, PARSE_NONFIRST_FRAG (-2) for a
@@ -1113,24 +1063,26 @@ int xdp_policy_main(struct xdp_md *ctx) {
       update_nonip_sender_stats(ctx->ingress_ifindex, pkt_src_mac, eth_proto);
     }
 
-    XDP_RECORD_TIMING(t0);
+    record_proc_time(stats, t0);
     return XDP_PASS;
   }
 
   /* Update per-IP-protocol stats (flow_key.protocol is valid from here) */
+  // todo: can this be per interface and thus folded into global stats?
   update_ip_proto_stats(flow_key.protocol, pkt_len);
 
   /* Update QUIC stats if this packet looks like QUIC */
   if (flow_key.flags & FLOW_FLAG_QUIC)
-    update_quic_stats(flow_key.flags, pkt_len);
+    update_quic_stats(stats, flow_key.flags, pkt_len);
 
   /* uRPF (unicast Reverse Path Forwarding) check.  Runs before policy and the
    * verdict cache so source-spoofed packets are dropped as cheaply as possible.
    * No-op (single map lookup) unless uRPF is enabled on this ingress interface.
    * Drops are accounted in global_stats by xdp_urpf_check itself. */
   if (xdp_urpf_check(ctx, stats, eth_proto, l3_off, pkt_len)) {
+    // todo: we should probably have 2 classes of drop, POLICY_DROP and URPF_DROP.
     update_action_stats(stats, ACTION_DROP);
-    XDP_RECORD_TIMING(t0);
+    record_proc_time(stats, t0);
     return XDP_DROP;
   }
 
@@ -1139,8 +1091,10 @@ int xdp_policy_main(struct xdp_md *ctx) {
    * source.  A hit short-circuits the policy lookup at XDP line rate. */
   int cached_verdict = xdp_flow_verdict_cache_check(
       stats, &flow_key, ctx->ingress_ifindex, pkt_len, t0);
-  if (cached_verdict >= 0)
+  if (cached_verdict >= 0) {
+    record_proc_time(stats, t0);
     return cached_verdict;
+  }
 
   /* Lookup policy (two-level LPM: src prefix → dst prefix → L4 rules).
    * Scoped per-interface by ctx->ingress_ifindex. */
@@ -1194,12 +1148,12 @@ int xdp_policy_main(struct xdp_md *ctx) {
       else
         bpf_tail_call(ctx, &xdp_dispatcher, XDP_DISPATCHER_SNI_SLOT);
       /* Tail call slot not loaded — fail open */
-      XDP_RECORD_TIMING(t0);
+      record_proc_time(stats, t0);
       update_action_stats(stats, ACTION_PASS);
       FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, fc_rule_id, ACTION_PASS, XDP_PASS);
     }
 
-    XDP_RECORD_TIMING(t0);
+    record_proc_time(stats, t0);
     /* Seed the policy verdict cache so every subsequent packet on this 5-tuple
      * short-circuits at the verdict-cache check above instead of re-walking the
      * two-level LPM trie.  Only for cacheable flows (pure PASS/DROP); LOG /
@@ -1225,7 +1179,7 @@ int xdp_policy_main(struct xdp_md *ctx) {
                              0, t0, ctx->ingress_ifindex);
 
     /* Return appropriate XDP verdict */
-    XDP_RECORD_TIMING(t0);
+    record_proc_time(stats, t0);
     switch (action) {
     case ACTION_DROP:
       FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, 0, ACTION_DROP, XDP_DROP);

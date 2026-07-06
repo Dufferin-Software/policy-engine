@@ -215,17 +215,20 @@ pub trait BpfOperations: Send + Sync {
     /// Get count of active flow verdicts
     fn get_flow_verdict_count(&self, direction: Direction) -> Result<u64>;
 
-    /// Get processing-time histogram buckets (64 entries, summed across CPUs)
+    /// Get processing-time histogram buckets (64 entries, summed across CPUs
+    /// and interfaces; tracked per-interface inside `GlobalStats::proc_hist`)
     fn get_processing_time_hist(&self, direction: Direction) -> Result<Vec<u64>>;
 
     /// Get per-protocol packet/byte stats (256 entries, summed across CPUs)
     fn get_proto_stats(&self, direction: Direction) -> Result<Vec<ProtoStats>>;
 
-    /// Get L3 protocol stats (4 buckets: 0=IPv4, 1=IPv6, 2=ARP, 3=Other)
+    /// Get L3 protocol stats (5 buckets: 0=IPv4, 1=IPv6, 2=ARP, 3=MPLS,
+    /// 4=Other), summed across CPUs and interfaces (tracked per-interface
+    /// inside `GlobalStats::l3`)
     fn get_l3_stats(&self, direction: Direction) -> Result<Vec<ProtoStats>>;
 
     /// Get per-QUIC-version stats as (version_name, packets, bytes) triples.
-    /// Ingress only; egress returns empty vec (TC has no QUIC stats map).
+    /// Ingress only; egress returns empty vec (TC does not classify QUIC).
     fn get_quic_stats(&self, direction: Direction) -> Result<Vec<(String, u64, u64)>>;
 
     /// Add or update an SNI rule entry in the direction-appropriate sni_rules map.

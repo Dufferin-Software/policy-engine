@@ -1194,6 +1194,7 @@ mod tests {
             fib_fallback_packets: 3,
             urpf_drop_packets: 13,
             urpf_drop_bytes: 26,
+            ..Default::default()
         };
         let out = GlobalStatsOutput::from(stats);
         assert_eq!(out.rx_packets, 100);

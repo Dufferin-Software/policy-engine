@@ -69,28 +69,6 @@ static __always_inline void update_rule_stats(__u64 rule_id, __u32 pkt_len,
 }
 
 /*
- * Update per-L3-protocol statistics, bucketed by ethertype
- * (0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other).
- */
-static __always_inline void update_l3_proto_stats(__u16 eth_proto,
-                                                  __u32 pkt_len) {
-  __u32 l3_key = 4;
-  if (eth_proto == ETH_P_IP)
-    l3_key = 0;
-  else if (eth_proto == ETH_P_IPV6)
-    l3_key = 1;
-  else if (eth_proto == ETH_P_ARP)
-    l3_key = 2;
-  else if (eth_proto == ETHERTYPE_MPLS || eth_proto == ETHERTYPE_MPLS_MC)
-    l3_key = 3;
-  struct proto_stats *l3ps = bpf_map_lookup_elem(&per_l3_stats, &l3_key);
-  if (l3ps) {
-    l3ps->packets++;
-    l3ps->bytes += pkt_len;
-  }
-}
-
-/*
  * Update per-IP-protocol statistics, keyed by L4 protocol number
  * (e.g. TCP=6, UDP=17, ICMP=1).
  */

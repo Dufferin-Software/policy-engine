@@ -4,24 +4,6 @@
 #pragma once
 
 /*
- * Increment per-QUIC-version counters (noinline keeps the main function small).
- */
-static __noinline void update_quic_stats(__u16 flags, __u32 pkt_len) {
-  __u32 slot;
-  if (flags & FLOW_FLAG_QUIC_V1)
-    slot = 1;
-  else if (flags & FLOW_FLAG_QUIC_V2)
-    slot = 2;
-  else
-    slot = 3;
-  struct quic_stats_val *qs = bpf_map_lookup_elem(&quic_stats, &slot);
-  if (qs) {
-    qs->packets++;
-    qs->bytes += pkt_len;
-  }
-}
-
-/*
  * Parse packet and extract 5-tuple flow key.
  * Returns L4 header byte offset from start of packet on success, -1 on error.
  */

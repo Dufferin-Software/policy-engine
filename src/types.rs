@@ -1335,9 +1335,17 @@ unsafe impl plain::Plain for ProtoStats {}
 
 pub const HIST_BUCKETS: usize = 64;
 
+/// L3 protocol buckets in `GlobalStats::l3` (0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other).
+/// Keep in sync with L3_PROTO_BUCKETS in policy_common.h.
+pub const L3_BUCKETS: usize = 5;
+
+/// QUIC version slots in `GlobalStats::quic` (0=unused, 1=v1, 2=v2, 3=other).
+/// Keep in sync with QUIC_STATS_SLOTS in policy_common.h.
+pub const QUIC_SLOTS: usize = 4;
+
 /// Global statistics (must match BPF struct layout)
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct GlobalStats {
     pub rx_packets: u64,
     pub rx_bytes: u64,
@@ -1362,6 +1370,21 @@ pub struct GlobalStats {
     pub fib_fallback_packets: u64,
     pub urpf_drop_packets: u64,
     pub urpf_drop_bytes: u64,
+    /// Per-L3-protocol counters (0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other)
+    pub l3: [ProtoStats; L3_BUCKETS],
+    /// Per-QUIC-version counters (0=unused, 1=v1, 2=v2, 3=other; XDP only)
+    pub quic: [ProtoStats; QUIC_SLOTS],
+    /// log2(ns) processing-time histogram
+    pub proc_hist: [u64; HIST_BUCKETS],
+}
+
+impl Default for GlobalStats {
+    fn default() -> Self {
+        // All-zero is valid for this plain-old-data struct; derive(Default)
+        // is unavailable because std only implements Default for arrays of
+        // up to 32 elements and proc_hist has HIST_BUCKETS (64).
+        unsafe { std::mem::zeroed() }
+    }
 }
 
 impl GlobalStats {
@@ -1372,6 +1395,46 @@ impl GlobalStats {
                 self as *const GlobalStats as *const u8,
                 std::mem::size_of::<GlobalStats>(),
             )
+        }
+    }
+
+    /// Add `other`'s counters into `self`.  Used to sum the per-CPU copies of
+    /// one interface slot and to aggregate across interface slots for the
+    /// engine-wide l3/quic/proc_hist views.
+    pub fn accumulate(&mut self, other: &GlobalStats) {
+        self.rx_packets += other.rx_packets;
+        self.rx_bytes += other.rx_bytes;
+        self.tx_packets += other.tx_packets;
+        self.tx_bytes += other.tx_bytes;
+        self.policy_matches += other.policy_matches;
+        self.policy_drops += other.policy_drops;
+        self.policy_pass += other.policy_pass;
+        self.policy_redirects += other.policy_redirects;
+        self.parse_errors += other.parse_errors;
+        self.tail_calls += other.tail_calls;
+        self.bum_packets += other.bum_packets;
+        self.non_ip_unicast += other.non_ip_unicast;
+        self.inspect_redirects += other.inspect_redirects;
+        self.fragments += other.fragments;
+        self.verdict_pass_packets += other.verdict_pass_packets;
+        self.verdict_pass_bytes += other.verdict_pass_bytes;
+        self.verdict_drop_packets += other.verdict_drop_packets;
+        self.verdict_drop_bytes += other.verdict_drop_bytes;
+        self.fib_forwarded_packets += other.fib_forwarded_packets;
+        self.fib_forwarded_bytes += other.fib_forwarded_bytes;
+        self.fib_fallback_packets += other.fib_fallback_packets;
+        self.urpf_drop_packets += other.urpf_drop_packets;
+        self.urpf_drop_bytes += other.urpf_drop_bytes;
+        for (d, s) in self.l3.iter_mut().zip(other.l3.iter()) {
+            d.packets += s.packets;
+            d.bytes += s.bytes;
+        }
+        for (d, s) in self.quic.iter_mut().zip(other.quic.iter()) {
+            d.packets += s.packets;
+            d.bytes += s.bytes;
+        }
+        for (d, s) in self.proc_hist.iter_mut().zip(other.proc_hist.iter()) {
+            *d += *s;
         }
     }
 }
@@ -2229,6 +2292,48 @@ mod tests {
         fn as_bytes_correct_size() {
             let g = GlobalStats::default();
             assert_eq!(g.as_bytes().len(), std::mem::size_of::<GlobalStats>());
+        }
+
+        /// Guards the layout contract with the packed BPF struct: 23 scalar
+        /// u64 counters + l3[5] + quic[4] (16 bytes each) + proc_hist[64].
+        /// If this fails, struct global_stats in policy_common.h and
+        /// GlobalStats have drifted apart.
+        #[test]
+        fn matches_bpf_struct_size() {
+            assert_eq!(
+                std::mem::size_of::<GlobalStats>(),
+                23 * 8 + L3_BUCKETS * 16 + QUIC_SLOTS * 16 + HIST_BUCKETS * 8
+            );
+        }
+
+        #[test]
+        fn accumulate_sums_scalars_and_arrays() {
+            let mut a = GlobalStats {
+                rx_packets: 1,
+                urpf_drop_bytes: 2,
+                ..Default::default()
+            };
+            a.l3[0].packets = 10;
+            a.quic[1].bytes = 20;
+            a.proc_hist[63] = 30;
+
+            let mut b = GlobalStats {
+                rx_packets: 100,
+                urpf_drop_bytes: 200,
+                ..Default::default()
+            };
+            b.l3[0].packets = 1000;
+            b.l3[4].bytes = 4;
+            b.quic[1].bytes = 2000;
+            b.proc_hist[63] = 3000;
+
+            a.accumulate(&b);
+            assert_eq!(a.rx_packets, 101);
+            assert_eq!(a.urpf_drop_bytes, 202);
+            assert_eq!(a.l3[0].packets, 1010);
+            assert_eq!(a.l3[4].bytes, 4);
+            assert_eq!(a.quic[1].bytes, 2020);
+            assert_eq!(a.proc_hist[63], 3030);
         }
     }
 

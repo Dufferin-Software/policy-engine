@@ -265,16 +265,6 @@ struct {
 } tc_src_groups_v6 SEC(".maps");
 
 /*
- * Processing-time histogram (log2 ns buckets 0-63, egress)
- */
-struct {
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 64);
-  __type(key, __u32);
-  __type(value, __u64);
-} tc_processing_time_hist SEC(".maps");
-
-/*
  * Per-IP-protocol packet/byte counters (egress, indexed by protocol 0-255)
  */
 struct {
@@ -284,16 +274,9 @@ struct {
   __type(value, struct proto_stats);
 } tc_per_proto_stats SEC(".maps");
 
-/*
- * Per-L3-protocol packet/byte counters (egress).
- * Buckets: 0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other
- */
-struct {
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 5);
-  __type(key, __u32);
-  __type(value, struct proto_stats);
-} tc_per_l3_stats SEC(".maps");
+/* Per-L3-protocol and processing-time-histogram counters live inside
+ * struct global_stats (see policy_common.h) — updated through the
+ * tc_global_stats pointer the datapath already holds, no extra map lookups. */
 
 /*
  * Flow cache configuration — enables/disables per-flow accounting for IPFIX
@@ -317,31 +300,6 @@ struct {
   __type(key, struct flow_key);
   __type(value, struct flow_cache_entry);
 } tc_flow_cache SEC(".maps");
-
-/* Record elapsed ns into the egress log2 histogram (reads clock internally) */
-#define TC_RECORD_TIMING(t0)                                             \
-  do {                                                                   \
-    __u64 __delta = bpf_ktime_get_ns() - (t0);                           \
-    __u32 __slot = log2_u64(__delta);                                    \
-    if (__slot > 63)                                                     \
-      __slot = 63;                                                       \
-    __u64 *__h = bpf_map_lookup_elem(&tc_processing_time_hist, &__slot); \
-    if (__h)                                                             \
-      (*__h)++;                                                          \
-  } while (0)
-
-/* Record elapsed ns using a pre-fetched 'now' — avoids an extra
- * bpf_ktime_get_ns() call on paths that already read the clock. */
-#define TC_RECORD_TIMING_AT(t0, now)                                     \
-  do {                                                                   \
-    __u64 __delta = (now) - (t0);                                        \
-    __u32 __slot = log2_u64(__delta);                                    \
-    if (__slot > 63)                                                     \
-      __slot = 63;                                                       \
-    __u64 *__h = bpf_map_lookup_elem(&tc_processing_time_hist, &__slot); \
-    if (__h)                                                             \
-      (*__h)++;                                                          \
-  } while (0)
 
 /*
  * TC_FLOW_CACHE_TAIL_CALL — tail-call tc_flow_cache_update with flow metadata.
@@ -500,7 +458,7 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
         gs->policy_matches++;
     }
     /* Reuse 'now' already read above — avoids an extra clock call */
-    TC_RECORD_TIMING_AT(t0, now);
+    record_proc_time_at(gs, t0, now);
     return TC_ACT_SHOT;
   } else if (fv->action == ACTION_PASS) {
     /* Cached PASS verdict: flow previously inspected, pass through. */
@@ -516,7 +474,7 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
       if (gs)
         gs->policy_matches++;
     }
-    TC_RECORD_TIMING_AT(t0, now);
+    record_proc_time_at(gs, t0, now);
     return TC_ACT_OK;
   }
 
@@ -678,7 +636,7 @@ int tc_policy_egress(struct __sk_buff *ctx) {
         if ((void *)(vlan + 1) <= data_end)
           eth_proto = bpf_ntohs(vlan->inner);
       }
-      tc_update_l3_proto_stats(eth_proto, pkt_len);
+      update_l3_proto_stats(gs, eth_proto, pkt_len);
     }
   }
 
@@ -696,7 +654,7 @@ int tc_policy_egress(struct __sk_buff *ctx) {
     l4_off = 0;
   } else if (l4_off < 0) {
     /* Non-IP traffic or malformed packet on egress — pass through */
-    TC_RECORD_TIMING(t0);
+    record_proc_time(gs, t0);
     return TC_ACT_OK;
   }
 
@@ -764,12 +722,12 @@ int tc_policy_egress(struct __sk_buff *ctx) {
       else
         bpf_tail_call(ctx, &tc_dispatcher, TC_DISPATCHER_SNI_SLOT);
       /* Tail call slot not loaded — fail open */
-      TC_RECORD_TIMING(t0);
+      record_proc_time(gs, t0);
       update_action_stats(gs, ACTION_PASS);
       TC_FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, tc_fc_rule_id, ACTION_PASS, TC_ACT_OK);
     }
 
-    TC_RECORD_TIMING(t0);
+    record_proc_time(gs, t0);
     /* Seed the policy verdict cache so subsequent packets on this 5-tuple
      * short-circuit at the verdict-cache check instead of re-walking the
      * two-level LPM trie.  Only for cacheable flows (pure PASS/DROP). */
@@ -793,7 +751,7 @@ int tc_policy_egress(struct __sk_buff *ctx) {
                             action == ACTION_DROP ? ACTION_DROP : ACTION_PASS, 0,
                             t0, ctx->ifindex);
 
-    TC_RECORD_TIMING(t0);
+    record_proc_time(gs, t0);
     switch (action) {
     case ACTION_DROP:
       TC_FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, 0, ACTION_DROP, TC_ACT_SHOT);
@@ -838,6 +796,12 @@ int tc_sni_inspect(struct __sk_buff *ctx) {
   struct tc_pkt_meta *meta = bpf_map_lookup_elem(&tc_pkt_scratch, &zero);
   if (!meta)
     return TC_ACT_OK;
+
+  /* Look up global stats once here so all return paths can update counters
+   * and record processing time. */
+  __u32 gs_key = ctx->ifindex % MAX_INTERFACES;
+  struct global_stats *gs = bpf_map_lookup_elem(&tc_global_stats, &gs_key);
+
   if (meta->sni_idx >= meta->sni_count) {
     /* All SNI rules exhausted without a match — pass through.  Seed the
      * verdict cache so subsequent packets on this flow fast-path at L4 entry,
@@ -848,7 +812,7 @@ int tc_sni_inspect(struct __sk_buff *ctx) {
     __u64 sni_now = bpf_ktime_get_ns();
     if (meta->sni_seen)
       tc_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now, ctx->ifindex);
-    TC_RECORD_TIMING_AT(meta->t0, sni_now);
+    record_proc_time_at(gs, meta->t0, sni_now);
     TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, TC_ACT_OK);
   }
 
@@ -876,9 +840,6 @@ int tc_sni_inspect(struct __sk_buff *ctx) {
 
   void *data = (void *)(long)ctx->data;
   const void *data_end = (void *)(long)ctx->data_end;
-
-  __u32 gs_key = ctx->ifindex % MAX_INTERFACES;
-  struct global_stats *gs = bpf_map_lookup_elem(&tc_global_stats, &gs_key);
 
   if (!sni || sni->sni_match_type == SNI_MATCH_NONE)
     goto next_rule;
@@ -985,7 +946,7 @@ int tc_sni_inspect(struct __sk_buff *ctx) {
 
     if (final_verdict == TC_ACT_SHOT) {
       tc_sni_write_verdict(&meta->flow, ACTION_DROP, sni_now, ctx->ifindex);
-      TC_RECORD_TIMING_AT(meta->t0, sni_now);
+      record_proc_time_at(gs, meta->t0, sni_now);
       TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, rule_id, ACTION_DROP, TC_ACT_SHOT);
     }
     goto next_rule;
@@ -1003,7 +964,7 @@ next_rule:
     __u64 sni_now = bpf_ktime_get_ns();
     if (meta->sni_seen)
       tc_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now, ctx->ifindex);
-    TC_RECORD_TIMING_AT(meta->t0, sni_now);
+    record_proc_time_at(gs, meta->t0, sni_now);
   }
   TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, TC_ACT_OK);
 }
@@ -1025,6 +986,11 @@ int tc_quic_initial_inspect(struct __sk_buff *ctx) {
   struct tc_pkt_meta *meta = bpf_map_lookup_elem(&tc_pkt_scratch, &zero);
   if (!meta)
     return TC_ACT_OK;
+
+  /* For the processing-time histogram at pass_through (replaces the old
+   * standalone histogram map lookup — net-neutral cost). */
+  __u32 gs_key = ctx->ifindex % MAX_INTERFACES;
+  struct global_stats *gs = bpf_map_lookup_elem(&tc_global_stats, &gs_key);
 
   void *data = (void *)(long)ctx->data;
   const void *data_end = (void *)(long)ctx->data_end;
@@ -1106,7 +1072,7 @@ int tc_quic_initial_inspect(struct __sk_buff *ctx) {
    * inspection completes. */
 
 pass_through:
-  TC_RECORD_TIMING(meta->t0);
+  record_proc_time(gs, meta->t0);
   TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, TC_ACT_OK);
 }
 
