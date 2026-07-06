@@ -2,14 +2,23 @@
 // Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
 
 import { useEffect, useRef, useState } from 'react'
-import { gql, useQuery } from '@apollo/client'
+import { gql, useQuery, useMutation } from '@apollo/client'
 import { getToken } from '../lib/auth'
 
 const ALERTS_QUERY = gql`
   query SuricataAlerts($filter: SuricataAlertFilterInput, $limit: Int) {
     suricataAlerts(filter: $filter, limit: $limit) {
       id nodeId timestamp srcIp srcPort destIp destPort
-      protocol action signatureId signature category severity
+      protocol action signatureId signature category severity acked
+    }
+  }
+`
+
+const ACK_ALERTS = gql`
+  mutation AckSuricataAlerts($nodeId: ID) {
+    ackSuricataAlerts(nodeId: $nodeId) {
+      success
+      message
     }
   }
 `
@@ -28,6 +37,7 @@ interface Alert {
   signature: string | null
   category: string | null
   severity: number | null
+  acked: boolean
 }
 
 /** Suricata severity: 1 = most urgent. Map to a palette color family. */
@@ -61,23 +71,36 @@ function normalizeLive(w: Record<string, unknown>): Alert {
     signature: (info.signature as string) ?? null,
     category: (info.category as string) ?? null,
     severity: (info.severity as number) ?? null,
+    acked: false,
   }
 }
 
 export default function AlertsView() {
   const [nodeFilter, setNodeFilter] = useState('')
   const [minSeverity, setMinSeverity] = useState('')
+  const [showAcked, setShowAcked] = useState(false)
   const [live, setLive] = useState<Alert[]>([])
   const [connected, setConnected] = useState(false)
 
   const filter: Record<string, unknown> = {}
   if (nodeFilter.trim()) filter.nodeId = nodeFilter.trim()
   if (minSeverity.trim()) filter.minSeverity = parseInt(minSeverity, 10)
+  if (showAcked) filter.includeAcked = true
 
   const { data, refetch } = useQuery<{ suricataAlerts: Alert[] }>(ALERTS_QUERY, {
     variables: { filter, limit: 200 },
     fetchPolicy: 'cache-and-network',
   })
+  const [ackAlerts] = useMutation(ACK_ALERTS)
+
+  // "Clear" acknowledges (hides) alerts; nothing is deleted, and the
+  // retention sweep removes stored alerts on its own schedule.
+  const onClear = async () => {
+    const node = nodeFilter.trim()
+    await ackAlerts({ variables: { nodeId: node || null } })
+    setLive([])
+    refetch()
+  }
 
   // Live tail over the raw /ws/alerts WebSocket.
   const wsRef = useRef<WebSocket | null>(null)
@@ -143,6 +166,25 @@ export default function AlertsView() {
         >
           Refresh
         </button>
+        <button
+          onClick={onClear}
+          title={
+            nodeFilter.trim()
+              ? 'Acknowledge all alerts for the filtered node (kept in history)'
+              : 'Acknowledge all alerts (kept in history)'
+          }
+          className="px-2 py-0.5 rounded bg-gray-700 text-gray-200 hover:bg-blue-700"
+        >
+          Clear
+        </button>
+        <label className="flex items-center gap-1 text-gray-500 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={showAcked}
+            onChange={(e) => setShowAcked(e.target.checked)}
+          />
+          show acked
+        </label>
       </div>
 
       <div className="overflow-x-auto">
@@ -165,7 +207,7 @@ export default function AlertsView() {
               </tr>
             )}
             {rows.map((a) => (
-              <tr key={a.id} className="border-t border-gray-800">
+              <tr key={a.id} className={`border-t border-gray-800 ${a.acked ? 'opacity-50' : ''}`}>
                 <td className="px-2 py-1 font-mono text-gray-400 whitespace-nowrap">
                   {a.timestamp}
                 </td>

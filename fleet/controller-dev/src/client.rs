@@ -687,12 +687,14 @@ impl ControllerClient {
         })
     }
 
-    /// Query Suricata alerts (newest first), optionally filtered.
+    /// Query Suricata alerts (newest first), optionally filtered. Only
+    /// unacknowledged alerts unless `include_acked`.
     pub fn list_suricata_alerts(
         &self,
         node_id: Option<&str>,
         min_severity: Option<i32>,
         signature_id: Option<i32>,
+        include_acked: bool,
         limit: i32,
     ) -> Result<Vec<SuricataAlert>> {
         #[derive(Deserialize)]
@@ -704,7 +706,7 @@ impl ControllerClient {
             query SuricataAlerts($filter: SuricataAlertFilterInput, $limit: Int) {
                 suricataAlerts(filter: $filter, limit: $limit) {
                     id nodeId timestamp srcIp srcPort destIp destPort
-                    protocol action signatureId signature category severity
+                    protocol action signatureId signature category severity acked
                 }
             }
         "#;
@@ -718,8 +720,27 @@ impl ControllerClient {
         if let Some(sid) = signature_id {
             filter.insert("signatureId".into(), json!(sid));
         }
+        if include_acked {
+            filter.insert("includeAcked".into(), json!(true));
+        }
         let r: Response = self.execute(q, Some(json!({ "filter": filter, "limit": limit })))?;
         Ok(r.suricata_alerts)
+    }
+
+    /// Acknowledge all unacked Suricata alerts, optionally scoped to one node.
+    pub fn ack_suricata_alerts(&self, node_id: Option<&str>) -> Result<OperationResult> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "ackSuricataAlerts")]
+            ack_suricata_alerts: OperationResult,
+        }
+        let q = r#"
+            mutation AckSuricataAlerts($nodeId: ID) {
+                ackSuricataAlerts(nodeId: $nodeId) { success message }
+            }
+        "#;
+        let r: Response = self.execute(q, Some(json!({ "nodeId": node_id })))?;
+        Ok(r.ack_suricata_alerts)
     }
 
     /// Create a fleet-managed Suricata ruleset from raw rule content.
@@ -872,6 +893,22 @@ impl ControllerClient {
         "#;
         let r: Response = self.execute(q, Some(json!({ "nodeId": node_id })))?;
         Ok(r.push_suricata_rulesets)
+    }
+
+    /// Delete persisted Suricata alerts, optionally scoped to one node.
+    pub fn clear_suricata_alerts(&self, node_id: Option<&str>) -> Result<OperationResult> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "clearSuricataAlerts")]
+            clear_suricata_alerts: OperationResult,
+        }
+        let q = r#"
+            mutation ClearSuricataAlerts($nodeId: ID) {
+                clearSuricataAlerts(nodeId: $nodeId) { success message }
+            }
+        "#;
+        let r: Response = self.execute(q, Some(json!({ "nodeId": node_id })))?;
+        Ok(r.clear_suricata_alerts)
     }
 
     /// Set the default action for unmatched packets on an interface+direction.

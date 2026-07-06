@@ -90,6 +90,8 @@ pub struct SuricataAlertOutput {
     pub signature: Option<String>,
     pub category: Option<String>,
     pub severity: Option<i32>,
+    /// True once an operator has acknowledged (UI "cleared") this alert.
+    pub acked: bool,
 }
 
 /// Filter for the `suricataAlerts` query. Tenant scoping is applied
@@ -102,6 +104,8 @@ pub struct SuricataAlertFilterInput {
     pub signature_id: Option<i32>,
     /// Substring match against the signature text.
     pub signature_contains: Option<String>,
+    /// Also return acknowledged alerts (default false: unacked only).
+    pub include_acked: Option<bool>,
 }
 
 pub async fn resolve_suricata_alerts(
@@ -118,6 +122,7 @@ pub async fn resolve_suricata_alerts(
         min_severity: f.min_severity,
         signature_id: f.signature_id.map(|v| v as i64),
         signature_contains: f.signature_contains,
+        include_acked: f.include_acked.unwrap_or(false),
     };
     let limit = limit.unwrap_or(200).clamp(1, 5000) as i64;
     Ok(store
@@ -138,8 +143,63 @@ pub async fn resolve_suricata_alerts(
             signature: a.signature,
             category: a.category,
             severity: a.severity,
+            acked: a.acked_at.is_some(),
         })
         .collect())
+}
+
+/// Acknowledge all unacked alerts for the caller's tenant (optionally one
+/// node's). Alerts stay in the store for history/retention; the default
+/// alert list just stops showing them.
+pub async fn resolve_ack_suricata_alerts(
+    ctx: &Context<'_>,
+    node_id: Option<ID>,
+) -> Result<OperationResult> {
+    let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+    let principal = ctx.data::<Arc<Principal>>()?;
+    let node_id = node_id.map(|n| n.0);
+    let now_ns = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let updated = store
+        .ack_suricata_alerts(&principal.tenant_slug, node_id.as_deref(), now_ns)
+        .await?;
+    audit(
+        store,
+        principal,
+        "suricata_alerts_acked",
+        node_id,
+        format!("acked={updated}"),
+    )
+    .await;
+    Ok(OperationResult {
+        success: true,
+        message: Some(format!("Acknowledged {updated} alert(s)")),
+    })
+}
+
+/// Delete persisted alerts for the caller's tenant (optionally one node's).
+/// The live WebSocket stream is unaffected — this only clears history.
+pub async fn resolve_clear_suricata_alerts(
+    ctx: &Context<'_>,
+    node_id: Option<ID>,
+) -> Result<OperationResult> {
+    let store = ctx.data::<Arc<dyn ControllerStore>>()?;
+    let principal = ctx.data::<Arc<Principal>>()?;
+    let node_id = node_id.map(|n| n.0);
+    let removed = store
+        .clear_suricata_alerts(&principal.tenant_slug, node_id.as_deref())
+        .await?;
+    audit(
+        store,
+        principal,
+        "suricata_alerts_cleared",
+        node_id,
+        format!("removed={removed}"),
+    )
+    .await;
+    Ok(OperationResult {
+        success: true,
+        message: Some(format!("Deleted {removed} alert(s)")),
+    })
 }
 
 async fn output_for(

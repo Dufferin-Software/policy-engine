@@ -248,6 +248,9 @@ pub struct SuricataAlert {
     pub signature: Option<String>,
     pub category: Option<String>,
     pub severity: Option<i32>,
+    /// True once an operator has acknowledged this alert.
+    #[serde(default)]
+    pub acked: bool,
 }
 
 /// A fleet-managed Suricata ruleset (listing form, no content).

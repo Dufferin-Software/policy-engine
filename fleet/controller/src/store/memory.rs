@@ -743,6 +743,7 @@ impl ControllerStore for InMemoryControllerStore {
                 category: a.category.clone(),
                 severity: a.severity,
                 raw_json: a.raw_json.clone(),
+                acked_at: None,
             });
         }
         Ok(())
@@ -757,6 +758,7 @@ impl ControllerStore for InMemoryControllerStore {
         let mut out: Vec<SuricataAlertRecord> = state
             .suricata_alerts
             .iter()
+            .filter(|a| filter.include_acked || a.acked_at.is_none())
             .filter(|a| filter.tenant_id.as_ref().is_none_or(|t| &a.tenant_id == t))
             .filter(|a| filter.node_id.as_ref().is_none_or(|n| &a.node_id == n))
             .filter(|a| {
@@ -782,10 +784,31 @@ impl ControllerStore for InMemoryControllerStore {
         Ok(out)
     }
 
-    async fn prune_suricata_alerts(&self, cutoff_ns: i64) -> Result<u64> {
+    async fn ack_suricata_alerts(
+        &self,
+        tenant_id: &str,
+        node_id: Option<&str>,
+        acked_ns: i64,
+    ) -> Result<u64> {
+        let mut state = self.inner.lock().unwrap();
+        let mut updated = 0;
+        for a in state.suricata_alerts.iter_mut().filter(|a| {
+            a.acked_at.is_none()
+                && a.tenant_id == tenant_id
+                && node_id.is_none_or(|n| a.node_id == n)
+        }) {
+            a.acked_at = Some(acked_ns);
+            updated += 1;
+        }
+        Ok(updated)
+    }
+
+    async fn clear_suricata_alerts(&self, tenant_id: &str, node_id: Option<&str>) -> Result<u64> {
         let mut state = self.inner.lock().unwrap();
         let before = state.suricata_alerts.len();
-        state.suricata_alerts.retain(|a| a.received_ns >= cutoff_ns);
+        state
+            .suricata_alerts
+            .retain(|a| a.tenant_id != tenant_id || node_id.is_some_and(|n| a.node_id != n));
         Ok((before - state.suricata_alerts.len()) as u64)
     }
 

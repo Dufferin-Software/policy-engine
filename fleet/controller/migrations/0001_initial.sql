@@ -371,7 +371,11 @@ CREATE TABLE IF NOT EXISTS suricata_alerts (
     signature    TEXT,
     category     TEXT,
     severity     INTEGER,
-    raw_json     TEXT NOT NULL
+    raw_json     TEXT NOT NULL,
+    -- Acknowledge time (ns since epoch); NULL = unacknowledged. The UI's
+    -- "clear" acknowledges alerts rather than deleting them — deletion is
+    -- the retention sweep's job.
+    acked_at     INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS suricata_alerts_tenant_ts

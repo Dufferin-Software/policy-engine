@@ -2092,6 +2092,30 @@ impl MutationRoot {
         crate::graphql::suricata::resolve_unassign_suricata_ruleset(ctx, node_id, ruleset_id).await
     }
 
+    /// Acknowledge all unacked Suricata alerts for the caller's tenant,
+    /// optionally scoped to one node. Acked alerts leave the default alert
+    /// list but stay stored until the retention sweep deletes them.
+    #[graphql(guard = "Require::new(\"alert:write\")")]
+    async fn ack_suricata_alerts(
+        &self,
+        ctx: &Context<'_>,
+        node_id: Option<ID>,
+    ) -> Result<OperationResult> {
+        crate::graphql::suricata::resolve_ack_suricata_alerts(ctx, node_id).await
+    }
+
+    /// Permanently delete persisted Suricata alerts for the caller's tenant,
+    /// optionally scoped to one node. Admin purge — the UI's "clear" uses
+    /// `ackSuricataAlerts` instead.
+    #[graphql(guard = "Require::new(\"alert:delete\")")]
+    async fn clear_suricata_alerts(
+        &self,
+        ctx: &Context<'_>,
+        node_id: Option<ID>,
+    ) -> Result<OperationResult> {
+        crate::graphql::suricata::resolve_clear_suricata_alerts(ctx, node_id).await
+    }
+
     /// Force a gated ruleset sync of one node and wait for the agent's
     /// confirm. Returns success with a note when the node is already in sync.
     #[graphql(guard = "Require::new(\"node:write\")")]

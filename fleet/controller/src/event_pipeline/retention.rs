@@ -60,11 +60,42 @@ pub async fn sweep_once(scope: &TenantScope, metrics: &Arc<EventPipelineMetrics>
         }
         total += removed;
     }
+
+    // Suricata alerts share the tenant's retention window. Acked or not,
+    // history past the cutoff goes — the UI "clear" only acknowledges.
+    for _ in 0..100 {
+        let removed = prune_suricata_alerts(scope, cutoff, CHUNK).await?;
+        if removed == 0 {
+            break;
+        }
+        total += removed;
+    }
+
     if total > 0 {
         metrics.record_pruned(total);
         log::debug!("event retention pruned {total} rows older than {cutoff} ns");
     }
     Ok(total)
+}
+
+/// One chunked delete of Suricata alerts past the cutoff. Same portable
+/// `rowid IN (SELECT … LIMIT)` shape as [`EventStore::prune_older_than`];
+/// `suricata_alerts.tenant_id` holds the tenant slug, not the numeric id.
+async fn prune_suricata_alerts(scope: &TenantScope, cutoff_ns: i64, chunk: i64) -> Result<u64> {
+    let res = sqlx::query(
+        "DELETE FROM suricata_alerts WHERE id IN ( \
+            SELECT id FROM suricata_alerts \
+            WHERE tenant_id = ? AND received_ns < ? \
+            ORDER BY id ASC LIMIT ? \
+         )",
+    )
+    .bind(scope.slug())
+    .bind(cutoff_ns)
+    .bind(chunk)
+    .execute(scope.pool())
+    .await
+    .context("Failed to prune suricata alerts")?;
+    Ok(res.rows_affected())
 }
 
 async fn retention_seconds(scope: &TenantScope) -> Result<i64> {
@@ -135,5 +166,33 @@ mod tests {
         assert_eq!(pruned, 1);
         let remaining = store.list(&EventFilter::default(), 10).await.unwrap();
         assert_eq!(remaining.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sweep_prunes_old_suricata_alerts() {
+        let scope = scope_with_retention(1).await;
+        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        for (node, received_ns) in [("n1", now_ns - 10_000_000_000), ("n2", now_ns)] {
+            sqlx::query(
+                "INSERT INTO suricata_alerts \
+                 (tenant_id, node_id, timestamp, received_ns, raw_json) \
+                 VALUES ('default', ?, 't', ?, '{}')",
+            )
+            .bind(node)
+            .bind(received_ns)
+            .execute(scope.pool())
+            .await
+            .unwrap();
+        }
+
+        let metrics = Arc::new(EventPipelineMetrics::new());
+        let pruned = sweep_once(&scope, &metrics).await.unwrap();
+        assert_eq!(pruned, 1);
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT node_id FROM suricata_alerts ORDER BY id")
+                .fetch_all(scope.pool())
+                .await
+                .unwrap();
+        assert_eq!(remaining, vec!["n2".to_string()]);
     }
 }

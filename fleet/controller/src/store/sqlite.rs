@@ -1199,10 +1199,14 @@ impl ControllerStore for SqliteControllerStore {
     ) -> Result<Vec<SuricataAlertRecord>> {
         let mut sql = String::from(
             "SELECT id, tenant_id, node_id, timestamp, received_ns, src_ip, src_port, dst_ip, \
-             dst_port, proto, action, signature_id, signature, category, severity, raw_json \
+             dst_port, proto, action, signature_id, signature, category, severity, raw_json, \
+             acked_at \
              FROM suricata_alerts",
         );
         let mut clauses: Vec<&'static str> = Vec::new();
+        if !filter.include_acked {
+            clauses.push("acked_at IS NULL");
+        }
         if filter.tenant_id.is_some() {
             clauses.push("tenant_id = ?");
         }
@@ -1251,12 +1255,56 @@ impl ControllerStore for SqliteControllerStore {
         Ok(rows.into_iter().map(row_to_suricata_alert).collect())
     }
 
-    async fn prune_suricata_alerts(&self, cutoff_ns: i64) -> Result<u64> {
-        let res = sqlx::query("DELETE FROM suricata_alerts WHERE received_ns < ?")
-            .bind(cutoff_ns)
-            .execute(&self.pool)
-            .await
-            .context("Failed to prune suricata alerts")?;
+    async fn ack_suricata_alerts(
+        &self,
+        tenant_id: &str,
+        node_id: Option<&str>,
+        acked_ns: i64,
+    ) -> Result<u64> {
+        let res = match node_id {
+            Some(node) => {
+                sqlx::query(
+                    "UPDATE suricata_alerts SET acked_at = ? \
+                     WHERE tenant_id = ? AND node_id = ? AND acked_at IS NULL",
+                )
+                .bind(acked_ns)
+                .bind(tenant_id)
+                .bind(node)
+                .execute(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE suricata_alerts SET acked_at = ? \
+                     WHERE tenant_id = ? AND acked_at IS NULL",
+                )
+                .bind(acked_ns)
+                .bind(tenant_id)
+                .execute(&self.pool)
+                .await
+            }
+        }
+        .context("Failed to ack suricata alerts")?;
+        Ok(res.rows_affected())
+    }
+
+    async fn clear_suricata_alerts(&self, tenant_id: &str, node_id: Option<&str>) -> Result<u64> {
+        let res = match node_id {
+            Some(node) => {
+                sqlx::query("DELETE FROM suricata_alerts WHERE tenant_id = ? AND node_id = ?")
+                    .bind(tenant_id)
+                    .bind(node)
+                    .execute(&self.pool)
+                    .await
+            }
+            None => {
+                sqlx::query("DELETE FROM suricata_alerts WHERE tenant_id = ?")
+                    .bind(tenant_id)
+                    .execute(&self.pool)
+                    .await
+            }
+        }
+        .context("Failed to clear suricata alerts")?;
         Ok(res.rows_affected())
     }
 
@@ -1719,6 +1767,7 @@ fn row_to_suricata_alert(row: sqlx::sqlite::SqliteRow) -> SuricataAlertRecord {
         category: row.get("category"),
         severity: row.get::<Option<i64>, _>("severity").map(|s| s as i32),
         raw_json: row.get("raw_json"),
+        acked_at: row.get("acked_at"),
     }
 }
 
@@ -1839,6 +1888,107 @@ mod tests {
                 .metrics_interval_secs,
             None
         );
+    }
+
+    fn sample_alert(tenant: &str, node: &str, received_ns: i64) -> NewSuricataAlert {
+        NewSuricataAlert {
+            tenant_id: tenant.to_string(),
+            node_id: node.to_string(),
+            timestamp: "2026-07-06T00:00:00Z".to_string(),
+            received_ns,
+            src_ip: None,
+            src_port: None,
+            dst_ip: None,
+            dst_port: None,
+            proto: None,
+            action: None,
+            signature_id: Some(1),
+            signature: Some("test".to_string()),
+            category: None,
+            severity: Some(2),
+            raw_json: "{}".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_suricata_alerts_hides_from_default_list_but_keeps_rows() {
+        let (store, _dir) = temp_store().await;
+        store
+            .insert_suricata_alerts(&[
+                sample_alert("default", "n1", 1),
+                sample_alert("default", "n2", 2),
+                sample_alert("other", "n3", 3),
+            ])
+            .await
+            .unwrap();
+
+        // Node-scoped ack touches only that node's rows.
+        assert_eq!(
+            store
+                .ack_suricata_alerts("default", Some("n1"), 100)
+                .await
+                .unwrap(),
+            1
+        );
+        // Tenant-wide ack skips already-acked rows and other tenants.
+        assert_eq!(
+            store.ack_suricata_alerts("default", None, 200).await.unwrap(),
+            1
+        );
+
+        // Default list = unacked only ("other" tenant's row).
+        let unacked = store
+            .list_suricata_alerts(&SuricataAlertFilter::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(unacked.len(), 1);
+        assert_eq!(unacked[0].tenant_id, "other");
+
+        // include_acked returns everything; acked rows keep their stamp.
+        let all = store
+            .list_suricata_alerts(
+                &SuricataAlertFilter {
+                    include_acked: true,
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        let n1 = all.iter().find(|a| a.node_id == "n1").unwrap();
+        assert_eq!(n1.acked_at, Some(100));
+    }
+
+    #[tokio::test]
+    async fn clear_suricata_alerts_scopes_by_tenant_and_node() {
+        let (store, _dir) = temp_store().await;
+        store
+            .insert_suricata_alerts(&[
+                sample_alert("default", "n1", 1),
+                sample_alert("default", "n2", 2),
+                sample_alert("other", "n3", 3),
+            ])
+            .await
+            .unwrap();
+
+        // Node-scoped clear removes only that node's rows.
+        assert_eq!(
+            store
+                .clear_suricata_alerts("default", Some("n1"))
+                .await
+                .unwrap(),
+            1
+        );
+
+        // Tenant-wide clear leaves other tenants untouched.
+        assert_eq!(store.clear_suricata_alerts("default", None).await.unwrap(), 1);
+        let remaining = store
+            .list_suricata_alerts(&SuricataAlertFilter::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].tenant_id, "other");
     }
 
     // uRPF mode persists per interface and clears interfaces not listed, via

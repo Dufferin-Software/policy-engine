@@ -242,6 +242,8 @@ pub struct SuricataAlertRecord {
     pub category: Option<String>,
     pub severity: Option<i32>,
     pub raw_json: String,
+    /// Acknowledge time (ns since epoch); None = unacknowledged.
+    pub acked_at: Option<i64>,
 }
 
 /// A new Suricata alert to insert (no id yet).
@@ -273,6 +275,8 @@ pub struct SuricataAlertFilter {
     pub signature_id: Option<i64>,
     /// Substring match against the signature text.
     pub signature_contains: Option<String>,
+    /// When false (default), only unacknowledged alerts are returned.
+    pub include_acked: bool,
 }
 
 /// A ZTP enrollment token. Operators mint these via the GraphQL API; the
@@ -629,8 +633,18 @@ pub trait ControllerStore: Send + Sync {
         filter: &SuricataAlertFilter,
         limit: i64,
     ) -> Result<Vec<SuricataAlertRecord>>;
-    /// Delete alerts older than `cutoff_ns` (retention). Returns rows removed.
-    async fn prune_suricata_alerts(&self, cutoff_ns: i64) -> Result<u64>;
+    /// Acknowledge all unacknowledged alerts for a tenant, optionally scoped
+    /// to one node, stamping them with `acked_ns`. Returns rows updated.
+    async fn ack_suricata_alerts(
+        &self,
+        tenant_id: &str,
+        node_id: Option<&str>,
+        acked_ns: i64,
+    ) -> Result<u64>;
+    /// Delete all alerts for a tenant, optionally scoped to one node.
+    /// Returns rows removed. Age-based deletion is the retention sweep's
+    /// job (`event_pipeline::retention`); this is the operator purge.
+    async fn clear_suricata_alerts(&self, tenant_id: &str, node_id: Option<&str>) -> Result<u64>;
 
     /// Set the default action for a specific interface+direction on a node.
     /// `direction` must be "ingress" or "egress". `action` must be "pass" or "drop".

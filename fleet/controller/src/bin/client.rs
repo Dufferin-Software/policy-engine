@@ -129,6 +129,21 @@ enum AlertsCmd {
         /// Max alerts to show.
         #[arg(long, default_value_t = 100)]
         limit: i32,
+        /// Also show acknowledged alerts.
+        #[arg(long)]
+        include_acked: bool,
+    },
+    /// Acknowledge all unacked alerts (they stay stored until retention).
+    Ack {
+        /// Only acknowledge one node's alerts.
+        #[arg(long)]
+        node_id: Option<String>,
+    },
+    /// Permanently delete stored alerts (admin purge; prefer `ack`).
+    Clear {
+        /// Only delete one node's alerts.
+        #[arg(long)]
+        node_id: Option<String>,
     },
 }
 
@@ -1241,9 +1256,15 @@ fn handle_alerts(client: &ControllerClient, cmd: AlertsCmd, json: bool) -> Resul
             min_severity,
             sid,
             limit,
+            include_acked,
         } => {
-            let alerts =
-                client.list_suricata_alerts(node_id.as_deref(), min_severity, sid, limit)?;
+            let alerts = client.list_suricata_alerts(
+                node_id.as_deref(),
+                min_severity,
+                sid,
+                include_acked,
+                limit,
+            )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&alerts)?);
             } else if alerts.is_empty() {
@@ -1258,7 +1279,7 @@ fn handle_alerts(client: &ControllerClient, cmd: AlertsCmd, json: bool) -> Resul
                         a.dest_port.unwrap_or(0),
                     );
                     println!(
-                        "{}  sev={}  sid={}  {}  {}  [{}]",
+                        "{}  sev={}  sid={}  {}  {}  [{}]{}",
                         a.timestamp,
                         a.severity
                             .map(|s| s.to_string())
@@ -1269,9 +1290,18 @@ fn handle_alerts(client: &ControllerClient, cmd: AlertsCmd, json: bool) -> Resul
                         flow,
                         a.signature.as_deref().unwrap_or("-"),
                         a.node_id,
+                        if a.acked { "  (acked)" } else { "" },
                     );
                 }
             }
+        }
+        AlertsCmd::Ack { node_id } => {
+            let r = client.ack_suricata_alerts(node_id.as_deref())?;
+            print_result(&r, json);
+        }
+        AlertsCmd::Clear { node_id } => {
+            let r = client.clear_suricata_alerts(node_id.as_deref())?;
+            print_result(&r, json);
         }
     }
     Ok(())
