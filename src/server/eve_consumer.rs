@@ -80,18 +80,21 @@ impl EveConsumer {
     }
 
     /// Start the Unix socket listener in the background.
+    ///
+    /// The socket is bound synchronously, so it exists on disk before this
+    /// returns: the Suricata systemd drop-in gates startup on
+    /// `ConditionPathExists=<socket>`, and the inspect restore path restarts
+    /// Suricata immediately after this call.
     pub async fn start(&mut self) -> Result<()> {
         if self.running {
             return Ok(());
         }
 
-        let socket_path = self.socket_path.clone();
+        let listener = Self::bind_unix_socket(&self.socket_path)?;
         let alert_tx = self.alert_tx.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = Self::listen_unix_socket(socket_path, alert_tx).await {
-                warn!("EVE consumer error: {}", e);
-            }
+            Self::accept_loop(listener, alert_tx).await;
         });
 
         self.running = true;
@@ -110,16 +113,10 @@ impl EveConsumer {
         self.running
     }
 
-    /// Create a Unix socket server, accept connections from Suricata, and
-    /// parse EVE JSON alert lines.  Suricata reconnects automatically after
-    /// a restart so we loop back to `accept()` on each connection close.
-    async fn listen_unix_socket(
-        socket_path: PathBuf,
-        alert_tx: broadcast::Sender<SuricataAlert>,
-    ) -> Result<()> {
-        // Remove stale socket file from a previous run.
+    /// Bind the EVE Unix socket, replacing any stale file from a previous run.
+    fn bind_unix_socket(socket_path: &PathBuf) -> Result<UnixListener> {
         if socket_path.exists() {
-            let _ = std::fs::remove_file(&socket_path);
+            let _ = std::fs::remove_file(socket_path);
         }
 
         // Ensure the parent directory exists.
@@ -127,9 +124,15 @@ impl EveConsumer {
             let _ = std::fs::create_dir_all(parent);
         }
 
-        let listener = UnixListener::bind(&socket_path)?;
+        let listener = UnixListener::bind(socket_path)?;
         info!("EVE consumer listening on {:?}", socket_path);
+        Ok(listener)
+    }
 
+    /// Accept connections from Suricata and parse EVE JSON alert lines.
+    /// Suricata reconnects automatically after a restart so we loop back to
+    /// `accept()` on each connection close.
+    async fn accept_loop(listener: UnixListener, alert_tx: broadcast::Sender<SuricataAlert>) {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {

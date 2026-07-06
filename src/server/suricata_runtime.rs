@@ -185,6 +185,12 @@ impl SuricataRuntime for DefaultSuricataRuntime {
              Description=Suricata (policy-engine IPS drop-in)\n\
              After=policy-engine.service network.target\n\
              Wants=policy-engine.service\n\
+             # Skip starts while policy-engine is down (After= only orders units\n\
+             # inside one transaction, not package-upgrade restarts): without the\n\
+             # engine there is no pe-inspect veth to capture on and no EVE socket\n\
+             # to stream to.  The engine binds the socket at process start and\n\
+             # explicitly restarts suricata when inspection is (re)enabled.\n\
+             ConditionPathExists=/run/policy-engine/eve.sock\n\
              \n\
              [Service]\n\
              EnvironmentFile=-{env}\n\
@@ -405,6 +411,9 @@ fn generate_suricata_yaml(iface: &str) -> String {
          \x20   cluster-id: 99\n\
          \x20   cluster-type: cluster_flow\n\
          \x20   defrag: yes\n\
+         \x20   # v3 ring buffer: faster for our copy-mode (non-inline) capture;\n\
+         \x20   # Suricata warns if left on the v2 default.\n\
+         \x20   tpacket-v3: yes\n\
          \n\
          default-rule-path: /var/lib/suricata/rules\n\
          rule-files:\n\

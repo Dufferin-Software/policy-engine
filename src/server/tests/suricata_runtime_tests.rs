@@ -118,6 +118,18 @@ fn write_systemd_env_yaml_has_af_packet_section() {
 }
 
 #[test]
+fn write_systemd_env_yaml_enables_tpacket_v3() {
+    let (root, _rt) = setup_written_env("yaml_tpv3");
+    let yaml_path = root.join("etc/suricata/policy-engine.yaml");
+    let content = std::fs::read_to_string(&yaml_path).unwrap();
+    assert!(
+        content.contains("tpacket-v3: yes"),
+        "af-packet capture should use the v3 ring buffer"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn write_systemd_env_env_file_contains_iface() {
     let (root, _rt) = setup_written_env("env_iface");
     let env_path = root.join("etc/suricata/suricata-policy-engine.env");
@@ -425,6 +437,20 @@ fn write_systemd_env_dropin_has_after_policy_engine() {
     assert!(
         content.contains("After=policy-engine.service"),
         "Drop-in should order After= policy-engine"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn write_systemd_env_dropin_gates_on_engine_eve_socket() {
+    let (root, _rt) = setup_written_env("dropin_condition");
+    let content = std::fs::read_to_string(
+        root.join("etc/systemd/system/suricata.service.d/policy-engine.conf"),
+    )
+    .unwrap();
+    assert!(
+        content.contains("ConditionPathExists=/run/policy-engine/eve.sock"),
+        "Drop-in should skip Suricata starts while policy-engine is down"
     );
     let _ = std::fs::remove_dir_all(root);
 }
