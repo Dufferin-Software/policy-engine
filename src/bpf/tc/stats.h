@@ -22,16 +22,3 @@ static __always_inline void tc_update_rule_stats(__u64 rule_id, __u32 pkt_len,
     bpf_map_update_elem(&tc_rule_stats, &rule_id, &new_stats, BPF_NOEXIST);
   }
 }
-
-/*
- * Update per-IP-protocol statistics, keyed by L4 protocol number
- * (e.g. TCP=6, UDP=17, ICMP=1).
- */
-static __always_inline void tc_update_ip_proto_stats(__u32 protocol,
-                                                     __u32 pkt_len) {
-  struct proto_stats *ps = bpf_map_lookup_elem(&tc_per_proto_stats, &protocol);
-  if (ps) {
-    ps->packets++;
-    ps->bytes += pkt_len;
-  }
-}

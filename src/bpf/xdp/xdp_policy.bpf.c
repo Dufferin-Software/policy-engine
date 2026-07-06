@@ -342,19 +342,10 @@ struct {
   __array(values, dst_lpm_v6_inner);
 } src_groups_v6 SEC(".maps");
 
-/*
- * Per-IP-protocol packet/byte counters (indexed by protocol number 0-255)
- */
-struct {
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 256);
-  __type(key, __u32);
-  __type(value, struct proto_stats);
-} per_proto_stats SEC(".maps");
-
-/* Per-L3-protocol, per-QUIC-version, and processing-time-histogram counters
- * live inside struct global_stats (see policy_common.h) — updated through the
- * global_stats pointer the datapath already holds, no extra map lookups. */
+/* Per-IP-protocol, per-L3-protocol, per-QUIC-version, and processing-time-
+ * histogram counters live inside struct global_stats (see policy_common.h) —
+ * updated through the global_stats pointer the datapath already holds, no
+ * extra map lookups. */
 
 /*
  * Build a flow_verdict_cache key from a parsed flow_key.  Shared by the
@@ -1068,8 +1059,7 @@ int xdp_policy_main(struct xdp_md *ctx) {
   }
 
   /* Update per-IP-protocol stats (flow_key.protocol is valid from here) */
-  // todo: can this be per interface and thus folded into global stats?
-  update_ip_proto_stats(flow_key.protocol, pkt_len);
+  update_l4_proto_stats(stats, flow_key.protocol, pkt_len);
 
   /* Update QUIC stats if this packet looks like QUIC */
   if (flow_key.flags & FLOW_FLAG_QUIC)

@@ -1343,6 +1343,10 @@ pub const L3_BUCKETS: usize = 5;
 /// Keep in sync with QUIC_STATS_SLOTS in policy_common.h.
 pub const QUIC_SLOTS: usize = 4;
 
+/// Per-IP-protocol slots in `GlobalStats::proto`, indexed by protocol number.
+/// Keep in sync with IP_PROTO_SLOTS in policy_common.h.
+pub const IP_PROTO_SLOTS: usize = 256;
+
 /// Global statistics (must match BPF struct layout)
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -1376,6 +1380,8 @@ pub struct GlobalStats {
     pub quic: [ProtoStats; QUIC_SLOTS],
     /// log2(ns) processing-time histogram
     pub proc_hist: [u64; HIST_BUCKETS],
+    /// Per-IP-protocol counters, indexed by protocol number (TCP=6, UDP=17, …)
+    pub proto: [ProtoStats; IP_PROTO_SLOTS],
 }
 
 impl Default for GlobalStats {
@@ -1435,6 +1441,10 @@ impl GlobalStats {
         }
         for (d, s) in self.proc_hist.iter_mut().zip(other.proc_hist.iter()) {
             *d += *s;
+        }
+        for (d, s) in self.proto.iter_mut().zip(other.proto.iter()) {
+            d.packets += s.packets;
+            d.bytes += s.bytes;
         }
     }
 }
@@ -2295,14 +2305,14 @@ mod tests {
         }
 
         /// Guards the layout contract with the packed BPF struct: 23 scalar
-        /// u64 counters + l3[5] + quic[4] (16 bytes each) + proc_hist[64].
-        /// If this fails, struct global_stats in policy_common.h and
-        /// GlobalStats have drifted apart.
+        /// u64 counters + l3[5] + quic[4] + proto[256] (16 bytes each) +
+        /// proc_hist[64].  If this fails, struct global_stats in
+        /// policy_common.h and GlobalStats have drifted apart.
         #[test]
         fn matches_bpf_struct_size() {
             assert_eq!(
                 std::mem::size_of::<GlobalStats>(),
-                23 * 8 + L3_BUCKETS * 16 + QUIC_SLOTS * 16 + HIST_BUCKETS * 8
+                23 * 8 + L3_BUCKETS * 16 + QUIC_SLOTS * 16 + HIST_BUCKETS * 8 + IP_PROTO_SLOTS * 16
             );
         }
 

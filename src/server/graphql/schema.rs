@@ -790,14 +790,14 @@ impl QueryRoot {
             .sample(&interface, dir_byte, global.rx_bytes, global.tx_bytes)
             .await;
 
-        let hist = service
-            .get_processing_time_hist(dir)
-            .unwrap_or_else(|_| vec![0u64; crate::types::HIST_BUCKETS]);
+        // Timing / proto / L3 breakdowns are read from the per-interface
+        // GlobalStats fetched above, so the panel is scoped to the selected
+        // interface.  (These used to come from the direction-global getters,
+        // which made every interface display identical values.)
+        let timing = compute_timing_stats(&global.proc_hist);
 
-        let timing = compute_timing_stats(&hist);
-
-        let proto_vec = service.get_proto_stats(dir).unwrap_or_default();
-        let proto_stats: Vec<ProtoStatsOutput> = proto_vec
+        let proto_stats: Vec<ProtoStatsOutput> = global
+            .proto
             .iter()
             .enumerate()
             .filter(|(_, ps)| ps.packets > 0)
@@ -812,8 +812,8 @@ impl QueryRoot {
         // L3 breakdown: buckets 0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other
         const L3_ETHERTYPES: [i32; 5] = [0x0800, 0x86DD, 0x0806, 0x8847, 0];
         const L3_NAMES: [&str; 5] = ["IPv4", "IPv6", "ARP", "MPLS", "Other"];
-        let l3_vec = service.get_l3_stats(dir).unwrap_or_default();
-        let l3_stats: Vec<ProtoStatsOutput> = l3_vec
+        let l3_stats: Vec<ProtoStatsOutput> = global
+            .l3
             .iter()
             .enumerate()
             .filter(|(_, ps)| ps.packets > 0)

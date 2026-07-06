@@ -499,6 +499,7 @@ struct proto_stats {
 #define L3_PROTO_BUCKETS 5   /* 0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other */
 #define QUIC_STATS_SLOTS 4   /* 0=unused, 1=v1, 2=v2, 3=other QUIC */
 #define PROC_HIST_BUCKETS 64 /* log2(ns) processing-time buckets */
+#define IP_PROTO_SLOTS 256   /* per-IP-protocol counters, indexed by proto # */
 
 /*
  * Global statistics per interface.
@@ -541,6 +542,7 @@ struct global_stats {
   struct proto_stats l3[L3_PROTO_BUCKETS];   /* per-L3-protocol counters */
   struct proto_stats quic[QUIC_STATS_SLOTS]; /* per-QUIC-version (XDP only) */
   __u64 proc_hist[PROC_HIST_BUCKETS];        /* log2 ns processing-time histogram */
+  struct proto_stats proto[IP_PROTO_SLOTS];  /* per-IP-protocol counters */
 } __attribute__((packed));
 
 /*
@@ -617,6 +619,21 @@ static __always_inline void update_quic_stats(struct global_stats *stats,
     slot = 3;
   stats->quic[slot].packets++;
   stats->quic[slot].bytes += pkt_len;
+}
+
+/*
+ * Update the per-IP-protocol counters embedded in global_stats, indexed by
+ * L4 protocol number (e.g. TCP=6, UDP=17, ICMP=1).  protocol is __u8 so the
+ * verifier sees the index bounded by IP_PROTO_SLOTS.  Shared by the XDP
+ * ingress and TC egress programs.
+ */
+static __always_inline void update_l4_proto_stats(struct global_stats *stats,
+                                                  __u8 protocol,
+                                                  __u32 pkt_len) {
+  if (!stats)
+    return;
+  stats->proto[protocol].packets++;
+  stats->proto[protocol].bytes += pkt_len;
 }
 
 /*

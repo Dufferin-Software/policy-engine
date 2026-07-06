@@ -264,18 +264,8 @@ struct {
   __array(values, tc_dst_lpm_v6_inner);
 } tc_src_groups_v6 SEC(".maps");
 
-/*
- * Per-IP-protocol packet/byte counters (egress, indexed by protocol 0-255)
- */
-struct {
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 256);
-  __type(key, __u32);
-  __type(value, struct proto_stats);
-} tc_per_proto_stats SEC(".maps");
-
-/* Per-L3-protocol and processing-time-histogram counters live inside
- * struct global_stats (see policy_common.h) — updated through the
+/* Per-IP-protocol, per-L3-protocol, and processing-time-histogram counters
+ * live inside struct global_stats (see policy_common.h) — updated through the
  * tc_global_stats pointer the datapath already holds, no extra map lookups. */
 
 /*
@@ -659,7 +649,7 @@ int tc_policy_egress(struct __sk_buff *ctx) {
   }
 
   /* Update per-IP-protocol stats (flow_key.protocol valid from here) */
-  tc_update_ip_proto_stats(flow_key.protocol, pkt_len);
+  update_l4_proto_stats(gs, flow_key.protocol, pkt_len);
 
   /* Check flow verdict cache.  Writers are the Suricata EVE consumer and the
    * QUIC SNI inspector; a hit short-circuits the policy lookup. */

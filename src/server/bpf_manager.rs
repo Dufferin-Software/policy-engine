@@ -615,7 +615,6 @@ impl BpfManager {
             ("pkt_scratch", &mut open_skel.maps.pkt_scratch),
             ("default_action", &mut open_skel.maps.default_action),
             ("fib_config_map", &mut open_skel.maps.fib_config_map),
-            ("per_proto_stats", &mut open_skel.maps.per_proto_stats),
             ("sni_rules", &mut open_skel.maps.sni_rules),
             ("mac_rules", &mut open_skel.maps.mac_rules),
         ];
@@ -707,7 +706,6 @@ impl BpfManager {
             ("tc_events", &mut open_skel.maps.tc_events),
             ("tc_pkt_scratch", &mut open_skel.maps.tc_pkt_scratch),
             ("tc_default_action", &mut open_skel.maps.tc_default_action),
-            ("tc_per_proto_stats", &mut open_skel.maps.tc_per_proto_stats),
             ("tc_sni_rules", &mut open_skel.maps.tc_sni_rules),
             ("tc_mac_rules", &mut open_skel.maps.tc_mac_rules),
         ];
@@ -846,7 +844,6 @@ impl BpfManager {
         pin_if_needed!(skel.maps.flow_verdict_cache, "flow_verdict_cache");
         #[cfg(feature = "suricata")]
         pin_if_needed!(skel.maps.inspect_config, "inspect_config");
-        pin_if_needed!(skel.maps.per_proto_stats, "per_proto_stats");
         // flows_to_inspect is pinned here (XDP skeleton owns it); TC reuses
         // it from this path via try_reuse_pinned_maps_tc.
         #[cfg(feature = "suricata")]
@@ -906,7 +903,6 @@ impl BpfManager {
         pin_if_needed!(skel.maps.tc_flow_verdict_cache, "tc_flow_verdict_cache");
         #[cfg(feature = "suricata")]
         pin_if_needed!(skel.maps.tc_inspect_config, "tc_inspect_config");
-        pin_if_needed!(skel.maps.tc_per_proto_stats, "tc_per_proto_stats");
         pin_if_needed!(skel.maps.tc_sni_rules, "tc_sni_rules");
         pin_if_needed!(skel.maps.tc_mac_rules, "tc_mac_rules");
         pin_if_needed!(skel.maps.tc_quic_inspect_events, "tc_quic_inspect_events");
@@ -2163,35 +2159,10 @@ impl BpfManager {
         Ok(self.sum_global_stats(direction)?.proc_hist.to_vec())
     }
 
-    /// Get per-protocol packet/byte stats (256 entries, summed across CPUs)
+    /// Get per-protocol packet/byte stats (256 entries, summed across CPUs
+    /// and interfaces)
     pub fn get_proto_stats(&self, direction: Direction) -> Result<Vec<crate::types::ProtoStats>> {
-        use crate::types::ProtoStats;
-        let mut totals = vec![ProtoStats::default(); 256];
-        let map: Option<&dyn MapCore> = match direction {
-            Direction::Ingress => self
-                .xdp_skel
-                .as_ref()
-                .map(|s| &s.maps.per_proto_stats as &dyn MapCore),
-            Direction::Egress => self
-                .tc_skel
-                .as_ref()
-                .map(|s| &s.maps.tc_per_proto_stats as &dyn MapCore),
-        };
-        if let Some(map) = map {
-            for proto in 0u32..256 {
-                let key = proto.to_ne_bytes();
-                if let Some(values) = map.lookup_percpu(&key, MapFlags::ANY)? {
-                    for cpu_val in values {
-                        let mut ps = ProtoStats::default();
-                        if plain::copy_from_bytes(&mut ps, &cpu_val).is_ok() {
-                            totals[proto as usize].packets += ps.packets;
-                            totals[proto as usize].bytes += ps.bytes;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(totals)
+        Ok(self.sum_global_stats(direction)?.proto.to_vec())
     }
 
     /// Get L3 protocol stats (5 buckets: 0=IPv4, 1=IPv6, 2=ARP, 3=MPLS,
