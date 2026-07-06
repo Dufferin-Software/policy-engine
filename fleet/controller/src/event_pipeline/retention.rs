@@ -71,6 +71,18 @@ pub async fn sweep_once(scope: &TenantScope, metrics: &Arc<EventPipelineMetrics>
         total += removed;
     }
 
+    // Fired-alert history: same window, but only resolved rows — a
+    // still-firing alert must never vanish mid-incident, however old.
+    // `alert_history` timestamps are seconds, not ns.
+    let cutoff_s = cutoff / 1_000_000_000;
+    for _ in 0..100 {
+        let removed = prune_alert_history(scope, cutoff_s, CHUNK).await?;
+        if removed == 0 {
+            break;
+        }
+        total += removed;
+    }
+
     if total > 0 {
         metrics.record_pruned(total);
         log::debug!("event retention pruned {total} rows older than {cutoff} ns");
@@ -95,6 +107,26 @@ async fn prune_suricata_alerts(scope: &TenantScope, cutoff_ns: i64, chunk: i64) 
     .execute(scope.pool())
     .await
     .context("Failed to prune suricata alerts")?;
+    Ok(res.rows_affected())
+}
+
+/// One chunked delete of resolved alert-history rows past the cutoff.
+/// Unresolved rows are kept regardless of age (open incidents), and rows
+/// age from `resolved_at`, not `fired_at`.
+async fn prune_alert_history(scope: &TenantScope, cutoff_s: i64, chunk: i64) -> Result<u64> {
+    let res = sqlx::query(
+        "DELETE FROM alert_history WHERE id IN ( \
+            SELECT id FROM alert_history \
+            WHERE tenant_id = ? AND resolved_at IS NOT NULL AND resolved_at < ? \
+            ORDER BY id ASC LIMIT ? \
+         )",
+    )
+    .bind(scope.tenant_id())
+    .bind(cutoff_s)
+    .bind(chunk)
+    .execute(scope.pool())
+    .await
+    .context("Failed to prune alert history")?;
     Ok(res.rows_affected())
 }
 
@@ -166,6 +198,53 @@ mod tests {
         assert_eq!(pruned, 1);
         let remaining = store.list(&EventFilter::default(), 10).await.unwrap();
         assert_eq!(remaining.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sweep_prunes_resolved_alert_history_only() {
+        let scope = scope_with_retention(1).await;
+        let now_s = chrono::Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO alert_rules \
+             (id, tenant_id, name, match_json, group_by, severity, receiver_ids, \
+              created_at, updated_at) \
+             VALUES (1, ?, 'r', '{}', '[]', 'info', '[]', 0, 0)",
+        )
+        .bind(scope.tenant_id())
+        .execute(scope.pool())
+        .await
+        .unwrap();
+        // (group_key, fired_at, resolved_at): resolved-old is pruned;
+        // unresolved-old and resolved-fresh survive.
+        for (key, fired, resolved) in [
+            ("resolved-old", now_s - 20, Some(now_s - 10)),
+            ("unresolved-old", now_s - 20, None),
+            ("resolved-fresh", now_s - 20, Some(now_s)),
+        ] {
+            sqlx::query(
+                "INSERT INTO alert_history \
+                 (tenant_id, rule_id, group_key, fired_at, resolved_at, \
+                  event_count, sample_event_ids) \
+                 VALUES (?, 1, ?, ?, ?, 1, '[]')",
+            )
+            .bind(scope.tenant_id())
+            .bind(key)
+            .bind(fired)
+            .bind(resolved)
+            .execute(scope.pool())
+            .await
+            .unwrap();
+        }
+
+        let metrics = Arc::new(EventPipelineMetrics::new());
+        let pruned = sweep_once(&scope, &metrics).await.unwrap();
+        assert_eq!(pruned, 1);
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT group_key FROM alert_history ORDER BY id")
+                .fetch_all(scope.pool())
+                .await
+                .unwrap();
+        assert_eq!(remaining, vec!["unresolved-old", "resolved-fresh"]);
     }
 
     #[tokio::test]

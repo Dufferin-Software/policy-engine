@@ -17,6 +17,7 @@ A high-performance XDP/TC packet policy engine for Linux. Rules are expressed as
 | [docs/ipfix-flow-export.md](docs/ipfix-flow-export.md) | IPFIX flow export |
 | [docs/cpu-affinity.md](docs/cpu-affinity.md) | CPU affinity configuration |
 | [docs/containers.md](docs/containers.md) | Container deployment guide |
+| [docs/controller/retention.md](docs/controller/retention.md) | Controller data retention (events, IDS alerts, alert history) |
 
 ## Architecture
 
