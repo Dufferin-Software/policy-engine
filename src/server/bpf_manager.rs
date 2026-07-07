@@ -2238,7 +2238,7 @@ impl BpfManager {
             .map(|(ethertype, packets)| EthertypeStats { ethertype, packets })
             .collect();
 
-        result.sort_by(|a, b| b.packets.cmp(&a.packets));
+        result.sort_by_key(|s| std::cmp::Reverse(s.packets));
 
         Ok(result)
     }
@@ -2286,7 +2286,7 @@ impl BpfManager {
             }
         }
 
-        result.sort_by(|a, b| b.packets.cmp(&a.packets));
+        result.sort_by_key(|s| std::cmp::Reverse(s.packets));
         Ok(result)
     }
 
