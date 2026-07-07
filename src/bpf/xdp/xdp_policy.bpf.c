@@ -1086,10 +1086,12 @@ int xdp_policy_main(struct xdp_md *ctx) {
    * source.  A hit short-circuits the policy lookup at XDP line rate. */
   int cached_verdict = xdp_flow_verdict_cache_check(
       stats, &flow_key, ctx->ingress_ifindex, pkt_len, t0);
-  if (cached_verdict >= 0) {
-    record_proc_time(stats, t0);
+  /* Timing already recorded by check_flow_verdict_cache on a hit (which
+   * reuses its expiry-check timestamp, avoiding a second ktime call);
+   * recording again here would double-count the packet in the histogram.
+   * TC (tc_policy_egress) returns the same way. */
+  if (cached_verdict >= 0)
     return cached_verdict;
-  }
 
   /* Lookup policy (two-level LPM: src prefix → dst prefix → L4 rules).
    * Scoped per-interface by ctx->ingress_ifindex. */
