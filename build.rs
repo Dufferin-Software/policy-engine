@@ -23,7 +23,8 @@ fn emit_build_info() {
     };
 
     let sha = run("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let dirty = run("git", &["status", "--porcelain"])
+    // Untracked files don't affect the built code — only count tracked changes.
+    let dirty = run("git", &["status", "--porcelain", "--untracked-files=no"])
         .map(|s| !s.is_empty())
         .unwrap_or(false);
     let built = run("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]).unwrap_or_else(|| "unknown".into());
