@@ -41,10 +41,23 @@ _DEB_PROFILES = $(foreach f,$(subst $(comma), ,$(FEATURES)),pkg.policy-engine.$(
 
 .PHONY: deb
 
+# Each build gets a unique Debian version (<base>+git<utc-timestamp>.<sha>)
+# via a temporary changelog entry (restored afterwards, even on failure).
+# With a constant version, `apt install ./pkg.deb` over an equal installed
+# version is a silent no-op — stale binaries survive what looks like an
+# upgrade.  The monotonic timestamp makes every rebuild an apt upgrade.
 deb:
-	$(if $(_DEB_PROFILES), \
-		DEB_BUILD_PROFILES="$(_DEB_PROFILES)" dpkg-buildpackage --no-sign -uc -us -b, \
-		dpkg-buildpackage --no-sign -uc -us -b)
+	@set -e; \
+	cp debian/changelog debian/changelog.deb-orig; \
+	trap 'mv debian/changelog.deb-orig debian/changelog' EXIT; \
+	base="$$(dpkg-parsechangelog -SVersion)"; \
+	maint="$$(dpkg-parsechangelog -SMaintainer)"; \
+	sha="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
+	ver="$$base+git$$(date -u +%Y%m%d%H%M%S).$$sha"; \
+	{ printf 'policy-engine (%s) unstable; urgency=medium\n\n  * Development build from git %s.\n\n -- %s  %s\n\n' \
+		"$$ver" "$$sha" "$$maint" "$$(date -R)"; \
+	  cat debian/changelog.deb-orig; } > debian/changelog; \
+	$(if $(_DEB_PROFILES),DEB_BUILD_PROFILES="$(_DEB_PROFILES)" )dpkg-buildpackage --no-sign -uc -us -b
 
 .PHONY: verify-bpf lint lint-rust lint-bpf fmt coverage lint-web build-web ci
 
