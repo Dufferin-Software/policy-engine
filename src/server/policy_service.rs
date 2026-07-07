@@ -490,7 +490,9 @@ impl PolicyService {
         let interfaces = self.bpf_ops.get_attached_interfaces();
         ServerStatus {
             running: true,
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            // Include the build fingerprint (git sha + build time, from
+            // build.rs) so a running instance can be matched to its source.
+            version: format!("{} ({})", env!("CARGO_PKG_VERSION"), env!("PE_BUILD_INFO")),
             uptime_secs: self.start_time.elapsed().as_secs(),
             program_attached: !interfaces.is_empty(),
         }

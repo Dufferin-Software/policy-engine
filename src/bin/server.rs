@@ -19,7 +19,11 @@ use policy_engine::server::{resolve_server_config, run_server, CliOverrides};
 /// Policy Engine Server
 #[derive(Parser)]
 #[command(name = "policy-engine")]
-#[command(author, version, about = "Policy Engine GraphQL Server")]
+#[command(
+    author,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PE_BUILD_INFO"), ")"),
+    about = "Policy Engine GraphQL Server"
+)]
 struct Args {
     /// Host address to bind to (overrides config file; default: 127.0.0.1)
     #[arg(short = 'H', long)]
