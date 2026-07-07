@@ -39,6 +39,7 @@ pub mod state_store;
 pub mod suricata_coordinator;
 #[cfg(feature = "suricata")]
 pub mod suricata_runtime;
+mod verdict_harvest;
 #[cfg(feature = "suricata")]
 pub mod veth_manager;
 

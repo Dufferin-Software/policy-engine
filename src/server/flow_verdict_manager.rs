@@ -121,6 +121,7 @@ pub fn enforce_alert(
         expires_ns: now_ns + verdict_ttl_ns,
         packets: 0,
         bytes: 0,
+        last_seen_ns: 0,
         rule_id: 0,
     };
     // The verdict cache is scoped per-interface (flow_verdict_key.ifindex),

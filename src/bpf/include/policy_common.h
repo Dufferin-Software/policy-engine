@@ -342,11 +342,16 @@ struct flow_verdict {
   __u64 expires_ns;   /* Auto-expire timestamp (0 = never) */
   __u64 packets;      /* Packets matched by this verdict */
   __u64 bytes;        /* Bytes matched by this verdict */
+  __u64 last_seen_ns; /* bpf_ktime_get_ns() at the most recent cache hit
+                         (plain store — the entry is per-flow, so packet
+                         ordering races only ever skew this by one packet) */
   __u64 rule_id;      /* Rule that produced this verdict (0 = none / default /
-                         SNI / IPS).  When non-zero the dataplane bumps
-                         rule_stats[rule_id] on every cache hit so per-rule
-                         packet/byte/last_seen counters stay accurate even though
-                         the fast path skips rule evaluation. */
+                         SNI / IPS).  The dataplane does NOT touch
+                         rule_stats[rule_id] on cache hits; userspace
+                         periodically harvests packets/bytes/last_seen_ns
+                         deltas from this entry into rule_stats (see
+                         verdict_harvest.rs) so the per-packet fast path
+                         avoids a HASH lookup and two shared atomic adds. */
 };
 
 #ifdef SURICATA_IPS

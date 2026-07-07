@@ -13,6 +13,7 @@ use std::os::fd::AsFd;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
+use super::verdict_harvest::VerdictHarvestState;
 use crate::paths::*;
 use crate::types::*;
 
@@ -109,6 +110,12 @@ pub struct BpfManager {
     /// reboot (BPF filesystem cleared), or BPF version change.  Used by the
     /// server to decide whether to restore state from the persistent store.
     pins_were_reused: bool,
+    /// Verdict-cache → rule_stats harvest baselines, [Ingress, Egress].  The
+    /// dataplane no longer bumps rule_stats on verdict-cache hits; every walk
+    /// of a verdict cache folds the per-flow counter deltas into the matching
+    /// rule_stats map (see verdict_harvest.rs).  Mutex rather than &mut
+    /// because harvesting also happens behind read paths (get_rule_stats).
+    verdict_harvest: [std::sync::Mutex<VerdictHarvestState>; 2],
 }
 
 impl BpfManager {
@@ -131,6 +138,10 @@ impl BpfManager {
             ingress_registry: GroupRegistry::new(),
             egress_registry: GroupRegistry::new(),
             pins_were_reused,
+            verdict_harvest: [
+                std::sync::Mutex::new(VerdictHarvestState::new()),
+                std::sync::Mutex::new(VerdictHarvestState::new()),
+            ],
         };
         // Load BPF programs eagerly before the HTTP server starts.
         // try_reuse_pinned_maps will reuse surviving pins (same-version restart)
@@ -2063,8 +2074,14 @@ impl BpfManager {
         Ok(rules)
     }
 
-    /// Get statistics for a rule
+    /// Get statistics for a rule.
+    ///
+    /// The dataplane only writes rule_stats on the cache-miss path; traffic on
+    /// cached flows accumulates in flow_verdict_cache entries instead, so fold
+    /// those in first (rate-limited — one cache walk covers a whole burst of
+    /// per-rule reads like the metrics tick or a UI rule listing).
     pub fn get_rule_stats(&self, rule_id: u64, direction: Direction) -> Result<Option<RuleStats>> {
+        self.harvest_rule_stats_rate_limited(direction);
         let map: Option<&dyn MapCore> = match direction {
             Direction::Ingress => self
                 .xdp_skel
@@ -2326,6 +2343,15 @@ impl BpfManager {
 
     /// Clear statistics for a specific rule
     pub fn clear_rule_stats(&mut self, rule_id: u64, direction: Direction) -> Result<()> {
+        // Fold outstanding verdict-cache deltas first: it advances the harvest
+        // baselines past all pre-clear traffic, so the clear leaves the counters
+        // at true zero instead of having stale deltas re-appear on the next walk.
+        if let Err(e) = self.harvest_rule_stats(direction) {
+            warn!(
+                "pre-clear verdict harvest failed for {:?}: {:#}",
+                direction, e
+            );
+        }
         let key_bytes = rule_id.to_ne_bytes();
         let zeroed_stats = RuleStats::default();
 
@@ -2354,6 +2380,14 @@ impl BpfManager {
 
     /// Clear statistics for all rules in a direction
     pub fn clear_all_rule_stats(&mut self, direction: Direction) -> Result<()> {
+        // See clear_rule_stats: consume pending verdict-cache deltas so they
+        // cannot re-surface after the wipe.
+        if let Err(e) = self.harvest_rule_stats(direction) {
+            warn!(
+                "pre-clear verdict harvest failed for {:?}: {:#}",
+                direction, e
+            );
+        }
         let zeroed_stats = RuleStats::default();
 
         match direction {
@@ -3172,8 +3206,30 @@ impl BpfManager {
         Ok(())
     }
 
-    /// List all flow verdicts
+    /// List all flow verdicts.
+    ///
+    /// Every listing doubles as a harvest point: the walk already paid for
+    /// iterating the cache, so its counters are folded into rule_stats on the
+    /// way out.  The 30 s expiry sweep, the pre-flush walk in
+    /// clear_flow_verdicts (which would otherwise delete unharvested deltas),
+    /// and UI listings all keep per-rule stats fresh through this without a
+    /// dedicated background task.
     pub fn list_flow_verdicts(
+        &self,
+        direction: Direction,
+    ) -> Result<Vec<(FlowVerdictKey, FlowVerdict)>> {
+        let verdicts = self.list_flow_verdicts_raw(direction)?;
+        if let Err(e) = self.apply_verdict_harvest(direction, &verdicts) {
+            warn!(
+                "verdict-cache → rule_stats harvest failed for {:?}: {:#}",
+                direction, e
+            );
+        }
+        Ok(verdicts)
+    }
+
+    /// Walk the direction's verdict-cache map without harvesting.
+    fn list_flow_verdicts_raw(
         &self,
         direction: Direction,
     ) -> Result<Vec<(FlowVerdictKey, FlowVerdict)>> {
@@ -3206,6 +3262,82 @@ impl BpfManager {
         }
 
         Ok(verdicts)
+    }
+
+    /// Fold a verdict-cache listing into the direction's rule_stats map.
+    ///
+    /// Holds the direction's harvest lock across both the baseline fold and
+    /// the map writes so concurrent walks cannot interleave read-modify-writes
+    /// of the same rule entry.  The RMW itself races with BPF-side atomic adds
+    /// exactly like bump_rule_stats does; that path only fires on the first
+    /// packet of a flow (cache miss) and on SNI matches, so the loss window is
+    /// accepted just as it is there.
+    fn apply_verdict_harvest(
+        &self,
+        direction: Direction,
+        verdicts: &[(FlowVerdictKey, FlowVerdict)],
+    ) -> Result<()> {
+        let map: Option<&dyn MapCore> = match direction {
+            Direction::Ingress => self
+                .xdp_skel
+                .as_ref()
+                .map(|s| &s.maps.rule_stats as &dyn MapCore),
+            Direction::Egress => self
+                .tc_skel
+                .as_ref()
+                .map(|s| &s.maps.tc_rule_stats as &dyn MapCore),
+        };
+        // No skeleton → nowhere to fold into; leave the baselines untouched
+        // rather than silently consuming the deltas.
+        let Some(map) = map else { return Ok(()) };
+
+        let mut state = self.verdict_harvest[direction as usize]
+            .lock()
+            .expect("verdict_harvest mutex poisoned");
+        for (rule_id, delta) in state.fold(verdicts) {
+            let key_bytes = rule_id.to_ne_bytes();
+            let mut stats = if let Some(existing) = map.lookup(&key_bytes, MapFlags::ANY)? {
+                let mut s = RuleStats::default();
+                plain::copy_from_bytes(&mut s, &existing)
+                    .map_err(|e| anyhow!("Failed to parse stats: {:?}", e))?;
+                s
+            } else {
+                RuleStats::default()
+            };
+            stats.packets = stats.packets.saturating_add(delta.packets);
+            stats.bytes = stats.bytes.saturating_add(delta.bytes);
+            stats.last_seen_ns = stats.last_seen_ns.max(delta.last_seen_ns);
+            map.update(&key_bytes, stats.as_bytes(), MapFlags::ANY)
+                .context("Failed to fold verdict-cache deltas into rule_stats")?;
+        }
+        Ok(())
+    }
+
+    /// Walk the direction's verdict cache and fold counter deltas into
+    /// rule_stats immediately (no rate limit).
+    fn harvest_rule_stats(&self, direction: Direction) -> Result<()> {
+        let verdicts = self.list_flow_verdicts_raw(direction)?;
+        self.apply_verdict_harvest(direction, &verdicts)
+    }
+
+    /// Rate-limited harvest for hot read paths: get_rule_stats is called once
+    /// per rule per metrics tick / UI listing, so only the first call in a
+    /// burst pays for the full verdict-cache walk.
+    fn harvest_rule_stats_rate_limited(&self, direction: Direction) {
+        const MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        let due = self.verdict_harvest[direction as usize]
+            .lock()
+            .expect("verdict_harvest mutex poisoned")
+            .elapsed_since_fold()
+            .is_none_or(|elapsed| elapsed >= MIN_INTERVAL);
+        if due {
+            if let Err(e) = self.harvest_rule_stats(direction) {
+                warn!(
+                    "verdict-cache → rule_stats harvest failed for {:?}: {:#}",
+                    direction, e
+                );
+            }
+        }
     }
 
     /// Get count of active flow verdicts

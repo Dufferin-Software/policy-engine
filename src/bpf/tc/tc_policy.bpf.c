@@ -391,8 +391,9 @@ tc_flow_verdict_key_from_flow(struct flow_verdict_key *fv_key,
  * the trie; the resulting PASS/DROP is cached so subsequent packets
  * short-circuit at the verdict-cache check in tc_policy_egress.  These verdicts
  * never expire on time (POLICY_VERDICT_EXPIRES_NS == 0): flushed on rule change,
- * reclaimed by LRU under pressure.  rule_id (0 for the default path) keeps
- * rule_stats accurate on cache hits.  Callers must only invoke this for
+ * reclaimed by LRU under pressure.  rule_id (0 for the default path) lets
+ * userspace attribute the entry's per-flow counters back to tc_rule_stats
+ * (see verdict_harvest.rs).  Callers must only invoke this for
  * cacheable (pure PASS/DROP) flows.  Defined here (before tc_policy_egress)
  * since the main program calls it.
  */
@@ -432,6 +433,7 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
   if (fv->action == ACTION_DROP) {
     __sync_fetch_and_add(&fv->packets, 1);
     __sync_fetch_and_add(&fv->bytes, pkt_len);
+    fv->last_seen_ns = now;
     update_action_stats(gs, ACTION_DROP);
     if (gs) {
       gs->verdict_drop_packets++;
@@ -440,13 +442,13 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
     /* A rule-derived verdict (rule_id != 0) counts as a policy match on every
      * packet, mirroring the cache-miss LPM path, so policy_matches stays
      * consistent with policy_drops/policy_pass (which already count per packet
-     * here).  Also keep per-rule stats accurate.  rule_id is 0 for default /
-     * SNI / IPS verdicts — no rule matched, so no bump. */
-    if (fv->rule_id) {
-      tc_update_rule_stats(fv->rule_id, pkt_len, now);
-      if (gs)
-        gs->policy_matches++;
-    }
+     * here).  rule_id is 0 for default / SNI / IPS verdicts — no rule matched,
+     * so no bump.  Per-rule packet/byte counters are NOT bumped here: userspace
+     * harvests the per-flow counters above into tc_rule_stats
+     * (verdict_harvest.rs), keeping the HASH lookup and its shared atomic adds
+     * off the per-packet fast path. */
+    if (fv->rule_id && gs)
+      gs->policy_matches++;
     /* Reuse 'now' already read above — avoids an extra clock call */
     record_proc_time_at(gs, t0, now);
     return TC_ACT_SHOT;
@@ -454,16 +456,14 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
     /* Cached PASS verdict: flow previously inspected, pass through. */
     __sync_fetch_and_add(&fv->packets, 1);
     __sync_fetch_and_add(&fv->bytes, pkt_len);
+    fv->last_seen_ns = now;
     update_action_stats(gs, ACTION_PASS);
     if (gs) {
       gs->verdict_pass_packets++;
       gs->verdict_pass_bytes += pkt_len;
     }
-    if (fv->rule_id) {
-      tc_update_rule_stats(fv->rule_id, pkt_len, now);
-      if (gs)
-        gs->policy_matches++;
-    }
+    if (fv->rule_id && gs)
+      gs->policy_matches++;
     record_proc_time_at(gs, t0, now);
     return TC_ACT_OK;
   }

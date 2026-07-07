@@ -141,6 +141,7 @@ fn verdict_seed_path_reaches_bpf_adaptor() {
         expires_ns: 100 + 600_000_000_000, // 10 min — matches QUIC_VERDICT_TTL_NS
         packets: 0,
         bytes: 0,
+        last_seen_ns: 0,
         rule_id: 0,
     };
 

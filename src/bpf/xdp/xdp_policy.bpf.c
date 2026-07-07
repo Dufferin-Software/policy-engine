@@ -464,11 +464,17 @@ xdp_sni_write_verdict(const struct flow_key *flow, __u32 action, __u64 now_ns,
  * verdict-cache check in xdp_policy_main, skipping the O(ancestors^2) walk.
  * These verdicts never expire on time (POLICY_VERDICT_EXPIRES_NS == 0): they are
  * flushed on rule change and reclaimed by LRU under pressure.  rule_id (0 for
- * the default-action path) is stored so cache hits keep rule_stats accurate.
+ * the default-action path) is stored so userspace can attribute the entry's
+ * per-flow packet/byte counters back to rule_stats (see verdict_harvest.rs).
  * Callers must only invoke this for cacheable flows (pure PASS/DROP — see
  * process_rule_actions' cacheable flag).
+ *
+ * __noinline so the ~100 bytes of key + verdict live in this subprogram's
+ * frame instead of xdp_policy_main's: main's frame plus its deepest callee
+ * must fit the 512-byte combined stack limit (same reasoning as
+ * tc_policy_write_verdict).
  */
-static __always_inline void
+static __noinline void
 xdp_policy_write_verdict(const struct flow_key *flow, __u32 action,
                          __u64 rule_id, __u64 now_ns, __u32 ifindex) {
   struct flow_verdict_key fv_key = {};
@@ -829,6 +835,7 @@ check_flow_verdict_cache(struct global_stats *stats,
   if (fv->action == ACTION_DROP) {
     __sync_fetch_and_add(&fv->packets, 1);
     __sync_fetch_and_add(&fv->bytes, pkt_len);
+    fv->last_seen_ns = now;
     update_action_stats(stats, ACTION_DROP);
     if (stats) {
       stats->verdict_drop_packets++;
@@ -837,13 +844,13 @@ check_flow_verdict_cache(struct global_stats *stats,
     /* A rule-derived verdict (rule_id != 0) counts as a policy match on every
      * packet, mirroring the cache-miss LPM path, so policy_matches stays
      * consistent with policy_drops/policy_pass (which already count per packet
-     * here).  Also keep per-rule stats accurate.  rule_id is 0 for default /
-     * SNI / IPS verdicts — no rule matched, so no bump. */
-    if (fv->rule_id) {
-      update_rule_stats(fv->rule_id, pkt_len, now);
-      if (stats)
-        stats->policy_matches++;
-    }
+     * here).  rule_id is 0 for default / SNI / IPS verdicts — no rule matched,
+     * so no bump.  Per-rule packet/byte counters are NOT bumped here: userspace
+     * harvests the per-flow counters above into rule_stats (verdict_harvest.rs),
+     * keeping the rule_stats HASH lookup and its shared atomic adds off the
+     * per-packet fast path. */
+    if (fv->rule_id && stats)
+      stats->policy_matches++;
     /* Reuse 'now' already read above — avoids an extra clock call */
     record_proc_time_at(stats, t0, now);
     return XDP_DROP;
@@ -852,16 +859,14 @@ check_flow_verdict_cache(struct global_stats *stats,
      * Pass through immediately, skipping the policy lookup. */
     __sync_fetch_and_add(&fv->packets, 1);
     __sync_fetch_and_add(&fv->bytes, pkt_len);
+    fv->last_seen_ns = now;
     update_action_stats(stats, ACTION_PASS);
     if (stats) {
       stats->verdict_pass_packets++;
       stats->verdict_pass_bytes += pkt_len;
     }
-    if (fv->rule_id) {
-      update_rule_stats(fv->rule_id, pkt_len, now);
-      if (stats)
-        stats->policy_matches++;
-    }
+    if (fv->rule_id && stats)
+      stats->policy_matches++;
     record_proc_time_at(stats, t0, now);
     return XDP_PASS;
   }

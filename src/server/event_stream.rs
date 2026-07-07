@@ -692,6 +692,7 @@ async fn process_quic_sample(
         expires_ns: now_ns + QUIC_VERDICT_TTL_NS,
         packets: 0,
         bytes: 0,
+        last_seen_ns: 0,
         rule_id: 0,
     };
     bpf.update_flow_verdict(&vkey, &verdict, sample.direction)

@@ -387,9 +387,12 @@ pub struct FlowVerdict {
     pub expires_ns: u64,
     pub packets: u64,
     pub bytes: u64,
-    /// Rule that produced this verdict (0 = none / default / SNI / IPS). When
-    /// non-zero the dataplane bumps `rule_stats[rule_id]` on every cache hit so
-    /// per-rule counters stay accurate on the cached fast path.
+    /// bpf_ktime_get_ns() at the most recent cache hit (CLOCK_MONOTONIC).
+    pub last_seen_ns: u64,
+    /// Rule that produced this verdict (0 = none / default / SNI / IPS). The
+    /// dataplane does not touch rule_stats on cache hits; userspace folds this
+    /// entry's packet/byte/last_seen deltas into `rule_stats[rule_id]` when it
+    /// walks the cache (see server/verdict_harvest.rs).
     pub rule_id: u64,
 }
 
@@ -409,6 +412,7 @@ impl fmt::Debug for FlowVerdict {
             .field("expires_ns", &self.expires_ns)
             .field("packets", &self.packets)
             .field("bytes", &self.bytes)
+            .field("last_seen_ns", &self.last_seen_ns)
             .field("rule_id", &self.rule_id)
             .finish()
     }
@@ -2236,6 +2240,7 @@ mod tests {
                 expires_ns: 99999,
                 packets: 5,
                 bytes: 500,
+                last_seen_ns: 0,
                 rule_id: 0,
             };
             let s = format!("{:?}", v);
