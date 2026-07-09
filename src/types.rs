@@ -41,8 +41,10 @@ pub mod tail_call_features {
     }
 }
 
-/// Maximum interfaces we track
-pub const MAX_INTERFACES: u32 = 256;
+/// Maximum interfaces we track.  Sizes the per-interface BPF stats/config
+/// maps; must be a power of two (the datapath masks with `ifindex %
+/// MAX_INTERFACES`).  Keep in sync with MAX_INTERFACES in policy_common.h.
+pub const MAX_INTERFACES: u32 = 16;
 
 /// Local endpoint of the inspect veth pair (TC clone-redirect target).
 pub const INSPECT_VETH_LOCAL: &str = "pe-inspect0";
@@ -1347,9 +1349,25 @@ pub const L3_BUCKETS: usize = 5;
 /// Keep in sync with QUIC_STATS_SLOTS in policy_common.h.
 pub const QUIC_SLOTS: usize = 4;
 
-/// Per-IP-protocol slots in `GlobalStats::proto`, indexed by protocol number.
-/// Keep in sync with IP_PROTO_SLOTS in policy_common.h.
-pub const IP_PROTO_SLOTS: usize = 256;
+/// Per-IP-protocol slots in `GlobalStats::proto`.  One dedicated slot per
+/// tracked protocol plus a catch-all (slot 0); the BPF side buckets with
+/// ip_proto_to_slot().  Keep in sync with IP_PROTO_SLOTS and the
+/// IP_PROTO_SLOT_* defines in policy_common.h.
+pub const IP_PROTO_SLOTS: usize = 8;
+
+/// IP protocol number represented by each `GlobalStats::proto` slot
+/// (slot 0 = catch-all "other", reported as protocol 0).  Must mirror the
+/// IP_PROTO_SLOT_* → PROTO_* mapping in policy_common.h.
+pub const IP_PROTO_SLOT_PROTOS: [u8; IP_PROTO_SLOTS] = [
+    0,   // IP_PROTO_SLOT_OTHER
+    1,   // IP_PROTO_SLOT_ICMP
+    6,   // IP_PROTO_SLOT_TCP
+    17,  // IP_PROTO_SLOT_UDP
+    47,  // IP_PROTO_SLOT_GRE
+    50,  // IP_PROTO_SLOT_ESP
+    58,  // IP_PROTO_SLOT_ICMPV6
+    132, // IP_PROTO_SLOT_SCTP
+];
 
 /// Global statistics (must match BPF struct layout)
 #[repr(C)]
@@ -1384,7 +1402,7 @@ pub struct GlobalStats {
     pub quic: [ProtoStats; QUIC_SLOTS],
     /// log2(ns) processing-time histogram
     pub proc_hist: [u64; HIST_BUCKETS],
-    /// Per-IP-protocol counters, indexed by protocol number (TCP=6, UDP=17, …)
+    /// Per-IP-protocol counters, indexed by slot (see IP_PROTO_SLOT_PROTOS)
     pub proto: [ProtoStats; IP_PROTO_SLOTS],
 }
 
@@ -2310,14 +2328,29 @@ mod tests {
         }
 
         /// Guards the layout contract with the packed BPF struct: 23 scalar
-        /// u64 counters + l3[5] + quic[4] + proto[256] (16 bytes each) +
-        /// proc_hist[64].  If this fails, struct global_stats in
+        /// u64 counters + l3[5] + quic[4] + proto[IP_PROTO_SLOTS] (16 bytes
+        /// each) + proc_hist[64].  If this fails, struct global_stats in
         /// policy_common.h and GlobalStats have drifted apart.
         #[test]
         fn matches_bpf_struct_size() {
             assert_eq!(
                 std::mem::size_of::<GlobalStats>(),
                 23 * 8 + L3_BUCKETS * 16 + QUIC_SLOTS * 16 + HIST_BUCKETS * 8 + IP_PROTO_SLOTS * 16
+            );
+        }
+
+        /// Guards the slot→protocol table against the IP_PROTO_SLOT_* defines
+        /// in policy_common.h: slot 0 is the catch-all and every tracked
+        /// protocol has exactly one slot.
+        #[test]
+        fn ip_proto_slot_table_consistent() {
+            assert_eq!(IP_PROTO_SLOT_PROTOS.len(), IP_PROTO_SLOTS);
+            assert_eq!(IP_PROTO_SLOT_PROTOS[0], 0, "slot 0 must be the catch-all");
+            let mut protos = IP_PROTO_SLOT_PROTOS;
+            protos.sort_unstable();
+            assert!(
+                protos.windows(2).all(|w| w[0] < w[1]),
+                "duplicate protocol number in IP_PROTO_SLOT_PROTOS"
             );
         }
 

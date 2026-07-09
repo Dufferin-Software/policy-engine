@@ -506,12 +506,14 @@ async fn collect_snapshot(state: &AppState) -> MetricsSnapshot {
         let Ok(proto_vec) = service.get_proto_stats(dir) else {
             continue;
         };
-        for (proto_num, ps) in proto_vec.iter().enumerate() {
+        // proto stats are slot-indexed; map each slot back to its protocol
+        // number (slot 0 = catch-all → proto 0 → "other").
+        for (slot, ps) in proto_vec.iter().enumerate() {
             if ps.packets == 0 {
                 continue;
             }
             protos.push(ProtoMetrics {
-                protocol: proto_name(proto_num as u8),
+                protocol: proto_name(crate::types::IP_PROTO_SLOT_PROTOS[slot]),
                 direction: dir_label(dir),
                 packets: ps.packets,
                 bytes: ps.bytes,

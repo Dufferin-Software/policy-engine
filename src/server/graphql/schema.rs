@@ -849,16 +849,21 @@ impl QueryRoot {
             .sample(&interface, dir_byte, &global.proc_hist)
             .await;
 
+        // proto[] is slot-indexed; IP_PROTO_SLOT_PROTOS maps a slot back to
+        // its IP protocol number (slot 0 = catch-all, reported as 0/"Other").
         let proto_stats: Vec<ProtoStatsOutput> = global
             .proto
             .iter()
             .enumerate()
             .filter(|(_, ps)| ps.packets > 0)
-            .map(|(proto, ps)| ProtoStatsOutput {
-                protocol: proto as i32,
-                name: proto_name(proto as u8).to_string(),
-                packets: ps.packets as i64,
-                bytes: ps.bytes as i64,
+            .map(|(slot, ps)| {
+                let proto = crate::types::IP_PROTO_SLOT_PROTOS[slot];
+                ProtoStatsOutput {
+                    protocol: proto as i32,
+                    name: proto_name(proto).to_string(),
+                    packets: ps.packets as i64,
+                    bytes: ps.bytes as i64,
+                }
             })
             .collect();
 
