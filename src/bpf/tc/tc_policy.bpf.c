@@ -417,11 +417,15 @@ tc_policy_write_verdict(const struct flow_key *flow, __u32 action,
  * Returns the TC verdict (TC_ACT_OK / TC_ACT_SHOT) on a live cache hit, having
  * already updated the relevant counters and recorded timing, or -1 when there
  * is no usable cached decision and the caller should continue to policy lookup.
+ *
+ * On a hit, *rule_id_out is set to the verdict's originating rule_id (0 for
+ * default / SNI / IPS verdicts) so the caller can attribute the packet in the
+ * flow cache tail call; untouched on a miss.
  */
 static __always_inline int
 tc_check_flow_verdict_cache(struct global_stats *gs,
                             const struct flow_verdict_key *fv_key,
-                            __u32 pkt_len, __u64 t0) {
+                            __u32 pkt_len, __u64 t0, __u64 *rule_id_out) {
   struct flow_verdict *fv = bpf_map_lookup_elem(&tc_flow_verdict_cache, fv_key);
   if (!fv)
     return -1;
@@ -449,6 +453,7 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
      * off the per-packet fast path. */
     if (fv->rule_id && gs)
       gs->policy_matches++;
+    *rule_id_out = fv->rule_id;
     /* Reuse 'now' already read above — avoids an extra clock call */
     record_proc_time_at(gs, t0, now);
     return TC_ACT_SHOT;
@@ -464,6 +469,7 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
     }
     if (fv->rule_id && gs)
       gs->policy_matches++;
+    *rule_id_out = fv->rule_id;
     record_proc_time_at(gs, t0, now);
     return TC_ACT_OK;
   }
@@ -479,14 +485,20 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
  * fit the 512-byte combined stack limit, and main is the frame every callee
  * stacks onto.  The lookup/branch state also re-converges at the call
  * boundary instead of forking across the LPM walk.
+ *
+ * ifindex and pkt_len are packed into one __u64 (ifindex in the high 32 bits)
+ * because BPF-to-BPF calls pass at most 5 register arguments and rule_id_out
+ * claims the fifth.
  */
 static __noinline int
 tc_flow_verdict_cache_check(struct global_stats *gs,
-                            const struct flow_key *flow, __u32 ifindex,
-                            __u32 pkt_len, __u64 t0) {
+                            const struct flow_key *flow,
+                            __u64 ifindex_pktlen, __u64 t0,
+                            __u64 *rule_id_out) {
   struct flow_verdict_key fv_key = {};
-  tc_flow_verdict_key_from_flow(&fv_key, flow, ifindex);
-  return tc_check_flow_verdict_cache(gs, &fv_key, pkt_len, t0);
+  tc_flow_verdict_key_from_flow(&fv_key, flow, (__u32)(ifindex_pktlen >> 32));
+  return tc_check_flow_verdict_cache(gs, &fv_key, (__u32)ifindex_pktlen, t0,
+                                     rule_id_out);
 }
 
 /*
@@ -652,12 +664,33 @@ int tc_policy_egress(struct __sk_buff *ctx) {
   update_l4_proto_stats(gs, flow_key.protocol, pkt_len);
 
   /* Check flow verdict cache.  Writers are the Suricata EVE consumer and the
-   * QUIC SNI inspector; a hit short-circuits the policy lookup. */
+   * QUIC SNI inspector; a hit short-circuits the policy lookup.
+   *
+   * A hit must still exit through TC_FLOW_CACHE_TAIL_CALL: returning the
+   * verdict directly here would skip per-flow IPFIX accounting for every
+   * post-first packet of a cached flow (timing is already recorded by
+   * tc_check_flow_verdict_cache, and tc_flow_cache_update does not record
+   * it again). */
   {
-    int cached_verdict =
-        tc_flow_verdict_cache_check(gs, &flow_key, ctx->ifindex, pkt_len, t0);
-    if (cached_verdict >= 0)
-      return cached_verdict;
+    __u64 fv_rule_id = 0;
+    int cached_verdict = tc_flow_verdict_cache_check(
+        gs, &flow_key, ((__u64)ctx->ifindex << 32) | pkt_len, t0, &fv_rule_id);
+    if (cached_verdict >= 0) {
+#ifdef SURICATA_IPS
+      /* A cached PASS must keep mirroring flows that are marked for
+       * inspection: a plain-policy PASS verdict never expires, so without
+       * this call Suricata would stop seeing the egress direction after the
+       * flow's first packet, well inside the 5-minute flows_to_inspect
+       * window.  Cached DROPs deliberately do not clone — the flow is dead
+       * (EVE consumer verdict) and Suricata has already alerted on it. */
+      if (cached_verdict == TC_ACT_OK)
+        tc_clone_inspected_flow(ctx, &flow_key);
+#endif /* SURICATA_IPS */
+      TC_FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, fv_rule_id,
+                              cached_verdict == TC_ACT_SHOT ? ACTION_DROP
+                                                            : ACTION_PASS,
+                              cached_verdict);
+    }
   }
 
 #ifdef SURICATA_IPS

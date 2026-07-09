@@ -819,11 +819,15 @@ pass_through:
  * Returns the XDP verdict (XDP_PASS / XDP_DROP) on a live cache hit, having
  * already updated the relevant counters and recorded timing, or -1 when there
  * is no usable cached decision and the caller should continue to policy lookup.
+ *
+ * On a hit, *rule_id_out is set to the verdict's originating rule_id (0 for
+ * default / SNI / IPS verdicts) so the caller can attribute the packet in the
+ * flow cache tail call; untouched on a miss.
  */
 static __always_inline int
 check_flow_verdict_cache(struct global_stats *stats,
                          const struct flow_verdict_key *fv_key, __u32 pkt_len,
-                         __u64 t0) {
+                         __u64 t0, __u64 *rule_id_out) {
   struct flow_verdict *fv = bpf_map_lookup_elem(&flow_verdict_cache, fv_key);
   if (!fv)
     return -1;
@@ -851,6 +855,7 @@ check_flow_verdict_cache(struct global_stats *stats,
      * per-packet fast path. */
     if (fv->rule_id && stats)
       stats->policy_matches++;
+    *rule_id_out = fv->rule_id;
     /* Reuse 'now' already read above — avoids an extra clock call */
     record_proc_time_at(stats, t0, now);
     return XDP_DROP;
@@ -867,6 +872,7 @@ check_flow_verdict_cache(struct global_stats *stats,
     }
     if (fv->rule_id && stats)
       stats->policy_matches++;
+    *rule_id_out = fv->rule_id;
     record_proc_time_at(stats, t0, now);
     return XDP_PASS;
   }
@@ -880,10 +886,10 @@ check_flow_verdict_cache(struct global_stats *stats,
 static __always_inline int
 xdp_flow_verdict_cache_check(struct global_stats *stats,
                              const struct flow_key *flow, __u32 ifindex,
-                             __u32 pkt_len, __u64 t0) {
+                             __u32 pkt_len, __u64 t0, __u64 *rule_id_out) {
   struct flow_verdict_key fv_key = {};
   flow_verdict_key_from_flow(&fv_key, flow, ifindex);
-  return check_flow_verdict_cache(stats, &fv_key, pkt_len, t0);
+  return check_flow_verdict_cache(stats, &fv_key, pkt_len, t0, rule_id_out);
 }
 
 /*
@@ -1084,14 +1090,22 @@ int xdp_policy_main(struct xdp_md *ctx) {
   /* Check flow verdict cache.  Writers are the Suricata EVE consumer (IPS
    * DROP verdicts), the QUIC SNI inspector, and any future flow-verdict
    * source.  A hit short-circuits the policy lookup at XDP line rate. */
+  __u64 fv_rule_id = 0;
   int cached_verdict = xdp_flow_verdict_cache_check(
-      stats, &flow_key, ctx->ingress_ifindex, pkt_len, t0);
+      stats, &flow_key, ctx->ingress_ifindex, pkt_len, t0, &fv_rule_id);
   /* Timing already recorded by check_flow_verdict_cache on a hit (which
    * reuses its expiry-check timestamp, avoiding a second ktime call);
    * recording again here would double-count the packet in the histogram.
-   * TC (tc_policy_egress) returns the same way. */
+   *
+   * A hit must still exit through FLOW_CACHE_TAIL_CALL: returning the verdict
+   * directly here would skip per-flow IPFIX accounting AND the FIB-forwarding
+   * chain for every post-first packet of a flow (xdp_flow_cache_update chains
+   * to xdp_fib_dispatch for PASS verdicts), stranding cached-PASS traffic in
+   * the kernel slow path exactly when the cache is supposed to make it fast. */
   if (cached_verdict >= 0)
-    return cached_verdict;
+    FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, fv_rule_id,
+                         cached_verdict == XDP_DROP ? ACTION_DROP : ACTION_PASS,
+                         cached_verdict);
 
   /* Lookup policy (two-level LPM: src prefix → dst prefix → L4 rules).
    * Scoped per-interface by ctx->ingress_ifindex. */
@@ -1222,6 +1236,37 @@ int xdp_fib_dispatch(struct xdp_md *ctx) {
   return xdp_fib_forward(ctx, gs, eth_proto, l3_off, pkt_len);
 }
 
+#ifdef SURICATA_IPS
+/*
+ * Return 1 if this ingress flow is currently marked for Suricata inspection
+ * (inspection mode enabled, present in flows_to_inspect, and unexpired).
+ *
+ * Used by xdp_flow_cache_update to keep inspected flows off the FIB redirect
+ * path: bpf_redirect bypasses the kernel stack and with it TC ingress, where
+ * tc_policy_ingress clones marked flows to the Suricata mirror interface.
+ * Such flows must take XDP_PASS while their inspection window is open.
+ *
+ * __noinline so the flow_inspect_key lives in this subprogram's frame and the
+ * config branches re-converge at the call boundary (same reasoning as
+ * xdp_mark_flow_for_inspect).  Cold: two map lookups, and the second only
+ * when inspection mode is enabled node-wide.
+ */
+static __noinline int xdp_flow_under_inspection(const struct flow_key *flow) {
+  __u32 cfg_key = 0;
+  const struct inspect_config *cfg =
+      bpf_map_lookup_elem(&inspect_config, &cfg_key);
+  if (!cfg || cfg->mode == INSPECT_MODE_DISABLED)
+    return 0;
+
+  struct flow_inspect_key fi_key = {};
+  flow_inspect_key_from_flow(&fi_key, flow);
+  const __u64 *expiry = bpf_map_lookup_elem(&flows_to_inspect, &fi_key);
+  if (!expiry)
+    return 0;
+  return *expiry == 0 || bpf_ktime_get_ns() < *expiry;
+}
+#endif /* SURICATA_IPS */
+
 /*
  * xdp_flow_cache_update — flow cache accounting program.
  *
@@ -1232,6 +1277,8 @@ int xdp_fib_dispatch(struct xdp_md *ctx) {
  * Updates the per-flow accounting entry in flow_cache (if enabled), then for
  * PASS verdicts chains on to xdp_fib_dispatch via FIB_TAIL_CALL so the full
  * policy_main → flow_cache_update → fib_dispatch chain completes correctly.
+ * Flows under Suricata inspection are exempted from the FIB chain (see
+ * xdp_flow_under_inspection above).
  */
 SEC("xdp")
 int xdp_flow_cache_update(struct xdp_md *ctx) {
@@ -1265,7 +1312,15 @@ int xdp_flow_cache_update(struct xdp_md *ctx) {
   }
 
   /* For PASS verdicts, chain on to FIB forwarding if enabled. */
-  if (verdict == XDP_PASS)
+  if (verdict == XDP_PASS) {
+#ifdef SURICATA_IPS
+    /* An XDP FIB redirect would bypass TC ingress and starve Suricata of the
+     * flow it is supposed to be inspecting — keep marked flows on the kernel
+     * path (slow, but correct) until their inspection window closes. */
+    if (xdp_flow_under_inspection(&meta->flow))
+      return XDP_PASS;
+#endif /* SURICATA_IPS */
     FIB_TAIL_CALL(ctx);
+  }
   return verdict;
 }
