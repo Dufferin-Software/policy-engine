@@ -233,26 +233,30 @@ struct {
 } pkt_scratch SEC(".maps");
 
 /*
- * Per-interface default action when no rule matches (configurable from userspace).
- * Keyed by ingress ifindex → u32 action (ACTION_PASS / ACTION_DROP).
- * Absent entry → ACTION_PASS.
+ * Per-interface default action when no rule matches (configurable from
+ * userspace).  ARRAY (JIT-inlined lookup) indexed by ingress ifindex %
+ * MAX_INTERFACES; the entry's ifindex field guards against slot aliasing —
+ * see default_action_lookup in policy_common.h.  Unowned slot → ACTION_PASS.
  */
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, MAX_INTERFACES);
   __type(key, __u32);
-  __type(value, __u32);
+  __type(value, struct default_action_entry);
 } default_action SEC(".maps");
 
 /*
  * Per-interface FIB forwarding configuration (written by userspace).
- * Keyed by ingress ifindex: when mode == FIB_FORWARD_ENABLED for the packet's
+ * ARRAY (JIT-inlined lookup — this is consulted on every PASS packet via
+ * FIB_TAIL_CALL) indexed by ingress ifindex % MAX_INTERFACES; the entry's
+ * ifindex field guards against slot aliasing — see fib_config_lookup in
+ * policy_common.h.  When mode == FIB_FORWARD_ENABLED for the packet's
  * ingress interface, the XDP program attempts bpf_fib_lookup() and redirects
  * directly to the next-hop interface, bypassing the kernel routing stack.
- * Absent entry or mode == FIB_FORWARD_DISABLED → normal XDP_PASS.
+ * Unowned slot or mode == FIB_FORWARD_DISABLED → normal XDP_PASS.
  */
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, MAX_INTERFACES);
   __type(key, __u32);
   __type(value, struct fib_config);
@@ -393,20 +397,38 @@ flow_verdict_key_from_flow(struct flow_verdict_key *fv_key,
  */
 #define FIB_TAIL_CALL(ctx)                                            \
   do {                                                                \
-    __u32 __fib_key = (ctx)->ingress_ifindex;                         \
     const struct fib_config *__fc =                                   \
-        bpf_map_lookup_elem(&fib_config_map, &__fib_key);             \
+        fib_config_lookup(&fib_config_map, (ctx)->ingress_ifindex);   \
     if (__fc && __fc->mode == FIB_FORWARD_ENABLED)                    \
       bpf_tail_call((ctx), &xdp_dispatcher, XDP_DISPATCHER_FIB_SLOT); \
   } while (0)
 
+#ifdef SURICATA_IPS
+/* Defined below (needs flows_to_inspect / inspect_config); forward-declared
+ * so FLOW_CACHE_TAIL_CALL can apply the inspection exemption on the
+ * flow-cache-disabled fast path. */
+static __noinline int xdp_flow_under_inspection(const struct flow_key *flow);
+#define XDP_FLOW_UNDER_INSPECTION(_fk) xdp_flow_under_inspection(_fk)
+#else
+#define XDP_FLOW_UNDER_INSPECTION(_fk) 0
+#endif /* SURICATA_IPS */
+
 /*
  * FLOW_CACHE_TAIL_CALL — tail-call xdp_flow_cache_update with flow metadata.
  *
- * Stores the flow key, length, rule id, action, and final verdict into the
- * per-CPU pkt_scratch slot, then tail-calls XDP_DISPATCHER_FLOW_CACHE_SLOT.
+ * Gated on flow_cache_config (per-flow IPFIX accounting enabled): only then
+ * does it store the flow key, length, rule id, action, and final verdict into
+ * the per-CPU pkt_scratch slot and tail-call XDP_DISPATCHER_FLOW_CACHE_SLOT.
  * xdp_flow_cache_update will update the flow cache map and (for PASS verdicts)
  * chain on to xdp_fib_dispatch (FIB_TAIL_CALL inside that program).
+ *
+ * When flow accounting is disabled (the common case outside IPFIX deploys),
+ * the 40-byte flow memcpy, scalar writes, and tail-call dispatch are skipped
+ * for the cost of one JIT-inlined ARRAY lookup, and PASS verdicts go straight
+ * to the FIB chain here — mirroring xdp_flow_cache_update's PASS handling,
+ * including the SURICATA_IPS exemption that keeps flows under inspection on
+ * the kernel path (XDP FIB redirect would bypass TC ingress, the Suricata
+ * clone point).
  *
  * Fail-open: if the tail call slot is not loaded (e.g. feature disabled at
  * compile time) the bpf_tail_call is a no-op and execution continues with
@@ -419,19 +441,26 @@ flow_verdict_key_from_flow(struct flow_verdict_key *fv_key,
  * _act:     __u32 — ACTION_PASS / ACTION_DROP / ACTION_INSPECT
  * _verdict: __u32 — XDP_PASS / XDP_DROP / XDP_REDIRECT
  */
-#define FLOW_CACHE_TAIL_CALL(_ctx, _fk, _len, _rid, _act, _verdict)           \
-  do {                                                                        \
-    __u32 _fc_key = 0;                                                        \
-    struct pkt_meta *_fcm = bpf_map_lookup_elem(&pkt_scratch, &_fc_key);      \
-    if (_fcm) {                                                               \
-      __builtin_memcpy(&_fcm->flow, (_fk), sizeof(struct flow_key));          \
-      _fcm->pkt_len = (_len);                                                 \
-      _fcm->fc_rule_id = (_rid);                                              \
-      _fcm->fc_action = (_act);                                               \
-      _fcm->fc_verdict = (_verdict);                                          \
-      bpf_tail_call((_ctx), &xdp_dispatcher, XDP_DISPATCHER_FLOW_CACHE_SLOT); \
-    }                                                                         \
-    return (_verdict);                                                        \
+#define FLOW_CACHE_TAIL_CALL(_ctx, _fk, _len, _rid, _act, _verdict)         \
+  do {                                                                      \
+    __u32 _fc_key = 0;                                                      \
+    const struct flow_cache_config *_fcc =                                  \
+        bpf_map_lookup_elem(&flow_cache_config_map, &_fc_key);              \
+    if (_fcc && _fcc->enabled == FLOW_CACHE_ENABLED) {                      \
+      struct pkt_meta *_fcm = bpf_map_lookup_elem(&pkt_scratch, &_fc_key);  \
+      if (_fcm) {                                                           \
+        __builtin_memcpy(&_fcm->flow, (_fk), sizeof(struct flow_key));      \
+        _fcm->pkt_len = (_len);                                             \
+        _fcm->fc_rule_id = (_rid);                                          \
+        _fcm->fc_action = (_act);                                           \
+        _fcm->fc_verdict = (_verdict);                                      \
+        bpf_tail_call((_ctx), &xdp_dispatcher,                              \
+                      XDP_DISPATCHER_FLOW_CACHE_SLOT);                      \
+      }                                                                     \
+    } else if ((_verdict) == XDP_PASS && !XDP_FLOW_UNDER_INSPECTION(_fk)) { \
+      FIB_TAIL_CALL(_ctx);                                                  \
+    }                                                                       \
+    return (_verdict);                                                      \
   } while (0)
 
 /*
@@ -1178,9 +1207,7 @@ int xdp_policy_main(struct xdp_md *ctx) {
 
   } else {
     /* No matching rule - use per-interface default action */
-    __u32 ifidx = ctx->ingress_ifindex;
-    __u32 *def_action = bpf_map_lookup_elem(&default_action, &ifidx);
-    __u32 action = def_action ? *def_action : ACTION_PASS;
+    __u32 action = default_action_lookup(&default_action, ctx->ingress_ifindex);
     update_action_stats(stats, action);
 
     /* Seed the default verdict (rule_id 0) so unmatched flows also skip the LPM

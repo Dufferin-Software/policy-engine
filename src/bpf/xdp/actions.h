@@ -45,7 +45,7 @@ static __noinline int xdp_mark_flow_for_inspect(struct global_stats *gs,
   if (!cfg || cfg->mode == INSPECT_MODE_DISABLED)
     return 0;
 
-  const struct fib_config *fc = bpf_map_lookup_elem(&fib_config_map, &ifindex);
+  const struct fib_config *fc = fib_config_lookup(&fib_config_map, ifindex);
   if (!fc || fc->inspect_enabled != INSPECT_IF_ENABLED)
     return 0;
 

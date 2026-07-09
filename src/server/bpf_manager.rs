@@ -2495,22 +2495,61 @@ impl BpfManager {
         direction: Direction,
         ifindex: u32,
     ) -> Result<()> {
-        let key = ifindex.to_ne_bytes();
-        let value = (action as u32).to_ne_bytes();
+        // ARRAY map: slot = ifindex % MAX_INTERFACES; the entry records its
+        // owner ifindex so the BPF side ignores aliased slots (fail-safe).
+        let key = (ifindex % MAX_INTERFACES).to_ne_bytes();
+        let entry = crate::types::DefaultActionEntry {
+            action: action as u32,
+            ifindex,
+        };
+
+        // Warn when this write silently disables an aliased sibling's default
+        // action (mirrors the slot-collision guard in set_fib_config).
+        let warn_on_collision = |bytes: Option<Vec<u8>>| {
+            if let Some(b) = bytes {
+                let mut cur = crate::types::DefaultActionEntry::default();
+                if plain::copy_from_bytes(&mut cur, &b).is_ok()
+                    && cur.ifindex != 0
+                    && cur.ifindex != ifindex
+                {
+                    warn!(
+                        "default_action slot collision: ifindex {} overwrites default action \
+                         owned by ifindex {} (both map to slot {}); the loser falls back to PASS",
+                        ifindex,
+                        cur.ifindex,
+                        ifindex % MAX_INTERFACES
+                    );
+                }
+            }
+        };
 
         match direction {
             Direction::Ingress => {
                 if let Some(skel) = &mut self.xdp_skel {
+                    warn_on_collision(
+                        skel.maps
+                            .default_action
+                            .lookup(&key, MapFlags::ANY)
+                            .ok()
+                            .flatten(),
+                    );
                     skel.maps
                         .default_action
-                        .update(&key, &value, MapFlags::ANY)?;
+                        .update(&key, entry.as_bytes(), MapFlags::ANY)?;
                 }
             }
             Direction::Egress => {
                 if let Some(skel) = &mut self.tc_skel {
+                    warn_on_collision(
+                        skel.maps
+                            .tc_default_action
+                            .lookup(&key, MapFlags::ANY)
+                            .ok()
+                            .flatten(),
+                    );
                     skel.maps
                         .tc_default_action
-                        .update(&key, &value, MapFlags::ANY)?;
+                        .update(&key, entry.as_bytes(), MapFlags::ANY)?;
                 }
             }
         }
@@ -2527,7 +2566,7 @@ impl BpfManager {
         direction: Direction,
         ifindex: u32,
     ) -> Result<Option<PolicyAction>> {
-        let key = ifindex.to_ne_bytes();
+        let key = (ifindex % MAX_INTERFACES).to_ne_bytes();
         let bytes = match direction {
             Direction::Ingress => self.xdp_skel.as_ref().and_then(|s| {
                 s.maps
@@ -2546,9 +2585,16 @@ impl BpfManager {
         };
         match bytes {
             None => Ok(None),
-            Some(b) if b.len() >= 4 => {
-                let val = u32::from_ne_bytes(b[..4].try_into().unwrap());
-                Ok(Some(PolicyAction::from(val)))
+            Some(b) if b.len() >= 8 => {
+                let mut entry = crate::types::DefaultActionEntry::default();
+                plain::copy_from_bytes(&mut entry, &b)
+                    .map_err(|e| anyhow!("Failed to parse default action entry: {:?}", e))?;
+                // A slot owned by a different (aliased) or no interface means
+                // no default action is configured for this ifindex.
+                if entry.ifindex != ifindex {
+                    return Ok(None);
+                }
+                Ok(Some(PolicyAction::from(entry.action)))
             }
             _ => Ok(None),
         }
@@ -2926,21 +2972,58 @@ impl BpfManager {
     /// BPF lookup miss fast-path can be used.
     pub fn set_fib_config(&mut self, interface: &str, config: &FibConfig) -> Result<()> {
         let ifindex = Self::get_ifindex(interface)? as u32;
-        let key = ifindex.to_ne_bytes();
+        // ARRAY map: slot = ifindex % MAX_INTERFACES; the entry records its
+        // owner ifindex so the BPF side ignores aliased slots (fail-safe).
+        let key = (ifindex % MAX_INTERFACES).to_ne_bytes();
         if let Some(skel) = &mut self.xdp_skel {
+            // Detect slot aliasing: a live entry owned by a different ifindex.
+            let current_owner = skel
+                .maps
+                .fib_config_map
+                .lookup(&key, MapFlags::ANY)
+                .ok()
+                .flatten()
+                .and_then(|b| {
+                    let mut cur = FibConfig::default();
+                    plain::copy_from_bytes(&mut cur, &b).ok()?;
+                    (cur.ifindex != 0).then_some(cur.ifindex)
+                });
+
             // The entry is shared between FIB forwarding, uRPF, and the
-            // per-interface inspect flag.  Only delete it when ALL features
+            // per-interface inspect flag.  Only clear it when ALL features
             // are disabled; otherwise persist the struct so disabling one
-            // feature does not wipe the others' config.
+            // feature does not wipe the others' config.  (ARRAY entries
+            // cannot be deleted — an all-zero entry is the "absent" state.)
             if config.mode == crate::types::FIB_FORWARD_DISABLED
                 && config.urpf_mode == crate::types::URPF_DISABLED
                 && config.inspect_enabled == crate::types::INSPECT_IF_DISABLED
             {
-                let _ = skel.maps.fib_config_map.delete(&key);
+                // Don't wipe a slot that belongs to an aliased sibling.
+                if current_owner.is_none() || current_owner == Some(ifindex) {
+                    let zero = FibConfig::default();
+                    let _ = skel
+                        .maps
+                        .fib_config_map
+                        .update(&key, zero.as_bytes(), MapFlags::ANY);
+                }
             } else {
+                if let Some(owner) = current_owner {
+                    if owner != ifindex {
+                        warn!(
+                            "fib_config slot collision: ifindex {} overwrites config owned by \
+                             ifindex {} (both map to slot {}); the loser's FIB/uRPF/inspect \
+                             config is disabled",
+                            ifindex,
+                            owner,
+                            ifindex % MAX_INTERFACES
+                        );
+                    }
+                }
+                let mut entry = *config;
+                entry.ifindex = ifindex;
                 skel.maps
                     .fib_config_map
-                    .update(&key, config.as_bytes(), MapFlags::ANY)
+                    .update(&key, entry.as_bytes(), MapFlags::ANY)
                     .context("Failed to set FIB forwarding config")?;
             }
         }
@@ -2957,37 +3040,39 @@ impl BpfManager {
     /// Get current FIB forwarding configuration for an ingress interface.
     pub fn get_fib_config(&self, interface: &str) -> Result<FibConfig> {
         let ifindex = Self::get_ifindex(interface)? as u32;
-        let key = ifindex.to_ne_bytes();
+        let key = (ifindex % MAX_INTERFACES).to_ne_bytes();
         if let Some(skel) = &self.xdp_skel {
             if let Some(value_bytes) = skel.maps.fib_config_map.lookup(&key, MapFlags::ANY)? {
                 let mut config = FibConfig::default();
                 plain::copy_from_bytes(&mut config, &value_bytes)
                     .map_err(|e| anyhow!("Failed to parse FIB config: {:?}", e))?;
-                return Ok(config);
+                // A slot owned by a different (aliased) or no interface means
+                // no config for this ifindex — mirror the BPF-side fail-safe.
+                if config.ifindex == ifindex {
+                    return Ok(config);
+                }
             }
         }
         Ok(FibConfig::default())
     }
 
     /// List all FIB config entries currently in the map, resolved to interface names.
-    /// Entries whose ifindex can no longer be resolved to a name are skipped.
+    /// ARRAY slots always exist; live entries are identified by a non-zero owner
+    /// ifindex.  Entries whose ifindex can no longer be resolved to a name are
+    /// skipped.
     pub fn list_fib_configs(&self) -> Result<Vec<(String, FibConfig)>> {
         let mut out = Vec::new();
         if let Some(skel) = &self.xdp_skel {
-            for key_bytes in skel.maps.fib_config_map.keys() {
-                if key_bytes.len() != 4 {
-                    continue;
-                }
-                let mut ifindex_arr = [0u8; 4];
-                ifindex_arr.copy_from_slice(&key_bytes);
-                let ifindex = u32::from_ne_bytes(ifindex_arr);
-                if let Some(value_bytes) =
-                    skel.maps.fib_config_map.lookup(&key_bytes, MapFlags::ANY)?
-                {
+            for slot in 0..MAX_INTERFACES {
+                let key = slot.to_ne_bytes();
+                if let Some(value_bytes) = skel.maps.fib_config_map.lookup(&key, MapFlags::ANY)? {
                     let mut config = FibConfig::default();
                     plain::copy_from_bytes(&mut config, &value_bytes)
                         .map_err(|e| anyhow!("Failed to parse FIB config: {:?}", e))?;
-                    if let Some(name) = Self::ifindex_to_name(ifindex as i32) {
+                    if config.ifindex == 0 {
+                        continue; // zero-initialised slot — no config
+                    }
+                    if let Some(name) = Self::ifindex_to_name(config.ifindex as i32) {
                         out.push((name, config));
                     }
                 }

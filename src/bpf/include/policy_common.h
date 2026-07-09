@@ -418,8 +418,52 @@ struct fib_config {
   __u32 mode;            /* FIB_FORWARD_DISABLED or FIB_FORWARD_ENABLED */
   __u32 urpf_mode;       /* URPF_DISABLED / URPF_LOOSE / URPF_STRICT */
   __u32 inspect_enabled; /* INSPECT_IF_DISABLED / INSPECT_IF_ENABLED */
-  __u32 _pad;            /* reserved */
+  __u32 ifindex;         /* raw ifindex that owns this ARRAY slot; see
+                            fib_config_lookup */
 } __attribute__((packed));
+
+/*
+ * Per-interface config lookup for the ARRAY-based fib_config_map.
+ *
+ * fib_config_map is an ARRAY (JIT-inlined lookup, no jhash + bucket walk on
+ * the per-packet FIB path) indexed by `ifindex % MAX_INTERFACES`.  The
+ * entry's ifindex field records the raw interface index that last wrote the
+ * slot: if two live ifindexes alias the same slot, the loser reads a
+ * mismatched ifindex and gets NULL, so the config fails safe (treated as
+ * absent / feature disabled) instead of applying another interface's
+ * settings.  Zero-initialised slots (ifindex 0 is never a real interface)
+ * also return NULL, preserving the old absent-HASH-entry semantics.
+ *
+ * map is the caller's fib_config_map handle (XDP-owned; the TC skeleton
+ * shares it via pin reuse).
+ */
+static __always_inline const struct fib_config *
+fib_config_lookup(void *map, __u32 ifindex) {
+  __u32 slot = ifindex % MAX_INTERFACES;
+  const struct fib_config *cfg = bpf_map_lookup_elem(map, &slot);
+  if (!cfg || cfg->ifindex != ifindex)
+    return NULL;
+  return cfg;
+}
+
+/*
+ * Per-interface default action entry (default_action / tc_default_action
+ * ARRAY maps).  Same slot-aliasing scheme as fib_config: slot = ifindex %
+ * MAX_INTERFACES, ifindex records the owner, mismatch or zero-initialised
+ * slot falls back to ACTION_PASS via default_action_lookup.
+ */
+struct default_action_entry {
+  __u32 action;  /* ACTION_PASS / ACTION_DROP */
+  __u32 ifindex; /* raw ifindex that owns this ARRAY slot */
+} __attribute__((packed));
+
+static __always_inline __u32 default_action_lookup(void *map, __u32 ifindex) {
+  __u32 slot = ifindex % MAX_INTERFACES;
+  const struct default_action_entry *da = bpf_map_lookup_elem(map, &slot);
+  if (!da || da->ifindex != ifindex)
+    return ACTION_PASS;
+  return da->action;
+}
 
 /*
  * Flow cache for IPFIX export (independent of Suricata IPS).

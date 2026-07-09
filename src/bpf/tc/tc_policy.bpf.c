@@ -94,10 +94,13 @@ struct {
  * Per-interface XDP feature config (FIB forwarding / uRPF / inspect enable).
  * Owned and pinned by the XDP skeleton; this skeleton reuses the pin (same
  * mechanism as flows_to_inspect below) so the TC egress ACTION_INSPECT arms
- * can honour the per-interface inspect_enabled flag.  Keyed by ifindex.
+ * can honour the per-interface inspect_enabled flag.  ARRAY indexed by
+ * ifindex % MAX_INTERFACES with an embedded owner ifindex — declaration must
+ * stay identical to the XDP one for pin reuse; see fib_config_lookup in
+ * policy_common.h.
  */
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, MAX_INTERFACES);
   __type(key, __u32);
   __type(value, struct fib_config);
@@ -195,18 +198,16 @@ static __noinline __u8 check_mac_rule_tc(const __u8 *pkt_src,
 }
 
 /*
- * Default action when no rule matches (configurable from userspace)
- */
-/*
- * Per-interface default action when no rule matches (configurable from userspace).
- * Keyed by egress ifindex → u32 action (ACTION_PASS / ACTION_DROP).
- * Absent entry → ACTION_PASS.
+ * Per-interface default action when no rule matches (configurable from
+ * userspace).  ARRAY (JIT-inlined lookup) indexed by egress ifindex %
+ * MAX_INTERFACES with an embedded owner ifindex — see default_action_lookup
+ * in policy_common.h.  Unowned slot → ACTION_PASS.
  */
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(type, BPF_MAP_TYPE_ARRAY);
   __uint(max_entries, MAX_INTERFACES);
   __type(key, __u32);
-  __type(value, __u32);
+  __type(value, struct default_action_entry);
 } tc_default_action SEC(".maps");
 
 /*
@@ -295,25 +296,31 @@ struct {
  * TC_FLOW_CACHE_TAIL_CALL — tail-call tc_flow_cache_update with flow metadata.
  *
  * Mirrors FLOW_CACHE_TAIL_CALL in xdp_policy.bpf.c; uses tc_pkt_scratch and
- * tc_dispatcher. TC does not chain to FIB forwarding (TC-only program).
+ * tc_dispatcher. TC does not chain to FIB forwarding (TC-only program), so
+ * when flow accounting is disabled the whole tail call is skipped for the
+ * cost of one JIT-inlined ARRAY lookup and the verdict is returned directly.
  *
  * Fail-open: if the tail call slot is not loaded the bpf_tail_call is a no-op
  * and execution continues with the plain `return (_verdict)` below.
  */
-#define TC_FLOW_CACHE_TAIL_CALL(_ctx, _fk, _len, _rid, _act, _verdict)      \
-  do {                                                                      \
-    __u32 _fc_key = 0;                                                      \
-    struct tc_pkt_meta *_fcm =                                              \
-        bpf_map_lookup_elem(&tc_pkt_scratch, &_fc_key);                     \
-    if (_fcm) {                                                             \
-      __builtin_memcpy(&_fcm->flow, (_fk), sizeof(struct flow_key));        \
-      _fcm->pkt_len = (_len);                                               \
-      _fcm->fc_rule_id = (_rid);                                            \
-      _fcm->fc_action = (_act);                                             \
-      _fcm->fc_verdict = (_verdict);                                        \
-      bpf_tail_call((_ctx), &tc_dispatcher, TC_DISPATCHER_FLOW_CACHE_SLOT); \
-    }                                                                       \
-    return (_verdict);                                                      \
+#define TC_FLOW_CACHE_TAIL_CALL(_ctx, _fk, _len, _rid, _act, _verdict)        \
+  do {                                                                        \
+    __u32 _fc_key = 0;                                                        \
+    const struct flow_cache_config *_fcc =                                    \
+        bpf_map_lookup_elem(&tc_flow_cache_config_map, &_fc_key);             \
+    if (_fcc && _fcc->enabled == FLOW_CACHE_ENABLED) {                        \
+      struct tc_pkt_meta *_fcm =                                              \
+          bpf_map_lookup_elem(&tc_pkt_scratch, &_fc_key);                     \
+      if (_fcm) {                                                             \
+        __builtin_memcpy(&_fcm->flow, (_fk), sizeof(struct flow_key));        \
+        _fcm->pkt_len = (_len);                                               \
+        _fcm->fc_rule_id = (_rid);                                            \
+        _fcm->fc_action = (_act);                                             \
+        _fcm->fc_verdict = (_verdict);                                        \
+        bpf_tail_call((_ctx), &tc_dispatcher, TC_DISPATCHER_FLOW_CACHE_SLOT); \
+      }                                                                       \
+    }                                                                         \
+    return (_verdict);                                                        \
   } while (0)
 
 // clang-format off
@@ -763,9 +770,7 @@ int tc_policy_egress(struct __sk_buff *ctx) {
 
   } else {
     /* No matching rule - use per-interface default action */
-    __u32 ifidx = ctx->ifindex;
-    __u32 *def_action = bpf_map_lookup_elem(&tc_default_action, &ifidx);
-    __u32 action = def_action ? *def_action : ACTION_PASS;
+    __u32 action = default_action_lookup(&tc_default_action, ctx->ifindex);
     update_action_stats(gs, action);
 
     /* Seed the default verdict (rule_id 0) so unmatched flows skip the LPM walk
@@ -926,9 +931,8 @@ int tc_sni_inspect(struct __sk_buff *ctx) {
           break;
         /* Per-interface gate — mirrors the ACTION_INSPECT arm in
          * tc/actions.h: only mark flows on inspect-enabled interfaces. */
-        __u32 if_key = ctx->ifindex;
         const struct fib_config *fc =
-            bpf_map_lookup_elem(&fib_config_map, &if_key);
+            fib_config_lookup(&fib_config_map, ctx->ifindex);
         if (!fc || fc->inspect_enabled != INSPECT_IF_ENABLED)
           break;
         struct flow_inspect_key fi_key = {};

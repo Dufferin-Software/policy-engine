@@ -213,7 +213,11 @@ pub struct FibConfig {
     pub mode: u32,
     pub urpf_mode: u32,
     pub inspect_enabled: u32,
-    pub _pad: u32,
+    /// Raw ifindex that owns this ARRAY slot (slot = ifindex %
+    /// MAX_INTERFACES).  Stamped by set_fib_config; the BPF side
+    /// (fib_config_lookup) treats a mismatch as "no config" so slot
+    /// aliasing fails safe.
+    pub ifindex: u32,
 }
 
 impl FibConfig {
@@ -225,6 +229,27 @@ impl FibConfig {
 }
 
 unsafe impl plain::Plain for FibConfig {}
+
+/// Per-interface default action entry (must match struct default_action_entry
+/// in policy_common.h).  Same ARRAY slot-aliasing scheme as FibConfig:
+/// slot = ifindex % MAX_INTERFACES, `ifindex` records the owner, and the BPF
+/// side falls back to ACTION_PASS on a mismatched or zero-initialised slot.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DefaultActionEntry {
+    pub action: u32,
+    pub ifindex: u32,
+}
+
+impl DefaultActionEntry {
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(self as *const _ as *const u8, std::mem::size_of::<Self>())
+        }
+    }
+}
+
+unsafe impl plain::Plain for DefaultActionEntry {}
 
 /// Flow cache mode constants (must match BPF policy_common.h)
 #[cfg(feature = "ipfix")]
@@ -2337,6 +2362,16 @@ mod tests {
                 std::mem::size_of::<GlobalStats>(),
                 23 * 8 + L3_BUCKETS * 16 + QUIC_SLOTS * 16 + HIST_BUCKETS * 8 + IP_PROTO_SLOTS * 16
             );
+        }
+
+        /// Guards the layout contract with struct fib_config /
+        /// struct default_action_entry in policy_common.h (ARRAY map values;
+        /// the last u32 of each is the owner ifindex used for the
+        /// slot-aliasing guard).
+        #[test]
+        fn per_interface_config_entries_match_bpf_struct_size() {
+            assert_eq!(std::mem::size_of::<FibConfig>(), 4 * 4);
+            assert_eq!(std::mem::size_of::<DefaultActionEntry>(), 2 * 4);
         }
 
         /// Guards the slot→protocol table against the IP_PROTO_SLOT_* defines

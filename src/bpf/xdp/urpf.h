@@ -95,8 +95,8 @@ static __always_inline int xdp_urpf_check(struct xdp_md *ctx,
                                           __u16 eth_proto,
                                           int l3_off,
                                           __u32 pkt_len) {
-  __u32 key = ctx->ingress_ifindex;
-  const struct fib_config *cfg = bpf_map_lookup_elem(&fib_config_map, &key);
+  const struct fib_config *cfg =
+      fib_config_lookup(&fib_config_map, ctx->ingress_ifindex);
   if (!cfg)
     return 0;
   __u32 mode = cfg->urpf_mode;
