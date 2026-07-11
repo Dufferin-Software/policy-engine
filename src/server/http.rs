@@ -299,10 +299,21 @@ async fn start_inspect_tasks(state: &Arc<AppState>) -> std::io::Result<()> {
 
 /// Background loop: periodically evict expired flow verdicts from the BPF maps.
 ///
-/// Not gated behind `suricata`: SNI/QUIC matching writes verdicts into the same
-/// cache in every build, so the cache needs an evictor regardless of IPS. Plain
-/// HASH maps don't auto-expire — without this loop, expired entries accumulate
-/// until the map fills (`MAX_FLOW_VERDICTS`).
+/// Not gated behind `suricata`: SNI/QUIC matching writes TTL'd verdicts into the
+/// same cache in every build, so the cache needs a sweeper regardless of IPS.
+///
+/// This is a space reclaim, not a correctness guard.  The datapath already
+/// treats a past-`expires_ns` entry as a miss (`check_flow_verdict_cache`), so
+/// a stale verdict is never honoured; and the caches are `LRU_HASH`, so the map
+/// cannot fill.  What the sweep buys is LRU slots: an expired entry for a flow
+/// that never returns is never re-touched and never overwritten, so it squats on
+/// a slot until capacity pressure happens to evict it.  Reclaiming it early
+/// keeps the cache's effective capacity closer to `MAX_FLOW_VERDICTS`, and keeps
+/// stale entries out of the userspace verdict listing.
+///
+/// Only TTL'd verdicts are swept.  Plain policy verdicts carry
+/// `expires_ns == 0` (never expire) and are left to LRU eviction and to the
+/// flush on rule change (`PolicyService::invalidate_flow_verdicts`).
 fn spawn_flow_verdict_cleanup_loop(state: Arc<AppState>) {
     let manager = FlowVerdictManager::new();
     tokio::spawn(async move {
