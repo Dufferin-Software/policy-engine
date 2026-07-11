@@ -69,15 +69,23 @@ struct {
  *
  * LRU_HASH (not plain HASH): the plain L4 fast path seeds a verdict for every
  * flow with a 12 h TTL, so the table must self-evict under flow-count pressure
- * rather than fill and reject inserts.  See flow_verdict_cache in
- * src/bpf/xdp/xdp_policy.bpf.c for the full rationale.
+ * rather than fill and reject inserts.  See flow_verdict_cache_v4 in
+ * src/bpf/xdp/xdp_policy.bpf.c for the full rationale, and for why the cache is
+ * split per address family.
  */
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
-  __uint(max_entries, MAX_FLOW_VERDICTS);
-  __type(key, struct flow_verdict_key);
+  __uint(max_entries, MAX_FLOW_VERDICTS_V4);
+  __type(key, struct flow_verdict_key_v4);
   __type(value, struct flow_verdict);
-} tc_flow_verdict_cache SEC(".maps");
+} tc_flow_verdict_cache_v4 SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, MAX_FLOW_VERDICTS_V6);
+  __type(key, struct flow_verdict_key_v6);
+  __type(value, struct flow_verdict);
+} tc_flow_verdict_cache_v6 SEC(".maps");
 
 #ifdef SURICATA_IPS
 /*
@@ -370,30 +378,42 @@ static __noinline void tc_clone_inspected_flow(struct __sk_buff *ctx,
 #endif /* SURICATA_IPS */
 
 /*
- * Build a tc_flow_verdict_cache key from a parsed flow_key.  Shared by the
- * verdict-cache lookup in tc_policy_egress and the verdict writer below so the
- * two stay in sync on field layout (address family, addresses, ports, proto).
+ * Egress verdict cache accessors.  Mirror of xdp_verdict_lookup /
+ * xdp_verdict_update: the cache is split per address family, and this pair is
+ * the only place in the TC program that knows it.
  */
-static __always_inline void
-tc_flow_verdict_key_from_flow(struct flow_verdict_key *fv_key,
-                              const struct flow_key *flow, __u32 ifindex) {
+static __always_inline struct flow_verdict *
+tc_verdict_lookup(const struct flow_key *flow, __u32 ifindex) {
   if (flow->af == AF_INET) {
-    fv_key->saddr4 = flow->saddr4;
-    fv_key->daddr4 = flow->daddr4;
-  } else {
-    __builtin_memcpy(fv_key->saddr6, flow->saddr6, 16);
-    __builtin_memcpy(fv_key->daddr6, flow->daddr6, 16);
+    struct flow_verdict_key_v4 k = {};
+    flow_verdict_key_v4_from_flow(&k, flow, ifindex);
+    return bpf_map_lookup_elem(&tc_flow_verdict_cache_v4, &k);
+  } else if (flow->af == AF_INET6) {
+    struct flow_verdict_key_v6 k = {};
+    flow_verdict_key_v6_from_flow(&k, flow, ifindex);
+    return bpf_map_lookup_elem(&tc_flow_verdict_cache_v6, &k);
   }
-  fv_key->sport = flow->sport;
-  fv_key->dport = flow->dport;
-  fv_key->protocol = flow->protocol;
-  fv_key->af = flow->af;
-  fv_key->ifindex = ifindex;
+  return NULL;
+}
+
+static __always_inline void tc_verdict_update(const struct flow_key *flow,
+                                              __u32 ifindex,
+                                              const struct flow_verdict *v,
+                                              __u64 flags) {
+  if (flow->af == AF_INET) {
+    struct flow_verdict_key_v4 k = {};
+    flow_verdict_key_v4_from_flow(&k, flow, ifindex);
+    bpf_map_update_elem(&tc_flow_verdict_cache_v4, &k, v, flags);
+  } else if (flow->af == AF_INET6) {
+    struct flow_verdict_key_v6 k = {};
+    flow_verdict_key_v6_from_flow(&k, flow, ifindex);
+    bpf_map_update_elem(&tc_flow_verdict_cache_v6, &k, v, flags);
+  }
 }
 
 /*
- * Seed tc_flow_verdict_cache from the plain policy fast path (the two-level LPM
- * result — L3 prefix + L4 port/proto — or the default action; no SNI / IPS).
+ * Seed the egress verdict cache from the plain policy fast path (the two-level
+ * LPM result — L3 prefix + L4 port/proto — or the default action; no SNI / IPS).
  * Mirrors xdp_policy_write_verdict for egress: the first packet of a flow walks
  * the trie; the resulting PASS/DROP is cached so subsequent packets
  * short-circuit at the verdict-cache check in tc_policy_egress.  These verdicts
@@ -407,15 +427,12 @@ tc_flow_verdict_key_from_flow(struct flow_verdict_key *fv_key,
 static __noinline void
 tc_policy_write_verdict(const struct flow_key *flow, __u32 action,
                         __u64 rule_id, __u64 now_ns, __u32 ifindex) {
-  struct flow_verdict_key fv_key = {};
-  tc_flow_verdict_key_from_flow(&fv_key, flow, ifindex);
-
   struct flow_verdict v = {};
   v.action = action;
   v.rule_id = rule_id;
   v.timestamp_ns = now_ns;
   v.expires_ns = POLICY_VERDICT_EXPIRES_NS;
-  bpf_map_update_elem(&tc_flow_verdict_cache, &fv_key, &v, BPF_ANY);
+  tc_verdict_update(flow, ifindex, &v, BPF_ANY);
 }
 
 /*
@@ -431,9 +448,9 @@ tc_policy_write_verdict(const struct flow_key *flow, __u32 action,
  */
 static __always_inline int
 tc_check_flow_verdict_cache(struct global_stats *gs,
-                            const struct flow_verdict_key *fv_key,
+                            const struct flow_key *flow, __u32 ifindex,
                             __u32 pkt_len, __u64 t0, __u64 *rule_id_out) {
-  struct flow_verdict *fv = bpf_map_lookup_elem(&tc_flow_verdict_cache, fv_key);
+  struct flow_verdict *fv = tc_verdict_lookup(flow, ifindex);
   if (!fv)
     return -1;
 
@@ -485,13 +502,13 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
 }
 
 /*
- * Build the flow_verdict_key and check the verdict cache (egress).
+ * Check the verdict cache (egress).
  *
- * Marked __noinline so the 64-byte key lives in this subprogram's frame
- * instead of tc_policy_egress's: main's frame plus its deepest callee must
- * fit the 512-byte combined stack limit, and main is the frame every callee
- * stacks onto.  The lookup/branch state also re-converges at the call
- * boundary instead of forking across the LPM walk.
+ * Marked __noinline so the key lives in this subprogram's frame instead of
+ * tc_policy_egress's: main's frame plus its deepest callee must fit the
+ * 512-byte combined stack limit, and main is the frame every callee stacks
+ * onto.  The lookup/branch state also re-converges at the call boundary
+ * instead of forking across the LPM walk.
  *
  * ifindex and pkt_len are packed into one __u64 (ifindex in the high 32 bits)
  * because BPF-to-BPF calls pass at most 5 register arguments and rule_id_out
@@ -502,10 +519,8 @@ tc_flow_verdict_cache_check(struct global_stats *gs,
                             const struct flow_key *flow,
                             __u64 ifindex_pktlen, __u64 t0,
                             __u64 *rule_id_out) {
-  struct flow_verdict_key fv_key = {};
-  tc_flow_verdict_key_from_flow(&fv_key, flow, (__u32)(ifindex_pktlen >> 32));
-  return tc_check_flow_verdict_cache(gs, &fv_key, (__u32)ifindex_pktlen, t0,
-                                     rule_id_out);
+  return tc_check_flow_verdict_cache(gs, flow, (__u32)(ifindex_pktlen >> 32),
+                                     (__u32)ifindex_pktlen, t0, rule_id_out);
 }
 
 /*
@@ -792,7 +807,7 @@ int tc_policy_egress(struct __sk_buff *ctx) {
 }
 
 /*
- * Seed tc_flow_verdict_cache with the action selected by tc_sni_inspect after
+ * Seed the egress verdict cache with the action selected by tc_sni_inspect after
  * walking a matched rule's actions[] (or PASS on the no-match-after-all-rules-
  * exhausted path).  TC egress uses the canonical egress 5-tuple (client→server)
  * as the key, mirroring the read path in tc_policy_egress's verdict-cache
@@ -802,13 +817,10 @@ int tc_policy_egress(struct __sk_buff *ctx) {
 static __always_inline void
 tc_sni_write_verdict(const struct flow_key *flow, __u32 action, __u64 now_ns,
                      __u32 ifindex) {
-  struct flow_verdict_key fv_key = {};
-  tc_flow_verdict_key_from_flow(&fv_key, flow, ifindex);
-
   struct flow_verdict v = {};
   v.action = action;
   v.expires_ns = now_ns + SNI_VERDICT_TTL_NS;
-  bpf_map_update_elem(&tc_flow_verdict_cache, &fv_key, &v, BPF_ANY);
+  tc_verdict_update(flow, ifindex, &v, BPF_ANY);
 }
 
 /*

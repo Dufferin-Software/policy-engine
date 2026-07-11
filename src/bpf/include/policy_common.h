@@ -69,8 +69,18 @@
  * inspector (cached verdicts after decrypting the Initial ClientHello), and
  * the in-kernel TCP SNI inspector (tc_sni_inspect / xdp_sni_inspect) after
  * walking the rule's action list.
- * Always compiled in so non-Suricata builds can still cache verdicts. */
-#define MAX_FLOW_VERDICTS 65536
+ * Always compiled in so non-Suricata builds can still cache verdicts.
+ *
+ * Sized per address family (see flow_verdict_key_v4 / _v6).  The v4 capacity is
+ * unchanged from the old shared map, so a v4-dominant host caches the same
+ * number of flows out of a map that is now 9.4 MB instead of 11.0 MB (144 vs
+ * 168 B/entry) — and v6 entries no longer dilute the buckets that v4 lookups
+ * walk.  The v6 map is smaller and stays cold on hosts with no v6 traffic, so
+ * it costs address space rather than cache.
+ *
+ * Keep in sync with MAX_FLOW_VERDICTS_V4 / _V6 in src/types.rs. */
+#define MAX_FLOW_VERDICTS_V4 65536
+#define MAX_FLOW_VERDICTS_V6 16384
 
 /* Verdict cache expiry, split by what the verdict actually depends on.
  *
@@ -244,7 +254,7 @@ struct sni_pending_entry {
 }; /* 16 + 4*16 = 80 bytes */
 
 /*
- * Flow verdict key (used in flow_verdict_cache / tc_flow_verdict_cache).
+ * Flow verdict keys (used in flow_verdict_cache_v4/v6 and the tc_ mirrors).
  * Generic 5-tuple keyed cache, scoped per-interface by ifindex.  Written by any
  * verdict source (plain policy fast path, Suricata EVE consumer, QUIC SNI
  * inspector, future inspectors); checked by XDP/TC at packet entry for cached
@@ -255,23 +265,36 @@ struct sni_pending_entry {
  * interfaces with different policies would share one cached verdict.  The XDP
  * and TC verdict caches are distinct maps, so each scopes by its own natural
  * ifindex — XDP uses ctx->ingress_ifindex, TC uses ctx->ifindex (egress).
+ *
+ * Split by address family rather than carrying a 16-byte address union sized
+ * for IPv6.  A v4 flow left 24 of the union's 32 address bytes zero, and the
+ * kernel hashed and memcmp'd them on every packet: the cache is on the hot path
+ * for *every* flow, so its element size sets how much of it stays resident in
+ * L2/L3.  Per-family keys cut the v4 element from 152 B to 120 B (168 -> 136 B
+ * per entry including the bucket share), a 19% reduction in the map's cache
+ * footprint, and shrink the per-packet key compare from 44 B to 20 B.
+ *
+ * `af` is not a key field: the map a key lives in already determines it.
  */
-struct flow_verdict_key {
-  union {
-    __u32 saddr4;
-    __u32 saddr6[4];
-  };
-  union {
-    __u32 daddr4;
-    __u32 daddr6[4];
-  };
+struct flow_verdict_key_v4 {
+  __u32 saddr;
+  __u32 daddr;
   __u16 sport;
   __u16 dport;
   __u8 protocol;
-  __u8 af;
-  __u16 _pad;
+  __u8 _pad[3];
   __u32 ifindex;
-} __attribute__((packed));
+} __attribute__((packed)); /* 20 bytes */
+
+struct flow_verdict_key_v6 {
+  __u32 saddr[4];
+  __u32 daddr[4];
+  __u16 sport;
+  __u16 dport;
+  __u8 protocol;
+  __u8 _pad[3];
+  __u32 ifindex;
+} __attribute__((packed)); /* 44 bytes */
 
 /*
  * Flows-to-inspect key (used in the flows_to_inspect hash map).
@@ -297,6 +320,35 @@ struct flow_inspect_key {
   __u8 af;
   __u16 _pad;
 } __attribute__((packed));
+
+/*
+ * Build a verdict-cache key from a parsed flow_key.  One builder per address
+ * family; the caller has already branched on flow->af to pick the map, so these
+ * do not re-check it.  Shared by the XDP and TC verdict accessors
+ * (xdp_verdict_lookup/update, tc_verdict_lookup/update) so both directions stay
+ * in sync on field layout.
+ */
+static __always_inline void
+flow_verdict_key_v4_from_flow(struct flow_verdict_key_v4 *k,
+                              const struct flow_key *flow, __u32 ifindex) {
+  k->saddr = flow->saddr4;
+  k->daddr = flow->daddr4;
+  k->sport = flow->sport;
+  k->dport = flow->dport;
+  k->protocol = flow->protocol;
+  k->ifindex = ifindex;
+}
+
+static __always_inline void
+flow_verdict_key_v6_from_flow(struct flow_verdict_key_v6 *k,
+                              const struct flow_key *flow, __u32 ifindex) {
+  __builtin_memcpy(k->saddr, flow->saddr6, 16);
+  __builtin_memcpy(k->daddr, flow->daddr6, 16);
+  k->sport = flow->sport;
+  k->dport = flow->dport;
+  k->protocol = flow->protocol;
+  k->ifindex = ifindex;
+}
 
 /*
  * Build a flows_to_inspect key from a parsed flow_key (forward 5-tuple).
@@ -343,11 +395,34 @@ flow_inspect_key_from_flow_reversed(struct flow_inspect_key *k,
 /*
  * Flow verdict value: cached decision with expiry and traffic counters.
  * packets/bytes are incremented atomically by XDP/TC on every verdict hit.
+ *
+ * 56 bytes, and deliberately not shrunk further.  With the 20-byte v4 key the
+ * LRU element comes to exactly 128 B (48 B htab_elem header + 24 B 8-aligned
+ * key + 56 B value).  LRU hashes are always preallocated as one contiguous,
+ * page-aligned array at element stride, so a 128-byte element means every entry
+ * is 64-byte aligned: the header and key land in the first cache line and the
+ * value falls entirely within the second.  A verdict lookup therefore touches
+ * exactly two cache lines, where the old 44-byte-key / 152-byte-element layout
+ * straddled three or four at an offset that varied per entry.  Trimming the
+ * value to 48 B would save 8 B/entry but break that alignment (120-byte stride)
+ * and cost more in lines touched than it saves in bytes resident.
+ *
+ * timestamp_ns is not read by the datapath, but it is not dead: userspace uses
+ * (timestamp_ns, rule_id) as the entry's identity to detect in-place
+ * replacement, where the counters restart from zero (see Baseline::matches in
+ * server/verdict_harvest.rs).  Without it, a rule-change flush followed by a
+ * re-seed under the same rule_id would look like a live entry whose counters
+ * went backwards, and the rule's traffic would be silently undercounted.
+ *
+ * rule_id stays 64-bit: auto-generated rule IDs are nanosecond timestamps
+ * (PolicyService::add_rule_inner), so they do not fit in 32 bits and narrowing
+ * would misattribute harvested counters to the wrong rule.
  */
 struct flow_verdict {
   __u32 action; /* ACTION_PASS or ACTION_DROP */
   __u32 _pad;
-  __u64 timestamp_ns; /* When verdict was set */
+  __u64 timestamp_ns; /* When the verdict was set; part of the entry identity
+                         userspace uses to detect in-place replacement */
   __u64 expires_ns;   /* Auto-expire timestamp (0 = never) */
   __u64 packets;      /* Packets matched by this verdict */
   __u64 bytes;        /* Bytes matched by this verdict */
@@ -361,7 +436,7 @@ struct flow_verdict {
                          deltas from this entry into rule_stats (see
                          verdict_harvest.rs) so the per-packet fast path
                          avoids a HASH lookup and two shared atomic adds. */
-};
+}; /* 56 bytes */
 
 #ifdef SURICATA_IPS
 /*

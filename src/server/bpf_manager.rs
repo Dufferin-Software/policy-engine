@@ -613,9 +613,36 @@ impl BpfManager {
         }
     }
 
+    /// Pins left behind by maps that no longer exist in the current skeleton.
+    ///
+    /// Pins outlive the process by design (that is what makes reuse work), and
+    /// nothing else removes them — a map is only unpinned when *reuse* of it
+    /// fails.  So when a map is renamed or dropped, its old pin would otherwise
+    /// linger forever, holding its kernel memory with no program referencing it.
+    ///
+    /// `flow_verdict_cache` / `tc_flow_verdict_cache` were replaced by the
+    /// per-address-family `_v4` / `_v6` pair; on a host upgraded in place the
+    /// originals are ~11 MB each of pinned dead weight.
+    const OBSOLETE_PINS: &'static [&'static str] = &["flow_verdict_cache", "tc_flow_verdict_cache"];
+
+    /// Unlink pins for maps this build no longer has.  Best-effort: a pin that
+    /// is absent (fresh host) or still busy is not an error.
+    fn remove_obsolete_pins() {
+        for name in Self::OBSOLETE_PINS {
+            let path = format!("{}/{}", BPF_PIN_PATH, name);
+            if Path::new(&path).exists() {
+                match fs::remove_file(&path) {
+                    Ok(()) => info!("Removed obsolete pinned map: {}", name),
+                    Err(e) => warn!("Failed to remove obsolete pinned map {}: {}", name, e),
+                }
+            }
+        }
+    }
+
     /// Try to reuse existing pinned XDP maps
     fn try_reuse_pinned_maps_xdp(&self, open_skel: &mut OpenXdpPolicySkel) -> Result<()> {
         let pin_path = BPF_PIN_PATH;
+        Self::remove_obsolete_pins();
 
         let map_reuses = [
             ("rule_stats", &mut open_skel.maps.rule_stats),
@@ -695,7 +722,14 @@ impl BpfManager {
                     }
                 }};
             }
-            try_reuse!(open_skel.maps.flow_verdict_cache, "flow_verdict_cache");
+            try_reuse!(
+                open_skel.maps.flow_verdict_cache_v4,
+                "flow_verdict_cache_v4"
+            );
+            try_reuse!(
+                open_skel.maps.flow_verdict_cache_v6,
+                "flow_verdict_cache_v6"
+            );
             #[cfg(feature = "suricata")]
             {
                 try_reuse!(open_skel.maps.inspect_config, "inspect_config");
@@ -784,8 +818,12 @@ impl BpfManager {
                 }};
             }
             try_reuse_tc!(
-                open_skel.maps.tc_flow_verdict_cache,
-                "tc_flow_verdict_cache"
+                open_skel.maps.tc_flow_verdict_cache_v4,
+                "tc_flow_verdict_cache_v4"
+            );
+            try_reuse_tc!(
+                open_skel.maps.tc_flow_verdict_cache_v6,
+                "tc_flow_verdict_cache_v6"
             );
             #[cfg(feature = "suricata")]
             {
@@ -852,7 +890,8 @@ impl BpfManager {
         pin_if_needed!(skel.maps.flow_cache_config_map, "flow_cache_config_map");
         #[cfg(feature = "ipfix")]
         pin_if_needed!(skel.maps.flow_cache, "flow_cache");
-        pin_if_needed!(skel.maps.flow_verdict_cache, "flow_verdict_cache");
+        pin_if_needed!(skel.maps.flow_verdict_cache_v4, "flow_verdict_cache_v4");
+        pin_if_needed!(skel.maps.flow_verdict_cache_v6, "flow_verdict_cache_v6");
         #[cfg(feature = "suricata")]
         pin_if_needed!(skel.maps.inspect_config, "inspect_config");
         // flows_to_inspect is pinned here (XDP skeleton owns it); TC reuses
@@ -911,7 +950,14 @@ impl BpfManager {
         );
         #[cfg(feature = "ipfix")]
         pin_if_needed!(skel.maps.tc_flow_cache, "tc_flow_cache");
-        pin_if_needed!(skel.maps.tc_flow_verdict_cache, "tc_flow_verdict_cache");
+        pin_if_needed!(
+            skel.maps.tc_flow_verdict_cache_v4,
+            "tc_flow_verdict_cache_v4"
+        );
+        pin_if_needed!(
+            skel.maps.tc_flow_verdict_cache_v6,
+            "tc_flow_verdict_cache_v6"
+        );
         #[cfg(feature = "suricata")]
         pin_if_needed!(skel.maps.tc_inspect_config, "tc_inspect_config");
         pin_if_needed!(skel.maps.tc_sni_rules, "tc_sni_rules");
@@ -3192,27 +3238,51 @@ impl BpfManager {
 
     /// Update a flow verdict.  Used by the Suricata EVE consumer (DROP verdicts
     /// from alerts) and the QUIC SNI inspector (post-Initial-decryption verdicts).
+    ///
+    /// Routes to the v4 or v6 cache by the key's address family — see
+    /// [`FlowVerdictKey`] for why the kernel cache is split.
     pub fn update_flow_verdict(
         &mut self,
         key: &FlowVerdictKey,
         value: &FlowVerdict,
         direction: Direction,
     ) -> Result<()> {
+        let is_v4 = key.af == AF_INET;
         match direction {
             Direction::Ingress => {
                 if let Some(skel) = &mut self.xdp_skel {
-                    skel.maps
-                        .flow_verdict_cache
-                        .update(key.as_bytes(), value.as_bytes(), MapFlags::ANY)
-                        .context("Failed to update ingress flow verdict")?;
+                    if is_v4 {
+                        skel.maps.flow_verdict_cache_v4.update(
+                            FlowVerdictKeyV4::from(key).as_bytes(),
+                            value.as_bytes(),
+                            MapFlags::ANY,
+                        )
+                    } else {
+                        skel.maps.flow_verdict_cache_v6.update(
+                            FlowVerdictKeyV6::from(key).as_bytes(),
+                            value.as_bytes(),
+                            MapFlags::ANY,
+                        )
+                    }
+                    .context("Failed to update ingress flow verdict")?;
                 }
             }
             Direction::Egress => {
                 if let Some(skel) = &mut self.tc_skel {
-                    skel.maps
-                        .tc_flow_verdict_cache
-                        .update(key.as_bytes(), value.as_bytes(), MapFlags::ANY)
-                        .context("Failed to update egress flow verdict")?;
+                    if is_v4 {
+                        skel.maps.tc_flow_verdict_cache_v4.update(
+                            FlowVerdictKeyV4::from(key).as_bytes(),
+                            value.as_bytes(),
+                            MapFlags::ANY,
+                        )
+                    } else {
+                        skel.maps.tc_flow_verdict_cache_v6.update(
+                            FlowVerdictKeyV6::from(key).as_bytes(),
+                            value.as_bytes(),
+                            MapFlags::ANY,
+                        )
+                    }
+                    .context("Failed to update egress flow verdict")?;
                 }
             }
         }
@@ -3270,21 +3340,40 @@ impl BpfManager {
         Ok(())
     }
 
-    /// Delete a flow verdict entry
+    /// Delete a flow verdict entry.  Routes by address family, as `update` does.
     pub fn delete_flow_verdict(
         &mut self,
         key: &FlowVerdictKey,
         direction: Direction,
     ) -> Result<()> {
+        let is_v4 = key.af == AF_INET;
         match direction {
             Direction::Ingress => {
                 if let Some(skel) = &mut self.xdp_skel {
-                    skel.maps.flow_verdict_cache.delete(key.as_bytes()).ok();
+                    if is_v4 {
+                        skel.maps
+                            .flow_verdict_cache_v4
+                            .delete(FlowVerdictKeyV4::from(key).as_bytes())
+                    } else {
+                        skel.maps
+                            .flow_verdict_cache_v6
+                            .delete(FlowVerdictKeyV6::from(key).as_bytes())
+                    }
+                    .ok();
                 }
             }
             Direction::Egress => {
                 if let Some(skel) = &mut self.tc_skel {
-                    skel.maps.tc_flow_verdict_cache.delete(key.as_bytes()).ok();
+                    if is_v4 {
+                        skel.maps
+                            .tc_flow_verdict_cache_v4
+                            .delete(FlowVerdictKeyV4::from(key).as_bytes())
+                    } else {
+                        skel.maps
+                            .tc_flow_verdict_cache_v6
+                            .delete(FlowVerdictKeyV6::from(key).as_bytes())
+                    }
+                    .ok();
                 }
             }
         }
@@ -3313,40 +3402,68 @@ impl BpfManager {
         Ok(verdicts)
     }
 
-    /// Walk the direction's verdict-cache map without harvesting.
+    /// Walk the direction's verdict-cache maps without harvesting.
+    ///
+    /// The cache is two maps (v4 and v6), so a listing concatenates both.  The
+    /// on-wire keys are converted back to the logical [`FlowVerdictKey`], whose
+    /// `af` field keeps the two families distinct for every caller above this
+    /// point (including the harvest baselines, which key on the logical bytes).
     fn list_flow_verdicts_raw(
         &self,
         direction: Direction,
     ) -> Result<Vec<(FlowVerdictKey, FlowVerdict)>> {
-        let mut verdicts = Vec::new();
-
-        let map: Option<&dyn MapCore> = match direction {
-            Direction::Ingress => self
-                .xdp_skel
-                .as_ref()
-                .map(|s| &s.maps.flow_verdict_cache as &dyn MapCore),
-            Direction::Egress => self
-                .tc_skel
-                .as_ref()
-                .map(|s| &s.maps.tc_flow_verdict_cache as &dyn MapCore),
+        let (map_v4, map_v6): (Option<&dyn MapCore>, Option<&dyn MapCore>) = match direction {
+            Direction::Ingress => (
+                self.xdp_skel
+                    .as_ref()
+                    .map(|s| &s.maps.flow_verdict_cache_v4 as &dyn MapCore),
+                self.xdp_skel
+                    .as_ref()
+                    .map(|s| &s.maps.flow_verdict_cache_v6 as &dyn MapCore),
+            ),
+            Direction::Egress => (
+                self.tc_skel
+                    .as_ref()
+                    .map(|s| &s.maps.tc_flow_verdict_cache_v4 as &dyn MapCore),
+                self.tc_skel
+                    .as_ref()
+                    .map(|s| &s.maps.tc_flow_verdict_cache_v6 as &dyn MapCore),
+            ),
         };
 
-        if let Some(map) = map {
-            for key_bytes in map.keys() {
-                let mut key = FlowVerdictKey::default();
-                plain::copy_from_bytes(&mut key, &key_bytes)
-                    .map_err(|e| anyhow!("Failed to parse flow verdict key: {:?}", e))?;
+        let mut verdicts = Vec::new();
+        if let Some(map) = map_v4 {
+            Self::collect_verdicts::<FlowVerdictKeyV4>(map, &mut verdicts)?;
+        }
+        if let Some(map) = map_v6 {
+            Self::collect_verdicts::<FlowVerdictKeyV6>(map, &mut verdicts)?;
+        }
+        Ok(verdicts)
+    }
 
-                if let Some(value_bytes) = map.lookup(&key_bytes, MapFlags::ANY)? {
-                    let mut value = FlowVerdict::default();
-                    plain::copy_from_bytes(&mut value, &value_bytes)
-                        .map_err(|e| anyhow!("Failed to parse flow verdict: {:?}", e))?;
-                    verdicts.push((key, value));
-                }
+    /// Walk one per-family verdict map, widening its on-wire keys back to the
+    /// logical [`FlowVerdictKey`] and appending to `out`.
+    fn collect_verdicts<K>(
+        map: &dyn MapCore,
+        out: &mut Vec<(FlowVerdictKey, FlowVerdict)>,
+    ) -> Result<()>
+    where
+        K: plain::Plain + Default,
+        for<'a> FlowVerdictKey: From<&'a K>,
+    {
+        for key_bytes in map.keys() {
+            let mut wire = K::default();
+            plain::copy_from_bytes(&mut wire, &key_bytes)
+                .map_err(|e| anyhow!("Failed to parse flow verdict key: {:?}", e))?;
+
+            if let Some(value_bytes) = map.lookup(&key_bytes, MapFlags::ANY)? {
+                let mut value = FlowVerdict::default();
+                plain::copy_from_bytes(&mut value, &value_bytes)
+                    .map_err(|e| anyhow!("Failed to parse flow verdict: {:?}", e))?;
+                out.push((FlowVerdictKey::from(&wire), value));
             }
         }
-
-        Ok(verdicts)
+        Ok(())
     }
 
     /// Fold a verdict-cache listing into the direction's rule_stats map.
@@ -3425,24 +3542,32 @@ impl BpfManager {
         }
     }
 
-    /// Get count of active flow verdicts
+    /// Get count of active flow verdicts, across both address-family maps.
     pub fn get_flow_verdict_count(&self, direction: Direction) -> Result<u64> {
-        let map: Option<&dyn MapCore> = match direction {
-            Direction::Ingress => self
-                .xdp_skel
-                .as_ref()
-                .map(|s| &s.maps.flow_verdict_cache as &dyn MapCore),
-            Direction::Egress => self
-                .tc_skel
-                .as_ref()
-                .map(|s| &s.maps.tc_flow_verdict_cache as &dyn MapCore),
+        let maps: [Option<&dyn MapCore>; 2] = match direction {
+            Direction::Ingress => [
+                self.xdp_skel
+                    .as_ref()
+                    .map(|s| &s.maps.flow_verdict_cache_v4 as &dyn MapCore),
+                self.xdp_skel
+                    .as_ref()
+                    .map(|s| &s.maps.flow_verdict_cache_v6 as &dyn MapCore),
+            ],
+            Direction::Egress => [
+                self.tc_skel
+                    .as_ref()
+                    .map(|s| &s.maps.tc_flow_verdict_cache_v4 as &dyn MapCore),
+                self.tc_skel
+                    .as_ref()
+                    .map(|s| &s.maps.tc_flow_verdict_cache_v6 as &dyn MapCore),
+            ],
         };
 
-        if let Some(map) = map {
-            Ok(map.keys().count() as u64)
-        } else {
-            Ok(0)
-        }
+        Ok(maps
+            .into_iter()
+            .flatten()
+            .map(|m| m.keys().count() as u64)
+            .sum())
     }
 
     /// Get interface index from name

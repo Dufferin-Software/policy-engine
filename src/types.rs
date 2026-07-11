@@ -116,9 +116,11 @@ pub const QUIC_VERSION_ANY: u32 = 0xFFFF_FFFF;
 pub const QUIC_VERSION_V1: u32 = 0x0000_0001;
 pub const QUIC_VERSION_V2: u32 = 0x6b33_43cf;
 
-/// Flow verdict cache capacity (must match MAX_FLOW_VERDICTS in policy_common.h).
-/// Used by both the Suricata IPS path and the QUIC SNI inspector.
-pub const MAX_FLOW_VERDICTS: u32 = 131072;
+/// Flow verdict cache capacity, per address family (must match
+/// MAX_FLOW_VERDICTS_V4 / _V6 in policy_common.h).  Used by both the Suricata
+/// IPS path and the QUIC SNI inspector.
+pub const MAX_FLOW_VERDICTS_V4: u32 = 65536;
+pub const MAX_FLOW_VERDICTS_V6: u32 = 16384;
 
 /// Inspect mode constants
 #[cfg(feature = "suricata")]
@@ -360,7 +362,15 @@ impl Default for FlowExportConfig {
     }
 }
 
-/// Flow verdict key (must match BPF struct layout)
+/// Flow verdict key — the *logical* key used across the service, API and
+/// harvest paths.
+///
+/// This is not the on-wire BPF key. The kernel cache is split by address family
+/// into `flow_verdict_cache_v4` (20-byte key) and `_v6` (44-byte key), because a
+/// shared IPv6-sized key made every IPv4 lookup hash and compare 24 bytes of
+/// zero padding on the hottest map in the datapath. `BpfManager` converts this
+/// logical key to [`FlowVerdictKeyV4`] / [`FlowVerdictKeyV6`] and picks the map;
+/// nothing above `BpfManager` needs to know the cache is two maps.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 pub struct FlowVerdictKey {
@@ -372,9 +382,121 @@ pub struct FlowVerdictKey {
     pub af: u8,
     pub _pad: u16,
     /// Interface index scoping this verdict (must match the BPF
-    /// `flow_verdict_key.ifindex`). Policy is per-interface, so the cache key
-    /// is too: XDP keys by `ctx->ingress_ifindex`, TC by `ctx->ifindex`.
+    /// `flow_verdict_key_v4/_v6.ifindex`). Policy is per-interface, so the cache
+    /// key is too: XDP keys by `ctx->ingress_ifindex`, TC by `ctx->ifindex`.
     pub ifindex: u32,
+}
+
+/// On-wire key for `flow_verdict_cache_v4` / `tc_flow_verdict_cache_v4`.
+/// Must match `struct flow_verdict_key_v4` in policy_common.h.
+///
+/// `af` is not a field: the map already determines the family.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct FlowVerdictKeyV4 {
+    pub saddr: [u8; 4],
+    pub daddr: [u8; 4],
+    pub sport: u16,
+    pub dport: u16,
+    pub protocol: u8,
+    pub _pad: [u8; 3],
+    pub ifindex: u32,
+}
+
+/// On-wire key for `flow_verdict_cache_v6` / `tc_flow_verdict_cache_v6`.
+/// Must match `struct flow_verdict_key_v6` in policy_common.h.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct FlowVerdictKeyV6 {
+    pub saddr: [u8; 16],
+    pub daddr: [u8; 16],
+    pub sport: u16,
+    pub dport: u16,
+    pub protocol: u8,
+    pub _pad: [u8; 3],
+    pub ifindex: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<FlowVerdictKeyV4>() == 20);
+const _: () = assert!(std::mem::size_of::<FlowVerdictKeyV6>() == 44);
+
+impl FlowVerdictKeyV4 {
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(self as *const _ as *const u8, std::mem::size_of::<Self>())
+        }
+    }
+}
+
+impl FlowVerdictKeyV6 {
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(self as *const _ as *const u8, std::mem::size_of::<Self>())
+        }
+    }
+}
+
+unsafe impl plain::Plain for FlowVerdictKeyV4 {}
+unsafe impl plain::Plain for FlowVerdictKeyV6 {}
+
+impl From<&FlowVerdictKey> for FlowVerdictKeyV4 {
+    fn from(k: &FlowVerdictKey) -> Self {
+        let mut v4 = Self {
+            sport: k.sport,
+            dport: k.dport,
+            protocol: k.protocol,
+            ifindex: k.ifindex,
+            ..Default::default()
+        };
+        v4.saddr.copy_from_slice(&k.saddr[..4]);
+        v4.daddr.copy_from_slice(&k.daddr[..4]);
+        v4
+    }
+}
+
+impl From<&FlowVerdictKey> for FlowVerdictKeyV6 {
+    fn from(k: &FlowVerdictKey) -> Self {
+        Self {
+            saddr: k.saddr,
+            daddr: k.daddr,
+            sport: k.sport,
+            dport: k.dport,
+            protocol: k.protocol,
+            _pad: [0; 3],
+            ifindex: k.ifindex,
+        }
+    }
+}
+
+impl From<&FlowVerdictKeyV4> for FlowVerdictKey {
+    fn from(k: &FlowVerdictKeyV4) -> Self {
+        let mut out = FlowVerdictKey {
+            sport: k.sport,
+            dport: k.dport,
+            protocol: k.protocol,
+            af: AF_INET,
+            ifindex: k.ifindex,
+            ..Default::default()
+        };
+        out.saddr[..4].copy_from_slice(&k.saddr);
+        out.daddr[..4].copy_from_slice(&k.daddr);
+        out
+    }
+}
+
+impl From<&FlowVerdictKeyV6> for FlowVerdictKey {
+    fn from(k: &FlowVerdictKeyV6) -> Self {
+        FlowVerdictKey {
+            saddr: k.saddr,
+            daddr: k.daddr,
+            sport: k.sport,
+            dport: k.dport,
+            protocol: k.protocol,
+            af: AF_INET6,
+            _pad: 0,
+            ifindex: k.ifindex,
+        }
+    }
 }
 
 impl FlowVerdictKey {
@@ -2272,6 +2394,97 @@ mod tests {
         fn flow_verdict_key_as_bytes() {
             let k = FlowVerdictKey::default();
             assert_eq!(k.as_bytes().len(), std::mem::size_of::<FlowVerdictKey>());
+        }
+
+        /// Logical key used by the service/API layers, for the conversion tests
+        /// below.  Distinct values in every field so a mis-ordered or truncated
+        /// conversion cannot round-trip by coincidence.
+        fn logical_key(af: u8) -> FlowVerdictKey {
+            let mut k = FlowVerdictKey {
+                sport: 0x1234,
+                dport: 0x5678,
+                protocol: 6,
+                af,
+                ifindex: 0xDEAD_BEEF,
+                ..Default::default()
+            };
+            if af == AF_INET {
+                k.saddr[..4].copy_from_slice(&[10, 0, 0, 1]);
+                k.daddr[..4].copy_from_slice(&[192, 168, 1, 254]);
+            } else {
+                k.saddr = [
+                    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+                ];
+                k.daddr = [
+                    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff,
+                ];
+            }
+            k
+        }
+
+        /// The v4 wire key is what the kernel actually hashes and memcmps, so a
+        /// wrong offset here would silently stop every v4 verdict from hitting.
+        #[test]
+        fn flow_verdict_key_v4_round_trip() {
+            let logical = logical_key(AF_INET);
+            let wire = FlowVerdictKeyV4::from(&logical);
+
+            assert_eq!(wire.saddr, [10, 0, 0, 1]);
+            assert_eq!(wire.daddr, [192, 168, 1, 254]);
+            assert_eq!({ wire.sport }, 0x1234);
+            assert_eq!({ wire.dport }, 0x5678);
+            assert_eq!(wire.protocol, 6);
+            assert_eq!({ wire.ifindex }, 0xDEAD_BEEF);
+            assert_eq!(wire.as_bytes().len(), 20);
+
+            // Widening back must reproduce the logical key exactly, including the
+            // af the map (not the wire key) is responsible for.
+            let back = FlowVerdictKey::from(&wire);
+            assert_eq!(back.as_bytes(), logical.as_bytes());
+        }
+
+        #[test]
+        fn flow_verdict_key_v6_round_trip() {
+            let logical = logical_key(AF_INET6);
+            let wire = FlowVerdictKeyV6::from(&logical);
+
+            assert_eq!(wire.saddr, logical.saddr);
+            assert_eq!(wire.daddr, logical.daddr);
+            assert_eq!({ wire.sport }, 0x1234);
+            assert_eq!({ wire.dport }, 0x5678);
+            assert_eq!(wire.protocol, 6);
+            assert_eq!({ wire.ifindex }, 0xDEAD_BEEF);
+            assert_eq!(wire.as_bytes().len(), 44);
+
+            let back = FlowVerdictKey::from(&wire);
+            assert_eq!(back.as_bytes(), logical.as_bytes());
+        }
+
+        /// The v4 wire key carries only the first 4 address bytes.  Two logical
+        /// keys that differ only in the unused IPv6 tail are the *same* v4 flow,
+        /// and must collapse to identical wire keys — otherwise the trailing
+        /// bytes would leak into the hash and split one flow across two entries.
+        #[test]
+        fn flow_verdict_key_v4_ignores_ipv6_tail() {
+            let a = logical_key(AF_INET);
+            let mut b = a;
+            b.saddr[4..].copy_from_slice(&[0xAA; 12]);
+            b.daddr[4..].copy_from_slice(&[0xBB; 12]);
+
+            assert_eq!(
+                FlowVerdictKeyV4::from(&a).as_bytes(),
+                FlowVerdictKeyV4::from(&b).as_bytes()
+            );
+        }
+
+        /// Padding must be zeroed: the kernel hashes the whole key, so a stale
+        /// pad byte would make an otherwise-identical flow miss its own entry.
+        #[test]
+        fn flow_verdict_wire_keys_have_zeroed_padding() {
+            let v4 = FlowVerdictKeyV4::from(&logical_key(AF_INET));
+            assert_eq!(v4._pad, [0; 3]);
+            let v6 = FlowVerdictKeyV6::from(&logical_key(AF_INET6));
+            assert_eq!(v6._pad, [0; 3]);
         }
 
         #[test]

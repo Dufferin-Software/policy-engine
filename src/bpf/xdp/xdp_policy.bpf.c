@@ -110,10 +110,17 @@ struct {
  */
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
-  __uint(max_entries, MAX_FLOW_VERDICTS);
-  __type(key, struct flow_verdict_key);
+  __uint(max_entries, MAX_FLOW_VERDICTS_V4);
+  __type(key, struct flow_verdict_key_v4);
   __type(value, struct flow_verdict);
-} flow_verdict_cache SEC(".maps");
+} flow_verdict_cache_v4 SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, MAX_FLOW_VERDICTS_V6);
+  __type(key, struct flow_verdict_key_v6);
+  __type(value, struct flow_verdict);
+} flow_verdict_cache_v6 SEC(".maps");
 
 #ifdef SURICATA_IPS
 /*
@@ -352,27 +359,46 @@ struct {
  * extra map lookups. */
 
 /*
- * Build a flow_verdict_cache key from a parsed flow_key.  Shared by the
- * verdict-cache lookup in xdp_policy_main, the verdict writers below, and the
- * INSPECT pass-verdict writer in actions.h (hence defined before the include
- * block) so all stay in sync on field layout (address family, addresses,
- * ports, proto).
+ * Verdict cache accessors.
+ *
+ * The cache is split per address family (flow_verdict_cache_v4 / _v6), so every
+ * access has to pick a map and build the matching key.  That branch lives here
+ * and nowhere else: the lookup in xdp_policy_main, the verdict writers below,
+ * and the INSPECT pass-verdict writer in actions.h (hence defined before the
+ * include block) all go through xdp_verdict_lookup / xdp_verdict_update, so
+ * there is exactly one place that knows the cache is two maps.
  */
-static __always_inline void
-flow_verdict_key_from_flow(struct flow_verdict_key *fv_key,
-                           const struct flow_key *flow, __u32 ifindex) {
+/* Look the flow up in the verdict cache for its address family.
+ * Returns NULL on miss (and for any unrecognised af). */
+static __always_inline struct flow_verdict *
+xdp_verdict_lookup(const struct flow_key *flow, __u32 ifindex) {
   if (flow->af == AF_INET) {
-    fv_key->saddr4 = flow->saddr4;
-    fv_key->daddr4 = flow->daddr4;
-  } else {
-    __builtin_memcpy(fv_key->saddr6, flow->saddr6, 16);
-    __builtin_memcpy(fv_key->daddr6, flow->daddr6, 16);
+    struct flow_verdict_key_v4 k = {};
+    flow_verdict_key_v4_from_flow(&k, flow, ifindex);
+    return bpf_map_lookup_elem(&flow_verdict_cache_v4, &k);
+  } else if (flow->af == AF_INET6) {
+    struct flow_verdict_key_v6 k = {};
+    flow_verdict_key_v6_from_flow(&k, flow, ifindex);
+    return bpf_map_lookup_elem(&flow_verdict_cache_v6, &k);
   }
-  fv_key->sport = flow->sport;
-  fv_key->dport = flow->dport;
-  fv_key->protocol = flow->protocol;
-  fv_key->af = flow->af;
-  fv_key->ifindex = ifindex;
+  return NULL;
+}
+
+/* Insert/overwrite a verdict in the cache for the flow's address family.
+ * `flags` is a BPF_ANY / BPF_NOEXIST style map-update flag. */
+static __always_inline void xdp_verdict_update(const struct flow_key *flow,
+                                               __u32 ifindex,
+                                               const struct flow_verdict *v,
+                                               __u64 flags) {
+  if (flow->af == AF_INET) {
+    struct flow_verdict_key_v4 k = {};
+    flow_verdict_key_v4_from_flow(&k, flow, ifindex);
+    bpf_map_update_elem(&flow_verdict_cache_v4, &k, v, flags);
+  } else if (flow->af == AF_INET6) {
+    struct flow_verdict_key_v6 k = {};
+    flow_verdict_key_v6_from_flow(&k, flow, ifindex);
+    bpf_map_update_elem(&flow_verdict_cache_v6, &k, v, flags);
+  }
 }
 
 // clang-format off
@@ -476,13 +502,10 @@ static __noinline int xdp_flow_under_inspection(const struct flow_key *flow);
 static __always_inline void
 xdp_sni_write_verdict(const struct flow_key *flow, __u32 action, __u64 now_ns,
                       __u32 ifindex) {
-  struct flow_verdict_key fv_key = {};
-  flow_verdict_key_from_flow(&fv_key, flow, ifindex);
-
   struct flow_verdict v = {};
   v.action = action;
   v.expires_ns = now_ns + SNI_VERDICT_TTL_NS;
-  bpf_map_update_elem(&flow_verdict_cache, &fv_key, &v, BPF_ANY);
+  xdp_verdict_update(flow, ifindex, &v, BPF_ANY);
 }
 
 /*
@@ -498,23 +521,19 @@ xdp_sni_write_verdict(const struct flow_key *flow, __u32 action, __u64 now_ns,
  * Callers must only invoke this for cacheable flows (pure PASS/DROP — see
  * process_rule_actions' cacheable flag).
  *
- * __noinline so the ~100 bytes of key + verdict live in this subprogram's
- * frame instead of xdp_policy_main's: main's frame plus its deepest callee
- * must fit the 512-byte combined stack limit (same reasoning as
- * tc_policy_write_verdict).
+ * __noinline so the key + verdict live in this subprogram's frame instead of
+ * xdp_policy_main's: main's frame plus its deepest callee must fit the 512-byte
+ * combined stack limit (same reasoning as tc_policy_write_verdict).
  */
 static __noinline void
 xdp_policy_write_verdict(const struct flow_key *flow, __u32 action,
                          __u64 rule_id, __u64 now_ns, __u32 ifindex) {
-  struct flow_verdict_key fv_key = {};
-  flow_verdict_key_from_flow(&fv_key, flow, ifindex);
-
   struct flow_verdict v = {};
   v.action = action;
   v.rule_id = rule_id;
   v.timestamp_ns = now_ns;
   v.expires_ns = POLICY_VERDICT_EXPIRES_NS;
-  bpf_map_update_elem(&flow_verdict_cache, &fv_key, &v, BPF_ANY);
+  xdp_verdict_update(flow, ifindex, &v, BPF_ANY);
 }
 
 /*
@@ -638,12 +657,11 @@ int xdp_sni_inspect(struct xdp_md *ctx) {
         flow_inspect_key_from_flow(&fi_key, &meta->flow);
         __u64 expiry = sni_now + INSPECT_CLONE_TTL_NS;
         bpf_map_update_elem(&flows_to_inspect, &fi_key, &expiry, BPF_ANY);
-        struct flow_verdict_key fv_key = {};
-        flow_verdict_key_from_flow(&fv_key, &meta->flow, ctx->ingress_ifindex);
         struct flow_verdict pass_v = {};
         pass_v.action = ACTION_PASS;
         pass_v.expires_ns = sni_now + INSPECT_PASS_VERDICT_TTL_NS;
-        bpf_map_update_elem(&flow_verdict_cache, &fv_key, &pass_v, BPF_NOEXIST);
+        xdp_verdict_update(&meta->flow, ctx->ingress_ifindex, &pass_v,
+                           BPF_NOEXIST);
         break;
       }
 #endif /* SURICATA_IPS */
@@ -855,9 +873,9 @@ pass_through:
  */
 static __always_inline int
 check_flow_verdict_cache(struct global_stats *stats,
-                         const struct flow_verdict_key *fv_key, __u32 pkt_len,
-                         __u64 t0, __u64 *rule_id_out) {
-  struct flow_verdict *fv = bpf_map_lookup_elem(&flow_verdict_cache, fv_key);
+                         const struct flow_key *flow, __u32 ifindex,
+                         __u32 pkt_len, __u64 t0, __u64 *rule_id_out) {
+  struct flow_verdict *fv = xdp_verdict_lookup(flow, ifindex);
   if (!fv)
     return -1;
 
@@ -907,18 +925,6 @@ check_flow_verdict_cache(struct global_stats *stats,
   }
 
   return -1;
-}
-
-/*
- * Build the flow_verdict_key and check the verdict cache.
- */
-static __always_inline int
-xdp_flow_verdict_cache_check(struct global_stats *stats,
-                             const struct flow_key *flow, __u32 ifindex,
-                             __u32 pkt_len, __u64 t0, __u64 *rule_id_out) {
-  struct flow_verdict_key fv_key = {};
-  flow_verdict_key_from_flow(&fv_key, flow, ifindex);
-  return check_flow_verdict_cache(stats, &fv_key, pkt_len, t0, rule_id_out);
 }
 
 /*
@@ -1120,7 +1126,7 @@ int xdp_policy_main(struct xdp_md *ctx) {
    * DROP verdicts), the QUIC SNI inspector, and any future flow-verdict
    * source.  A hit short-circuits the policy lookup at XDP line rate. */
   __u64 fv_rule_id = 0;
-  int cached_verdict = xdp_flow_verdict_cache_check(
+  int cached_verdict = check_flow_verdict_cache(
       stats, &flow_key, ctx->ingress_ifindex, pkt_len, t0, &fv_rule_id);
   /* Timing already recorded by check_flow_verdict_cache on a hit (which
    * reuses its expiry-check timestamp, avoiding a second ktime call);

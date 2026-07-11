@@ -69,13 +69,10 @@ static __noinline int xdp_mark_flow_for_inspect(struct global_stats *gs,
 static __noinline void
 xdp_write_inspect_pass_verdict(const struct flow_key *flow_key, __u32 ifindex,
                                __u64 now_ns) {
-  struct flow_verdict_key fv_key = {};
-  flow_verdict_key_from_flow(&fv_key, flow_key, ifindex);
-
   struct flow_verdict pass_v = {};
   pass_v.action = ACTION_PASS;
   pass_v.expires_ns = now_ns + INSPECT_PASS_VERDICT_TTL_NS;
-  bpf_map_update_elem(&flow_verdict_cache, &fv_key, &pass_v, BPF_NOEXIST);
+  xdp_verdict_update(flow_key, ifindex, &pass_v, BPF_NOEXIST);
 }
 #endif /* SURICATA_IPS */
 
