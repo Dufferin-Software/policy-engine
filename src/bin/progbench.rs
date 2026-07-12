@@ -3,63 +3,7 @@
 
 //! Per-packet cost of the XDP datapath, measured with BPF_PROG_TEST_RUN.
 //!
-//! `scripts/bench/xdp-bench.py` measures the datapath through a NIC, a wire and
-//! a traffic generator.  That is the right tool for "what does the appliance
-//! do", but it cannot answer "did this patch make the program cheaper": the
-//! generator or the wire is usually the binding constraint, and the program's
-//! own cost is a minority of the cycles `perf stat -a` attributes to it.
-//!
-//! This binary removes every one of those variables.  The kernel runs
-//! `xdp_policy_main` against one synthetic packet `--repeat` times in a tight
-//! loop with migration disabled, and a per-thread hardware counter reports the
-//! cycles it took.  There is no NIC, no driver receive path, no generator, and
-//! no wire.  What comes out is the cost of *our program*, which is the only
-//! thing a datapath patch can change.
-//!
-//! The headline number is **cycles per packet**, not nanoseconds -- see the
-//! "Cycles, not nanoseconds" note below, which exists because the first version
-//! of this tool reported a 3.6% regression that was nothing but a warm CPU.
-//!
-//! What it can and cannot see
-//! --------------------------
-//! BPF_PROG_TEST_RUN replays the *same* packet, so the maps it touches stay hot
-//! in L1 for the whole run.  That makes this a precise measurement of
-//! instruction cost and a poor one of cache behaviour.  A change that removes
-//! work (fewer lookups, a smaller struct, one less atomic) shows up here
-//! immediately and repeatably.  A change whose benefit is purely about cache
-//! footprint or LRU contention under many flows will look like nothing --
-//! not because it did nothing, but because a single-flow replay never creates
-//! the pressure it relieves.  Use the packet rig for that, and read
-//! `scripts/bench/README.md` before drawing a conclusion from either.
-//!
-//! Profiles
-//! --------
-//! The datapath caches its own verdicts: the first packet of a flow walks the
-//! LPM trie, and `xdp_policy_write_verdict` then seeds `flow_verdict_cache` so
-//! every later packet on that 5-tuple short-circuits.  The two profiles are the
-//! two sides of that.
-//!
-//! verdict  Steady state, and the overwhelming majority of packets in the
-//!          field: parse, stats, one LRU hash lookup, done.  A cacheable
-//!          (pure PASS) rule produces it naturally under replay.
-//!
-//! policy   The two-level LPM walk (src group -> dst prefix -> L4 rule), which
-//!          in production happens once per flow.  The only profile that
-//!          exercises `dst_lpm_value` and `l4_rule`.  There is no runtime
-//!          switch to disable the verdict cache, so the bench forces the walk
-//!          to repeat by giving the matching rule a rate-limited LOG action --
-//!          the datapath marks LOG flows non-cacheable, so they re-evaluate on
-//!          every packet.  See `install_policy`.
-//!
-//! A datapath change usually moves exactly one of the two.  Measuring the other
-//! is the easiest way to conclude that nothing happened.
-//!
-//! Usage
-//! -----
-//!     sudo policy-progbench --profile policy -o old.json
-//!     # ... rebuild with the change, then:
-//!     sudo policy-progbench --profile policy -o new.json
-//!     policy-progbench --compare old.json new.json
+//! Usage, profiles, and how to read the numbers: `scripts/bench/README.md`.
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -70,27 +14,8 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 
-/// XDP verdicts, for reporting which one the program returned.
 const XDP_DROP: u32 = 1;
 const XDP_PASS: u32 = 2;
-
-// --------------------------------------------------------------------------
-// Cycles, not nanoseconds
-// --------------------------------------------------------------------------
-//
-// The kernel hands back an elapsed time, and elapsed time is the wrong unit.
-// On any box with turbo the core clock moves with thermal and power state --
-// this laptop's ranges from 0.8 to 4.5 GHz -- so the same program measured
-// twice reads several percent apart for reasons that have nothing to do with
-// the program.  And the A/B workflow guarantees it: `cargo build` sits between
-// the two runs and heats the CPU hard, so build B is systematically measured on
-// a hotter, slower core than build A.  That is not noise, it is bias, and it
-// points the wrong way.
-//
-// Cycles do not care.  A per-thread hardware counter around the prog_run
-// syscall gives cycles/packet, which is invariant to whatever the clock is
-// doing, and cycles are what a datapath change actually moves.  ns/pkt is still
-// reported, but only as a readout of the machine on the day.
 
 const PERF_TYPE_HARDWARE: u32 = 0;
 const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
@@ -99,9 +24,8 @@ const PERF_EVENT_IOC_ENABLE: libc::c_ulong = 0x2400;
 const PERF_EVENT_IOC_DISABLE: libc::c_ulong = 0x2401;
 const PERF_EVENT_IOC_RESET: libc::c_ulong = 0x2403;
 
-/// `struct perf_event_attr`.  Not in the libc crate, so it is spelled out here.
-/// `size` lets the kernel cope with the fields it does not know about, so this
-/// only has to be a prefix-compatible layout, not an exact copy of today's.
+/// `struct perf_event_attr`; not in the libc crate.  `size` makes this only have
+/// to be prefix-compatible with the kernel's, not an exact copy.
 #[repr(C)]
 #[derive(Default)]
 struct PerfEventAttr {
@@ -111,9 +35,8 @@ struct PerfEventAttr {
     sample_period: u64,
     sample_type: u64,
     read_format: u64,
-    /// Bitfield. Bit 0 is `disabled`; we start disabled and enable around the
-    /// syscall we care about.  `exclude_kernel` is deliberately NOT set: the
-    /// BPF program runs in kernel context, so excluding it would count nothing.
+    /// Bit 0 is `disabled`.  `exclude_kernel` must stay unset: the BPF program
+    /// runs in kernel context, so excluding it would count nothing.
     flags: u64,
     wakeup_events: u32,
     bp_type: u32,
@@ -133,12 +56,9 @@ struct PerfEventAttr {
     config3: u64,
 }
 
-/// A hardware counter scoped to *this thread* (pid=0, cpu=-1).
-///
-/// Per-thread rather than per-CPU on purpose: `prog_test_run` runs the program
-/// in our own thread's syscall context, so a thread-scoped counter captures
-/// exactly the work we asked for and nothing else that happens to land on the
-/// same core.
+/// A hardware counter scoped to this thread (pid=0), not to a CPU:
+/// `prog_test_run` runs the program in our own thread's syscall context, so this
+/// counts exactly our work and nothing else landing on the same core.
 struct PerfCounter {
     fd: i32,
 }
@@ -244,48 +164,24 @@ struct Args {
     #[arg(long, default_value = "verdict")]
     profile: Profile,
 
-    /// Threads, each pinned to its own CPU, all hammering the same maps.
-    ///
-    /// This is the only way to see contention, and contention is most of what
-    /// is left to win on the fast path.  A single thread cannot observe a
-    /// shared LRU-list lock or a cache line bouncing between cores: those cost
-    /// nothing until two CPUs want the line at once.  Run 1 and N and compare
-    /// -- a contention fix leaves the 1-thread number alone and drops the
-    /// N-thread one.
+    /// Threads, each pinned to its own CPU, all driving the same maps.
     #[arg(long, default_value_t = 1)]
     threads: usize,
 
-    /// shared: every thread drives the SAME 5-tuple, so all CPUs hit one
-    /// verdict-cache entry and its counters -- the elephant-flow case, and what
-    /// makes the atomics on the verdict entry ping-pong a cache line.
-    ///
-    /// distinct: every thread drives its own 5-tuple, so the CPUs contend on
-    /// the map's LRU list rather than on one entry -- which is what
-    /// BPF_F_NO_COMMON_LRU is about.
-    ///
-    /// They stress different things. Measuring the wrong one will make a real
-    /// fix look like nothing.
+    /// shared: all threads drive one 5-tuple (contends on the verdict entry).
+    /// distinct: each thread its own (contends on the map's LRU list).
     #[arg(long, default_value = "shared")]
     flows: FlowMode,
 
-    /// Program invocations per round.  The kernel divides its own elapsed time
-    /// by this, so a large value is what drives the measurement's precision.
+    /// Program invocations per round.
     #[arg(long, default_value_t = 2_000_000)]
     repeat: u32,
 
-    /// Measurement rounds within one load of the BPF object.  Rounds are cheap
-    /// but *correlated* — they share the maps, the JIT'd code and its page
-    /// placement — so their spread is not the measurement's uncertainty.  They
-    /// exist to median away scheduler interference, nothing more.
+    /// Measurement rounds within one load of the BPF object.
     #[arg(long, default_value_t = 5)]
     rounds: u32,
 
-    /// Times to tear the datapath down and load it again, re-measuring from
-    /// scratch.  THIS is the unit of repetition that matters: the same program
-    /// measured across two loads varies by several percent (different map
-    /// pages, different JIT placement), while rounds within a single load agree
-    /// to well under one.  Trusting the round spread reports a 3% nothing as a
-    /// win — which this tool did, before this existed.
+    /// Teardown-and-reload cycles.  Spread across these is the reported error bar.
     #[arg(long, default_value_t = 5)]
     reloads: u32,
 
@@ -293,20 +189,16 @@ struct Args {
     #[arg(long, default_value_t = 64)]
     pkt_size: usize,
 
-    /// Decoy dst prefixes installed alongside the matching rule, to give the
-    /// inner LPM trie a realistic population rather than a single entry.
+    /// Decoy dst prefixes installed alongside the matching rule.
     #[arg(long, default_value_t = 64)]
     rules: u32,
 
-    /// Interface index used as `ctx->ingress_ifindex`.  The kernel insists this
-    /// names a real netdev, but never sends anything: 1 (loopback) always
-    /// exists, so by default the bench touches nothing on the system.
+    /// Interface index used as `ctx->ingress_ifindex`.  The kernel requires a
+    /// real netdev here but never sends anything; 1 (lo) always exists.
     #[arg(long, default_value_t = 1)]
     ifindex: u32,
 
-    /// CPU to pin the measuring thread to.  The kernel runs the program on
-    /// whichever CPU calls in, so without this the scheduler picks and the
-    /// numbers wander between cores of different thermal/boost state.
+    /// First CPU to pin to.
     #[arg(long, default_value_t = 0)]
     cpu: usize,
 
@@ -369,10 +261,8 @@ impl Profile {
 struct Result_ {
     label: String,
     profile: String,
-    /// Program tag: a hash of the JITed instructions, so it changes if and only
-    /// if the datapath changed.  Two runs of two builds is the entire point of
-    /// this tool, and forgetting to rebuild otherwise yields a beautifully
-    /// precise comparison of a binary against itself.
+    /// Hash of the JITed instructions: changes iff the datapath changed, which
+    /// is how a forgotten rebuild gets caught.
     prog_tag: Option<String>,
     cpu_model: Option<String>,
     kernel: Option<String>,
@@ -486,23 +376,17 @@ fn main() -> Result<()> {
         .map(|t| build_packet(&args, thread_sport(args.flows, t)))
         .collect::<Result<_>>()?;
 
-    if Counters::open().is_none() {
-        eprintln!(
-            "  WARNING: this CPU exposes no hardware cycle counter (perf_event_open failed).\n\
-             \x20          Falling back to ns/pkt, which moves with the core clock -- on a box\n\
-             \x20          with turbo that is several percent of drift between runs, biased\n\
-             \x20          against whichever build you measured second."
-        );
-    }
     let have_cycles = Counters::open().is_some();
+    if !have_cycles {
+        eprintln!("  WARNING: perf_event_open failed; no cycle counter, falling back to ns/pkt");
+    }
 
     let mut reloads: Vec<Sample> = Vec::with_capacity(args.reloads as usize);
     let mut last: Option<(u32, PathEvidence, Option<String>)> = None;
 
     for reload in 0..args.reloads {
-        // Start from bare metal every time: a reload that reused the pins would
-        // hand back the same maps at the same addresses, which is one of the
-        // things we are trying to vary across samples.
+        // Reusing the pins would hand back the same maps at the same addresses,
+        // which is one of the things a reload exists to vary.
         BpfManager::cleanup_pinned_state();
 
         let mut mgr = BpfManager::new().context("load BPF programs")?;
@@ -615,15 +499,10 @@ fn main() -> Result<()> {
 
 /// One BPF_PROG_TEST_RUN call.  Returns (verdict, per-packet sample).
 ///
-/// The kernel times the loop itself and hands back `duration` already divided
-/// by `repeat`, so the syscall's own cost (a microsecond or so, next to a
-/// program that runs in tens of nanoseconds) amortises to nothing.  Timing this
-/// from userspace instead would measure the syscall.
-///
-/// The cycle counters bracket the whole syscall, so they *do* include its
-/// entry, the xdp_buff setup and the page allocation -- once, spread across
-/// `repeat` invocations.  At the default repeat that is a rounding error, which
-/// is the other reason repeat wants to be large.
+/// The kernel hands back `duration` already divided by `repeat`.  The cycle
+/// counters bracket the whole syscall, so they also catch its entry and the
+/// xdp_buff setup -- once, amortised across `repeat`.  Both are reasons to keep
+/// `repeat` large.
 fn prog_run(
     prog_fd: i32,
     pkt: &[u8],
@@ -679,28 +558,18 @@ fn prog_run(
     ))
 }
 
-/// One round: every thread hammers the program on its own CPU, all at once.
+/// One round: every thread runs the program on its own CPU, all at once.
 ///
-/// The threads must overlap in time or there is no contention to measure, so
-/// they rendezvous on a barrier and only then enter the syscall.  Without that,
-/// a thread that started early finishes its million invocations before the
-/// others arrive, and each one effectively runs alone -- which is precisely the
-/// uncontended measurement we already have, dressed up as a parallel one.
+/// The threads must overlap in time or there is no contention to measure, hence
+/// the barrier: without it an early thread finishes its million invocations
+/// before the others arrive and each effectively runs alone.
 ///
-/// Each thread's counters are its own (perf is per-thread, and the threads are
-/// pinned to different CPUs).  The returned sample is the mean per-packet cost
-/// across threads: total cycles over total packets, which is what "what does a
-/// packet cost when N cores are doing this at once" means.
+/// The returned sample is the mean per-packet cost across threads.
 /// Refuse a CPU set that puts two threads on the SMT siblings of one physical
-/// core.
-///
-/// This is the nastiest confound in the whole tool.  Siblings share the core's
-/// execution units, so two threads on them do not contend on our maps -- they
-/// contend on the CPU itself, and cycles/pkt roughly doubles.  That looks
-/// *exactly* like the map contention we are hunting, and it would credit a
-/// contention "fix" with an improvement it never made.  On this box CPU 0's
-/// sibling is CPU 8, not CPU 1, so `--threads 8` is fine and `--threads 9`
-/// silently is not -- which no one would guess from the numbers.
+/// core: siblings share execution units, so cycles/pkt roughly doubles for
+/// reasons that are nothing to do with our maps, and it looks exactly like the
+/// map contention being measured.  Sibling numbering is not adjacent (here CPU
+/// 0 pairs with CPU 8), so the bad case is not guessable from the CPU indices.
 fn check_no_smt_siblings(cpu_base: usize, threads: usize) -> Result<()> {
     let mut seen: HashMap<String, usize> = HashMap::new();
     for t in 0..threads {
@@ -756,19 +625,14 @@ fn run_round(
                 let pkt = &pkts[t];
                 let core = cores.get(args.cpu + t).copied();
                 scope.spawn(move || {
-                    // Pin first: perf counters and the BPF program both follow
-                    // the thread, and an unpinned thread would wander onto a
-                    // core another thread is already saturating.
+                    // Pin before opening the counters: perf_event_open(pid=0)
+                    // attaches to the calling thread.
                     let pinned = core.map(core_affinity::set_for_current).unwrap_or(false);
-                    // Per-thread, after pinning: perf_event_open(pid=0) attaches
-                    // to the calling thread.
                     let counters = Counters::open();
 
-                    // Every thread MUST reach the barrier, including one that is
-                    // about to fail -- bailing out (or panicking) before it
-                    // leaves the others blocked here forever.  That is exactly
-                    // how an out-of-range core index turned into a hang instead
-                    // of an error.  Carry the failure past the barrier instead.
+                    // Every thread must reach the barrier, including one about
+                    // to fail: bailing out before it leaves the others blocked
+                    // here forever.  Carry the failure past it instead.
                     barrier.wait();
 
                     if !pinned {
@@ -898,15 +762,8 @@ fn bench_verdict_key(ifindex: u32) -> FlowVerdictKey {
     key
 }
 
-/// Install the policy the packet is measured against.
-///
-/// The decoys matter: an inner dst trie holding one entry is not the structure
-/// the field runs, and a change to `dst_lpm_value`'s layout is precisely a
-/// change to how that trie is walked.  Benchmarking against a one-entry trie
-/// would flatter it.
-///
-/// The action on the matching rule is what selects the profile, and it is not
-/// cosmetic — see the comments below.
+/// Install the policy the packet is measured against.  The action on the
+/// matching rule is what selects the profile -- see the `match` below.
 fn install_policy(mgr: &mut BpfManager, args: &Args) -> Result<()> {
     mgr.set_default_action(PolicyAction::Pass, Direction::Ingress, args.ifindex)?;
 
@@ -935,26 +792,18 @@ fn install_policy(mgr: &mut BpfManager, args: &Args) -> Result<()> {
         ..Default::default()
     };
     match args.profile {
-        // A pure PASS rule is *cacheable*: the first packet walks the trie and
-        // xdp_policy_write_verdict then seeds flow_verdict_cache, so every
-        // subsequent packet on the same 5-tuple short-circuits on the hit.
-        // Replaying one packet therefore measures the cache hit, which is
-        // exactly the steady-state cost of a flow in the field.
+        // A pure PASS rule is cacheable, so the datapath seeds the verdict cache
+        // itself and every packet after the first hits it.
         Profile::Verdict => {
             rule.set_actions(&[(PolicyAction::Pass, 0, ActionParams::None)]);
         }
         // A LOG action clears the datapath's `cacheable` flag (actions.h), so
-        // this flow is deliberately never cached and every packet re-walks the
-        // two-level LPM.  That is the only way to make a once-per-flow cost
-        // repeat often enough to measure: there is no runtime switch to turn
-        // the verdict cache off.
-        //
-        // The cost of LOG itself is one rule_stats lookup and a timestamp
-        // compare -- the rate limit keeps it from emitting a ringbuf event more
-        // than once a second.  It inflates the absolute ns/pkt a little, and it
-        // is identical in both builds of an A/B, so it cannot manufacture or
-        // hide a delta in the trie walk.  Absolute numbers from this profile
-        // are "LPM walk + LOG bookkeeping", not "LPM walk".
+        // the flow is never cached and every packet re-walks the LPM.  That is
+        // the only way to make a once-per-flow cost repeat: there is no runtime
+        // switch to disable the verdict cache.  LOG's own cost (a rule_stats
+        // lookup and a timestamp compare; the rate limit keeps it off the
+        // ringbuf) is in the absolute number, but identical in both halves of
+        // an A/B.
         Profile::Policy => {
             rule.set_actions(&[
                 (
@@ -970,10 +819,9 @@ fn install_policy(mgr: &mut BpfManager, args: &Args) -> Result<()> {
     }
     mgr.add_policy_rule_v4(&src_key, &dst_key, &rule, Direction::Ingress)?;
 
-    // The maps are pinned and outlive the process, so a verdict seeded by an
-    // earlier run is still sitting there.  Left in place it would short-circuit
-    // the LPM walk the policy profile exists to measure -- and it never expires
-    // (POLICY_VERDICT_EXPIRES_NS == 0), so it would not age out on its own.
+    // Pins outlive the process, and a policy-seeded verdict never expires
+    // (POLICY_VERDICT_EXPIRES_NS == 0), so a stale one would sit here
+    // short-circuiting the very LPM walk the policy profile measures.
     let key = bench_verdict_key(args.ifindex);
     let _ = mgr.delete_flow_verdict(&key, Direction::Ingress);
 
@@ -994,14 +842,11 @@ fn check_path(res: &Result_) -> Vec<String> {
     let e = &res.path_evidence;
 
     if e.rx_packets == 0 {
-        problems.push(
-            "the program counted no received packets -- it is not running the path we think".into(),
-        );
+        problems.push("rx_packets = 0".into());
     }
     if e.parse_errors > 0 {
         problems.push(format!(
-            "{} parse errors: the synthetic packet is malformed, so the program bailed \
-             early and this measures the parse failure path",
+            "parse_errors = {} (malformed packet)",
             e.parse_errors
         ));
     }
@@ -1015,9 +860,7 @@ fn check_path(res: &Result_) -> Vec<String> {
         "verdict" => {
             if e.verdict_pass_packets < nearly_all {
                 problems.push(format!(
-                    "profile=verdict but only {} of {} packets hit the verdict cache -- the \
-                     flow is not being served from the cache, so this measured the policy \
-                     path instead",
+                    "only {} of {} packets hit the verdict cache (measured the policy path)",
                     e.verdict_pass_packets, e.rx_packets
                 ));
             }
@@ -1025,15 +868,13 @@ fn check_path(res: &Result_) -> Vec<String> {
         "policy" => {
             if e.verdict_pass_packets > 0 {
                 problems.push(format!(
-                    "profile=policy but {} packets hit the verdict cache: the flow is being \
-                     cached, so this measured the cache hit and not the LPM walk it claims",
+                    "{} packets hit the verdict cache (measured the cache hit, not the LPM walk)",
                     e.verdict_pass_packets
                 ));
             }
             if e.policy_matches < nearly_all {
                 problems.push(format!(
-                    "profile=policy but only {} of {} packets matched a rule -- the rest fell \
-                     through to the default action without walking the L4 rules",
+                    "only {} of {} packets matched a rule (rest hit the default action)",
                     e.policy_matches, e.rx_packets
                 ));
             }
@@ -1107,14 +948,6 @@ fn print_result(res: &Result_, args: &Args) {
         pct(res.stdev_ns, res.median_ns)
     );
     println!();
-    if res.have_cycles {
-        println!("  Read cycles/pkt, not ns/pkt. The core clock moves with thermal and power");
-        println!("  state, and `cargo build` between an A and a B run heats it -- so ns is");
-        println!("  biased against whichever build you measured second. Cycles are not.");
-    }
-    println!("  min/max/spread are across reloads, not rounds: rounds within one load share");
-    println!("  maps and JIT placement, so their agreement flatters the real uncertainty.");
-    println!();
 
     let problems = check_path(res);
     if problems.is_empty() {
@@ -1125,28 +958,11 @@ fn print_result(res: &Result_, args: &Args) {
             res.path_evidence.verdict_pass_packets
         );
     } else {
-        println!("  path      WRONG PATH -- these numbers do not mean what they say:");
+        println!("  path      WRONG PATH:");
         for p in &problems {
             println!("            - {p}");
         }
     }
-    println!();
-    if res.config.threads == 1 {
-        println!("  note      ONE thread: nothing here can contend. A shared LRU list lock or a");
-        println!("            cache line bouncing between cores costs nothing until two CPUs");
-        println!("            want it at once, so a contention fix (BPF_F_NO_COMMON_LRU, the");
-        println!("            verdict-counter atomics) will correctly read as zero. Re-run with");
-        println!("            --threads N to see those. This number is the uncontended floor.");
-    } else {
-        println!(
-            "  note      {} threads on the same maps, so contention IS in this number.",
-            res.config.threads
-        );
-        println!("            Compare against a --threads 1 run to see how much of the cost is");
-        println!("            contention rather than the program itself.");
-    }
-    println!("            Each thread replays one packet, so its own maps stay hot in L1 --");
-    println!("            cache-footprint effects under many flows still need the packet rig.");
     println!();
 }
 
@@ -1182,33 +998,30 @@ fn compare(path_a: &str, path_b: &str) -> Result<()> {
     println!("  A = {path_a}  {}", a.label);
     println!("  B = {path_b}  {}", b.label);
     println!("  profile: {}", a.profile);
-    println!();
 
     if a.cpu_model != b.cpu_model {
-        println!("  WARNING: different CPUs; ns/pkt is not comparable across them.\n");
+        println!(
+            "  WARNING: different CPUs (A: {:?}, B: {:?})",
+            a.cpu_model, b.cpu_model
+        );
     }
-    // Forgetting to rebuild between runs produces a flawlessly precise
-    // comparison of one build against itself, and every column then reads
-    // "noise" for the most boring possible reason.
+    // Forgetting to rebuild between runs yields a flawlessly precise comparison
+    // of one build against itself, and every column then reads "noise".
     if a.prog_tag.is_some() && a.prog_tag == b.prog_tag {
         println!(
-            "  WARNING: A and B are the SAME program (tag {}).",
+            "  WARNING: A and B are the same program (tag {}); rebuild and re-run B",
             a.prog_tag.as_deref().unwrap_or("?")
         );
-        println!("           These two files measure one build against itself; any delta");
-        println!("           below is noise. Rebuild and re-run B.\n");
     }
     for (name, res) in [("A", &a), ("B", &b)] {
         for p in check_path(res) {
-            println!("  WARNING: {name} took the wrong path: {p}\n");
+            println!("  WARNING: {name} wrong path: {p}");
         }
     }
-
     if !a.have_cycles || !b.have_cycles {
-        println!("  WARNING: no cycle counter in at least one run, so the verdict below rests");
-        println!("           on ns/pkt -- which tracks the core clock, and therefore the CPU's");
-        println!("           thermal state, not the program. Treat a small delta as unproven.\n");
+        println!("  WARNING: no cycle counter in at least one run; verdict rests on ns/pkt");
     }
+    println!();
 
     println!(
         "  {:<20} {:>10} {:>10} {:>10}   verdict",
@@ -1271,13 +1084,6 @@ fn compare(path_a: &str, path_b: &str) -> Result<()> {
         }
     );
 
-    println!();
-    println!("  'noise'  within the combined reload-to-reload spread of the two runs;");
-    println!("           raise --reloads before believing it.");
-    if a.have_cycles && b.have_cycles {
-        println!("  ns/pkt is informational only -- cycles/pkt is the metric that survives a");
-        println!("  CPU that changes speed between the two runs.");
-    }
     println!();
     Ok(())
 }
@@ -1500,7 +1306,7 @@ mod tests {
                 parse_errors: 3,
             },
         );
-        assert!(check_path(&r).iter().any(|p| p.contains("parse errors")));
+        assert!(check_path(&r).iter().any(|p| p.contains("parse_errors")));
     }
 
     #[test]
