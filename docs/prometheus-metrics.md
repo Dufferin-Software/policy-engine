@@ -152,7 +152,7 @@ interval (default 15 s) all panels will show data.
 
 | Dashboard file | Use with | Description |
 |---|---|---|
-| `engine-data-plane.json` | Standalone mode | Per-node traffic, policy actions, protocol breakdown, latency, QUIC |
+| `engine-data-plane.json` | Standalone mode | Per-node traffic, policy actions, protocol breakdown, QUIC |
 | `fleet-data-plane.json` | Fleet mode | Fleet overview, node status, cert expiry, per-node traffic, rule counts |
 | `controller-events.json` | Fleet mode | Controller event/alert pipeline (Prometheus) + REST drill-in (requires Infinity plugin) |
 
@@ -250,18 +250,6 @@ Labels: `version` (e.g. `1`, `Q046`)
 
 Ingress only; egress always produces empty output.  Versions with zero counts
 are omitted.
-
-### Packet processing time
-
-Labels: `direction` (`ingress` | `egress`), `quantile` (`0.5` | `0.9` | `0.99`)
-
-| Metric | Type | Description |
-|---|---|---|
-| `policy_engine_processing_time_ns` | summary | Processing time percentile (ns) |
-| `policy_engine_processing_time_ns_count` | summary | Total packet samples in histogram |
-
-Pre-computed percentiles derived from the 64-bucket log₂ histogram recorded by
-the BPF programs.  Values are `NaN` when no samples have been recorded.
 
 ### Uptime
 

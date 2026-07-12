@@ -16,14 +16,6 @@ const GET_INTERFACES = gql`
 const GET_PERFORMANCE_STATS = gql`
   query GetPerformanceStats($interface: String!, $direction: GqlDirection!) {
     performanceStats(interface: $interface, direction: $direction) {
-      timing {
-        p50Ns
-        p95Ns
-        p99Ns
-        p999Ns
-        totalSamples
-        buckets
-      }
       protoStats {
         protocol
         name
@@ -42,15 +34,6 @@ const GET_PERFORMANCE_STATS = gql`
   }
 `
 
-interface TimingStats {
-  p50Ns: number
-  p95Ns: number
-  p99Ns: number
-  p999Ns: number
-  totalSamples: number
-  buckets: number[]
-}
-
 interface ProtoStat {
   protocol: number
   name: string
@@ -59,7 +42,6 @@ interface ProtoStat {
 }
 
 interface PerformanceStats {
-  timing: TimingStats
   protoStats: ProtoStat[]
   l3Stats: ProtoStat[]
   rxBytesPerSec: number
@@ -72,13 +54,6 @@ interface PerfData {
 
 interface InterfacesData {
   interfaces: { interface: string; direction: string }[]
-}
-
-function fmtNs(ns: number): string {
-  if (ns === 0) return '—'
-  if (ns < 1_000) return `${ns} ns`
-  if (ns < 1_000_000) return `${(ns / 1_000).toFixed(1)} µs`
-  return `${(ns / 1_000_000).toFixed(2)} ms`
 }
 
 function fmtBps(bps: number): string {
@@ -123,7 +98,6 @@ export function PerformancePanel() {
   })
 
   const perf = data?.performanceStats
-  const timing = perf?.timing
   const proto = (perf?.protoStats ?? [])
     .filter((p) => p.packets > 0)
     .sort((a, b) => b.packets - a.packets)
@@ -203,43 +177,6 @@ export function PerformancePanel() {
                 </div>
               </div>
             </div>
-          </div>
-
-          {/* Processing time */}
-          <div>
-            <h3 className="text-xs uppercase tracking-wider text-gray-500 mb-3">
-              BPF Processing Time
-              {timing && timing.totalSamples > 0 && (
-                <span className="ml-2 text-gray-600 normal-case">
-                  ({fmtNum(timing.totalSamples)} samples)
-                </span>
-              )}
-            </h3>
-            {!timing || timing.totalSamples === 0 ? (
-              <p className="text-sm text-gray-500">No timing data yet.</p>
-            ) : (
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-left text-xs text-gray-500 border-b border-gray-700">
-                    <th className="pb-1 pr-4 font-medium">Percentile</th>
-                    <th className="pb-1 text-right font-medium">Latency</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-700/40">
-                  {[
-                    { label: 'p50', ns: timing.p50Ns },
-                    { label: 'p95', ns: timing.p95Ns },
-                    { label: 'p99', ns: timing.p99Ns },
-                    { label: 'p99.9', ns: timing.p999Ns },
-                  ].map(({ label, ns }) => (
-                    <tr key={label} className="text-gray-300">
-                      <td className="py-1.5 pr-4 font-mono text-xs text-gray-400">{label}</td>
-                      <td className="py-1.5 text-right font-mono text-xs">{fmtNs(ns)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
           </div>
 
           {/* L3 protocol breakdown */}

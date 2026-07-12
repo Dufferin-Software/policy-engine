@@ -853,12 +853,6 @@ impl PolicyService {
         self.bpf_ops.get_global_stats(ifindex, direction)
     }
 
-    /// Get processing-time histogram (64 buckets, summed across CPUs)
-    pub fn get_processing_time_hist(&mut self, direction: Direction) -> Result<Vec<u64>> {
-        self.ensure_direction_loaded(direction)?;
-        self.bpf_ops.get_processing_time_hist(direction)
-    }
-
     /// Get per-protocol packet/byte stats (256 entries, summed across CPUs)
     pub fn get_proto_stats(
         &mut self,

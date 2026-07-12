@@ -627,11 +627,10 @@ struct proto_stats {
 
 /*
  * Bucket counts for the stats arrays embedded in struct global_stats.
- * Keep in sync with L3_BUCKETS / QUIC_SLOTS / HIST_BUCKETS in src/types.rs.
+ * Keep in sync with L3_BUCKETS / QUIC_SLOTS in src/types.rs.
  */
-#define L3_PROTO_BUCKETS 5   /* 0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other */
-#define QUIC_STATS_SLOTS 4   /* 0=unused, 1=v1, 2=v2, 3=other QUIC */
-#define PROC_HIST_BUCKETS 64 /* log2(ns) processing-time buckets */
+#define L3_PROTO_BUCKETS 5 /* 0=IPv4, 1=IPv6, 2=ARP, 3=MPLS, 4=Other */
+#define QUIC_STATS_SLOTS 4 /* 0=unused, 1=v1, 2=v2, 3=other QUIC */
 
 /* Per-IP-protocol counter slots.  A dedicated slot per tracked protocol plus
  * a catch-all; ip_proto_to_slot() maps the packet's protocol number to a
@@ -652,12 +651,12 @@ struct proto_stats {
 /*
  * Global statistics per interface.
  *
- * The l3[]/quic[]/proc_hist[] arrays used to live in standalone PERCPU_ARRAY
- * maps (per_l3_stats, quic_stats, processing_time_hist and their tc_
- * mirrors).  They are embedded here so the datapath updates them through the
- * global_stats pointer it already holds instead of paying one map lookup
- * each per packet.  This also scopes them per-interface; userspace sums
- * across interfaces to reproduce the old global view.
+ * The l3[]/quic[] arrays used to live in standalone PERCPU_ARRAY maps
+ * (per_l3_stats, quic_stats and their tc_ mirrors).  They are embedded here so
+ * the datapath updates them through the global_stats pointer it already holds
+ * instead of paying one map lookup each per packet.  This also scopes them
+ * per-interface; userspace sums across interfaces to reproduce the old global
+ * view.
  */
 struct global_stats {
   __u64 rx_packets;
@@ -689,42 +688,9 @@ struct global_stats {
   __u64 urpf_drop_bytes;                     /* Bytes dropped by the uRPF reverse-path check */
   struct proto_stats l3[L3_PROTO_BUCKETS];   /* per-L3-protocol counters */
   struct proto_stats quic[QUIC_STATS_SLOTS]; /* per-QUIC-version (XDP only) */
-  __u64 proc_hist[PROC_HIST_BUCKETS];        /* log2 ns processing-time histogram */
   struct proto_stats proto[IP_PROTO_SLOTS];  /* per-IP-protocol counters,
                                                 indexed by IP_PROTO_SLOT_* */
 } __attribute__((packed));
-
-/*
- * Integer log2 helper for histogram bucket assignment.
- * Returns floor(log2(v)), or 0 for v == 0.
- */
-static __always_inline __u32 log2_u64(__u64 v) {
-  __u32 r = 0;
-  if (v >= (1ULL << 32)) {
-    v >>= 32;
-    r += 32;
-  }
-  if (v >= (1ULL << 16)) {
-    v >>= 16;
-    r += 16;
-  }
-  if (v >= (1ULL << 8)) {
-    v >>= 8;
-    r += 8;
-  }
-  if (v >= (1ULL << 4)) {
-    v >>= 4;
-    r += 4;
-  }
-  if (v >= (1ULL << 2)) {
-    v >>= 2;
-    r += 2;
-  }
-  if (v >= (1ULL << 1)) {
-    r += 1;
-  }
-  return r;
-}
 
 /*
  * Update the per-L3-protocol counters embedded in global_stats, bucketed by
@@ -809,26 +775,6 @@ static __always_inline void update_l4_proto_stats(struct global_stats *stats,
   __u32 slot = ip_proto_to_slot(protocol);
   stats->proto[slot].packets++;
   stats->proto[slot].bytes += pkt_len;
-}
-
-/*
- * Record elapsed processing time into the log2-ns histogram embedded in
- * global_stats.  The _at variant takes a caller-provided 'now' so paths that
- * already read the clock don't pay a second bpf_ktime_get_ns() call.
- */
-static __always_inline void record_proc_time_at(struct global_stats *stats,
-                                                __u64 t0, __u64 now) {
-  if (!stats)
-    return;
-  __u32 slot = log2_u64(now - t0);
-  if (slot > PROC_HIST_BUCKETS - 1)
-    slot = PROC_HIST_BUCKETS - 1;
-  stats->proc_hist[slot]++;
-}
-
-static __always_inline void record_proc_time(struct global_stats *stats,
-                                             __u64 t0) {
-  record_proc_time_at(stats, t0, bpf_ktime_get_ns());
 }
 
 /*

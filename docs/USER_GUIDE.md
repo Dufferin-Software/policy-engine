@@ -800,7 +800,7 @@ Panels:
 - **Interfaces** — attach/detach XDP and TC programs
 - **Rules** — add, list, delete rules with full field support
 - **Statistics** — per-interface and per-rule counters
-- **Performance** — processing time histogram, bandwidth, protocol breakdown
+- **Performance** — bandwidth, protocol breakdown
 - **Event Stream** — real-time BPF event feed
 - **Inspect (IPS)** — enable/disable Suricata, deploy rules _(IPS package only)_
 - **FIB Forwarding** — toggle XDP forwarding
@@ -847,7 +847,7 @@ managedRules(direction: GqlDirection!)  # TTL/scheduled rules
 fibForwarding                           # FIB forwarding status (bool)
 flowExportStatus                        # IPFIX config + active flows
 inspectStatus                           # Suricata mode + veth info
-performanceStats(interface, direction)  # histogram + proto breakdown
+performanceStats(interface, direction)  # bandwidth + proto breakdown
 auditLog(limit: Int)
 ```
 

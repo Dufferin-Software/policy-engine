@@ -2184,7 +2184,7 @@ impl BpfManager {
     }
 
     /// Sum global_stats across all interface slots and CPUs for a direction.
-    /// Backs the l3/quic/proc_hist getters, which report engine-wide totals
+    /// Backs the l3/quic/proto getters, which report engine-wide totals
     /// for counters that are tracked per-interface inside struct global_stats.
     fn sum_global_stats(&self, direction: Direction) -> Result<GlobalStats> {
         let mut total_stats = GlobalStats::default();
@@ -2214,12 +2214,6 @@ impl BpfManager {
         }
 
         Ok(total_stats)
-    }
-
-    /// Get processing-time histogram buckets (64 entries, summed across CPUs
-    /// and interfaces)
-    pub fn get_processing_time_hist(&self, direction: Direction) -> Result<Vec<u64>> {
-        Ok(self.sum_global_stats(direction)?.proc_hist.to_vec())
     }
 
     /// Get per-protocol packet/byte stats (256 entries, summed across CPUs
@@ -3846,10 +3840,6 @@ impl crate::traits::BpfOperations for BpfManager {
 
     fn get_flow_verdict_count(&self, direction: Direction) -> Result<u64> {
         BpfManager::get_flow_verdict_count(self, direction)
-    }
-
-    fn get_processing_time_hist(&self, direction: Direction) -> Result<Vec<u64>> {
-        BpfManager::get_processing_time_hist(self, direction)
     }
 
     fn get_proto_stats(&self, direction: Direction) -> Result<Vec<crate::types::ProtoStats>> {

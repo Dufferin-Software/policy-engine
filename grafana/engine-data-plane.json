@@ -762,82 +762,6 @@
       }
     },
     {
-      "id": 13,
-      "title": "BPF packet processing time (ns)",
-      "type": "timeseries",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "pe-prometheus"
-      },
-      "gridPos": {
-        "x": 0,
-        "y": 80,
-        "w": 18,
-        "h": 8
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "pe-prometheus"
-          },
-          "expr": "policy_engine_processing_time_ns{quantile=\"0.5\",hostname=~\"$hostname\"}",
-          "legendFormat": "{{instance}} {{direction}} p50"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "pe-prometheus"
-          },
-          "expr": "policy_engine_processing_time_ns{quantile=\"0.9\",hostname=~\"$hostname\"}",
-          "legendFormat": "{{instance}} {{direction}} p90"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "pe-prometheus"
-          },
-          "expr": "policy_engine_processing_time_ns{quantile=\"0.99\",hostname=~\"$hostname\"}",
-          "legendFormat": "{{instance}} {{direction}} p99"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ns"
-        }
-      }
-    },
-    {
-      "id": 27,
-      "title": "BPF processing sample count",
-      "type": "timeseries",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "pe-prometheus"
-      },
-      "gridPos": {
-        "x": 18,
-        "y": 80,
-        "w": 6,
-        "h": 8
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "pe-prometheus"
-          },
-          "expr": "rate(policy_engine_processing_time_ns_count{hostname=~\"$hostname\"}[1m])",
-          "legendFormat": "{{instance}} {{direction}}"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "pps"
-        }
-      }
-    },
-    {
       "id": 14,
       "title": "QUIC packets/sec (ingress)",
       "type": "timeseries",
@@ -847,7 +771,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 88,
+        "y": 80,
         "w": 12,
         "h": 8
       },
@@ -889,7 +813,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 88,
+        "y": 80,
         "w": 12,
         "h": 8
       },

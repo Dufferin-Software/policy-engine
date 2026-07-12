@@ -711,52 +711,6 @@
       }
     },
     {
-      "id": 17,
-      "title": "BPF processing latency (ns)",
-      "type": "timeseries",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "pe-prometheus"
-      },
-      "gridPos": {
-        "x": 0,
-        "y": 52,
-        "w": 18,
-        "h": 8
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "pe-prometheus"
-          },
-          "expr": "policy_engine_processing_time_ns{quantile=\"0.5\",hostname=~\"$hostname\"}",
-          "legendFormat": "{{hostname}} {{direction}} p50"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "pe-prometheus"
-          },
-          "expr": "policy_engine_processing_time_ns{quantile=\"0.9\",hostname=~\"$hostname\"}",
-          "legendFormat": "{{hostname}} {{direction}} p90"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "pe-prometheus"
-          },
-          "expr": "policy_engine_processing_time_ns{quantile=\"0.99\",hostname=~\"$hostname\"}",
-          "legendFormat": "{{hostname}} {{direction}} p99"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ns"
-        }
-      }
-    },
-    {
       "id": 18,
       "title": "Last Seen \u2014 seconds ago",
       "type": "bargauge",
@@ -765,7 +719,7 @@
         "uid": "pe-prometheus"
       },
       "gridPos": {
-        "x": 18,
+        "x": 0,
         "y": 52,
         "w": 6,
         "h": 8

@@ -134,20 +134,16 @@ struct {
  * XDP use independent PERCPU_ARRAY maps.
  */
 struct tc_pkt_meta {
-  struct flow_key flow; /* 40 bytes */
-  __u32 pkt_len;        /* 4  bytes */
-  __u16 l4_off;         /* 2  bytes */
-  __u8 sni_count;       /* 1  byte  — number of valid entries in sni_pending */
-  __u8 sni_idx;         /* 1  byte  — next entry for tc_sni_inspect to check */
-  __u8 sni_seen;        /* 1  byte  — non-zero once match_sni_in_packet parsed a
-                                       ClientHello (sni_result != 0).  Gates the
-                                       no-match PASS verdict write so TCP SYNs
-                                       and other non-TLS segments don't poison
-                                       the cache before the real CH arrives. */
-  __u8 _sni_pad[5];     /* explicit padding so the layout is obvious — t0 below
-                           is 8-byte aligned regardless of compiler choice */
-  __u64
-      t0;                                             /* 8  bytes — packet start timestamp for processing-time histogram */
+  struct flow_key flow;                               /* 40 bytes */
+  __u32 pkt_len;                                      /* 4  bytes */
+  __u16 l4_off;                                       /* 2  bytes */
+  __u8 sni_count;                                     /* 1  byte  — number of valid entries in sni_pending */
+  __u8 sni_idx;                                       /* 1  byte  — next entry for tc_sni_inspect to check */
+  __u8 sni_seen;                                      /* 1  byte  — non-zero once match_sni_in_packet parsed a
+                                                                     ClientHello (sni_result != 0).  Gates the
+                                                                     no-match PASS verdict write so TCP SYNs
+                                                                     and other non-TLS segments don't poison
+                                                                     the cache before the real CH arrives. */
   struct sni_pending_entry sni_pending[MAX_L4_RULES]; /* 8 × 80 = 640 bytes */
   /* Flow cache tail call fields — written by TC_FLOW_CACHE_TAIL_CALL, read by tc_flow_cache_update */
   __u32 fc_verdict; /* TC return code to pass through */
@@ -439,8 +435,8 @@ tc_policy_write_verdict(const struct flow_key *flow, __u32 action,
  * Check the flow verdict cache for a cached PASS/DROP decision.
  *
  * Returns the TC verdict (TC_ACT_OK / TC_ACT_SHOT) on a live cache hit, having
- * already updated the relevant counters and recorded timing, or -1 when there
- * is no usable cached decision and the caller should continue to policy lookup.
+ * already updated the relevant counters, or -1 when there is no usable cached
+ * decision and the caller should continue to policy lookup.
  *
  * On a hit, *rule_id_out is set to the verdict's originating rule_id (0 for
  * default / SNI / IPS verdicts) so the caller can attribute the packet in the
@@ -449,7 +445,7 @@ tc_policy_write_verdict(const struct flow_key *flow, __u32 action,
 static __always_inline int
 tc_check_flow_verdict_cache(struct global_stats *gs,
                             const struct flow_key *flow, __u32 ifindex,
-                            __u32 pkt_len, __u64 t0, __u64 *rule_id_out) {
+                            __u32 pkt_len, __u64 *rule_id_out) {
   struct flow_verdict *fv = tc_verdict_lookup(flow, ifindex);
   if (!fv)
     return -1;
@@ -478,8 +474,6 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
     if (fv->rule_id && gs)
       gs->policy_matches++;
     *rule_id_out = fv->rule_id;
-    /* Reuse 'now' already read above — avoids an extra clock call */
-    record_proc_time_at(gs, t0, now);
     return TC_ACT_SHOT;
   } else if (fv->action == ACTION_PASS) {
     /* Cached PASS verdict: flow previously inspected, pass through. */
@@ -494,7 +488,6 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
     if (fv->rule_id && gs)
       gs->policy_matches++;
     *rule_id_out = fv->rule_id;
-    record_proc_time_at(gs, t0, now);
     return TC_ACT_OK;
   }
 
@@ -516,11 +509,10 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
  */
 static __noinline int
 tc_flow_verdict_cache_check(struct global_stats *gs,
-                            const struct flow_key *flow,
-                            __u64 ifindex_pktlen, __u64 t0,
+                            const struct flow_key *flow, __u64 ifindex_pktlen,
                             __u64 *rule_id_out) {
   return tc_check_flow_verdict_cache(gs, flow, (__u32)(ifindex_pktlen >> 32),
-                                     (__u32)ifindex_pktlen, t0, rule_id_out);
+                                     (__u32)ifindex_pktlen, rule_id_out);
 }
 
 /*
@@ -538,7 +530,7 @@ tc_flow_verdict_cache_check(struct global_stats *gs,
 static __always_inline int
 tc_apply_l4_rules(struct __sk_buff *ctx, struct global_stats *gs,
                   struct dst_lpm_value *policy, struct flow_key *flow_key,
-                  __u64 t0, __u32 pkt_len, const __u8 *pkt_src_mac,
+                  __u64 now_ns, __u32 pkt_len, const __u8 *pkt_src_mac,
                   const __u8 *pkt_dst_mac, struct tc_pkt_meta *meta,
                   __u64 *fc_rule_id, __u8 *cacheable) {
   __u8 cnt = policy->count;
@@ -556,11 +548,11 @@ tc_apply_l4_rules(struct __sk_buff *ctx, struct global_stats *gs,
           check_mac_rule_tc(pkt_src_mac, pkt_dst_mac, rule->mac_match_flags,
                             rule->rule_id)) {
         if (rule->sni_match_type == SNI_MATCH_NONE) {
-          tc_update_rule_stats(rule->rule_id, pkt_len, t0);
+          tc_update_rule_stats(rule->rule_id, pkt_len, now_ns);
           if (*fc_rule_id == 0)
             *fc_rule_id = rule->rule_id;
-          int v =
-              tc_process_rule_actions(ctx, gs, rule, flow_key, t0, cacheable);
+          int v = tc_process_rule_actions(ctx, gs, rule, flow_key, now_ns,
+                                          cacheable);
           if (v == TC_ACT_SHOT) {
             *fc_rule_id = rule->rule_id; /* override with DROP rule */
             dropped = 1;
@@ -593,13 +585,12 @@ tc_apply_l4_rules(struct __sk_buff *ctx, struct global_stats *gs,
  */
 static __always_inline void
 tc_fill_sni_meta(struct tc_pkt_meta *meta, const struct flow_key *flow_key,
-                 __u32 pkt_len, int l4_off, __u64 t0) {
+                 __u32 pkt_len, int l4_off) {
   __builtin_memcpy(&meta->flow, flow_key, sizeof(*flow_key));
   meta->pkt_len = pkt_len;
   meta->l4_off = (__u16)l4_off;
   meta->sni_idx = 0;
   meta->sni_seen = 0;
-  meta->t0 = t0;
 }
 
 SEC("tc")
@@ -608,7 +599,6 @@ int tc_policy_egress(struct __sk_buff *ctx) {
   struct dst_lpm_value *policy;
   __u32 pkt_len = ctx->len;
   __u32 zero = 0;
-  __u64 t0 = bpf_ktime_get_ns();
   __u64 tc_fc_rule_id = 0; /* rule_id for flow cache: first matching rule */
 
   /* Hoist the stats pointer — one lookup for the whole path.  The inspect
@@ -678,7 +668,6 @@ int tc_policy_egress(struct __sk_buff *ctx) {
     l4_off = 0;
   } else if (l4_off < 0) {
     /* Non-IP traffic or malformed packet on egress — pass through */
-    record_proc_time(gs, t0);
     return TC_ACT_OK;
   }
 
@@ -690,13 +679,11 @@ int tc_policy_egress(struct __sk_buff *ctx) {
    *
    * A hit must still exit through TC_FLOW_CACHE_TAIL_CALL: returning the
    * verdict directly here would skip per-flow IPFIX accounting for every
-   * post-first packet of a cached flow (timing is already recorded by
-   * tc_check_flow_verdict_cache, and tc_flow_cache_update does not record
-   * it again). */
+   * post-first packet of a cached flow. */
   {
     __u64 fv_rule_id = 0;
     int cached_verdict = tc_flow_verdict_cache_check(
-        gs, &flow_key, ((__u64)ctx->ifindex << 32) | pkt_len, t0, &fv_rule_id);
+        gs, &flow_key, ((__u64)ctx->ifindex << 32) | pkt_len, &fv_rule_id);
     if (cached_verdict >= 0) {
 #ifdef SURICATA_IPS
       /* A cached PASS must keep mirroring flows that are marked for
@@ -719,6 +706,13 @@ int tc_policy_egress(struct __sk_buff *ctx) {
   /* Clone egress packets belonging to flows being inspected on ingress. */
   tc_clone_inspected_flow(ctx, &flow_key);
 #endif /* SURICATA_IPS */
+
+  /* Everything from here down is the verdict-cache miss path, and all of it
+   * needs a timestamp: rule last_seen/log rate limiting, INSPECT TTLs, and the
+   * verdict-cache expiry seeded below.  Read the clock once, here, rather than
+   * at program entry — the paths above (non-IP pass-through and, above all, the
+   * cache hit, which is the steady-state fast path) then never touch it. */
+  __u64 now_ns = bpf_ktime_get_ns();
 
   /* Lookup policy (two-level LPM: src prefix → dst prefix → L4 rules).
    * Scoped per-interface by skb->ifindex (TC egress interface). */
@@ -746,7 +740,7 @@ int tc_policy_egress(struct __sk_buff *ctx) {
     /* Cleared by tc_apply_l4_rules if any matched rule carries a LOG / INSPECT
      * / TAIL_CALL action; gates the policy verdict seed below. */
     __u8 cacheable = 1;
-    int final_verdict = tc_apply_l4_rules(ctx, gs, policy, &flow_key, t0,
+    int final_verdict = tc_apply_l4_rules(ctx, gs, policy, &flow_key, now_ns,
                                           pkt_len, pkt_src_mac, pkt_dst_mac,
                                           meta, &tc_fc_rule_id, &cacheable);
     __u8 dropped = (final_verdict == TC_ACT_SHOT);
@@ -758,27 +752,24 @@ int tc_policy_egress(struct __sk_buff *ctx) {
        * flow metadata the inspection program needs.  sni_count is preserved
        * (set by the rule loop above); the rest is written here on the cold
        * SNI path only. */
-      tc_fill_sni_meta(meta, &flow_key, pkt_len, l4_off, t0);
+      tc_fill_sni_meta(meta, &flow_key, pkt_len, l4_off);
       /* Branch by L4 protocol so the same `sni` rule field triggers TLS-
-       * ClientHello matching on TCP and QUIC-Initial detection on UDP.
-       * Timing is recorded by the inspection tail-call program. */
+       * ClientHello matching on TCP and QUIC-Initial detection on UDP. */
       if (flow_key.protocol == PROTO_UDP)
         bpf_tail_call(ctx, &tc_dispatcher, TC_DISPATCHER_QUIC_SLOT);
       else
         bpf_tail_call(ctx, &tc_dispatcher, TC_DISPATCHER_SNI_SLOT);
       /* Tail call slot not loaded — fail open */
-      record_proc_time(gs, t0);
       update_action_stats(gs, ACTION_PASS);
       TC_FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, tc_fc_rule_id, ACTION_PASS, TC_ACT_OK);
     }
 
-    record_proc_time(gs, t0);
     /* Seed the policy verdict cache so subsequent packets on this 5-tuple
      * short-circuit at the verdict-cache check instead of re-walking the
      * two-level LPM trie.  Only for cacheable flows (pure PASS/DROP). */
     if (cacheable)
       tc_policy_write_verdict(&flow_key, dropped ? ACTION_DROP : ACTION_PASS,
-                              tc_fc_rule_id, t0, ctx->ifindex);
+                              tc_fc_rule_id, now_ns, ctx->ifindex);
     TC_FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, tc_fc_rule_id,
                             final_verdict == TC_ACT_SHOT ? ACTION_DROP : ACTION_PASS,
                             final_verdict);
@@ -792,9 +783,8 @@ int tc_policy_egress(struct __sk_buff *ctx) {
      * on subsequent packets.  Flushed on any rule change. */
     tc_policy_write_verdict(&flow_key,
                             action == ACTION_DROP ? ACTION_DROP : ACTION_PASS, 0,
-                            t0, ctx->ifindex);
+                            now_ns, ctx->ifindex);
 
-    record_proc_time(gs, t0);
     switch (action) {
     case ACTION_DROP:
       TC_FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, 0, ACTION_DROP, TC_ACT_SHOT);
@@ -849,10 +839,9 @@ int tc_sni_inspect(struct __sk_buff *ctx) {
      * this packet (sni_seen).  Otherwise this is a pre-handshake segment
      * (TCP SYN, ACK, etc.) and caching PASS here would poison the cache
      * before the real CH arrives. */
-    __u64 sni_now = bpf_ktime_get_ns();
     if (meta->sni_seen)
-      tc_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now, ctx->ifindex);
-    record_proc_time_at(gs, meta->t0, sni_now);
+      tc_sni_write_verdict(&meta->flow, ACTION_PASS, bpf_ktime_get_ns(),
+                           ctx->ifindex);
     TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, TC_ACT_OK);
   }
 
@@ -985,7 +974,6 @@ int tc_sni_inspect(struct __sk_buff *ctx) {
 
     if (final_verdict == TC_ACT_SHOT) {
       tc_sni_write_verdict(&meta->flow, ACTION_DROP, sni_now, ctx->ifindex);
-      record_proc_time_at(gs, meta->t0, sni_now);
       TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, rule_id, ACTION_DROP, TC_ACT_SHOT);
     }
     goto next_rule;
@@ -999,12 +987,9 @@ next_rule:
    * Seed the verdict cache only if at least one rule's parser proved this
    * packet carries a real ClientHello (see comment at the top of the function
    * for why pre-CH segments must not poison the cache). */
-  {
-    __u64 sni_now = bpf_ktime_get_ns();
-    if (meta->sni_seen)
-      tc_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now, ctx->ifindex);
-    record_proc_time_at(gs, meta->t0, sni_now);
-  }
+  if (meta->sni_seen)
+    tc_sni_write_verdict(&meta->flow, ACTION_PASS, bpf_ktime_get_ns(),
+                         ctx->ifindex);
   TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, TC_ACT_OK);
 }
 
@@ -1111,7 +1096,6 @@ int tc_quic_initial_inspect(struct __sk_buff *ctx) {
    * inspection completes. */
 
 pass_through:
-  record_proc_time(gs, meta->t0);
   TC_FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, TC_ACT_OK);
 }
 

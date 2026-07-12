@@ -215,10 +215,6 @@ pub trait BpfOperations: Send + Sync {
     /// Get count of active flow verdicts
     fn get_flow_verdict_count(&self, direction: Direction) -> Result<u64>;
 
-    /// Get processing-time histogram buckets (64 entries, summed across CPUs
-    /// and interfaces; tracked per-interface inside `GlobalStats::proc_hist`)
-    fn get_processing_time_hist(&self, direction: Direction) -> Result<Vec<u64>>;
-
     /// Get per-protocol packet/byte stats (256 entries, summed across CPUs)
     fn get_proto_stats(&self, direction: Direction) -> Result<Vec<ProtoStats>>;
 

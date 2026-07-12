@@ -67,51 +67,6 @@ impl BandwidthTracker {
     }
 }
 
-/// Windows the cumulative processing-time histogram between polls, mirroring
-/// BandwidthTracker: percentiles are computed over the samples that arrived
-/// since the previous poll of the same (interface, direction).  The raw
-/// histogram is cumulative since attach, so its percentiles stop moving once
-/// enough history accumulates; the per-poll delta reflects current behavior.
-pub struct TimingTracker {
-    #[allow(clippy::type_complexity)]
-    last: Mutex<HashMap<(String, u8), (Vec<u64>, TimingStatsOutput)>>,
-}
-
-impl TimingTracker {
-    fn new() -> Self {
-        Self {
-            last: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Compute timing stats over the histogram delta since the previous poll.
-    /// The first poll falls back to the cumulative histogram; an idle window
-    /// (no new samples, or counters that went backwards after a stats clear)
-    /// returns the previous poll's stats so the display holds its last known
-    /// value instead of flickering between windowed and lifetime numbers.
-    async fn sample(&self, iface: &str, direction: u8, current: &[u64]) -> TimingStatsOutput {
-        let mut map = self.last.lock().await;
-        let key = (iface.to_string(), direction);
-        let out = match map.get(&key) {
-            Some((prev_hist, prev_out)) => {
-                let delta: Vec<u64> = current
-                    .iter()
-                    .zip(prev_hist.iter())
-                    .map(|(c, p)| c.saturating_sub(*p))
-                    .collect();
-                if delta.iter().any(|&v| v > 0) {
-                    compute_timing_stats(&delta)
-                } else {
-                    prev_out.clone()
-                }
-            }
-            None => compute_timing_stats(current),
-        };
-        map.insert(key, (current.to_vec(), out.clone()));
-        out
-    }
-}
-
 /// Shared state for the GraphQL server
 pub struct AppState {
     pub service: Arc<Mutex<PolicyService>>,
@@ -130,7 +85,6 @@ pub struct AppState {
     #[cfg(feature = "suricata")]
     pub alert_stream_tx: broadcast::Sender<SuricataAlert>,
     pub bandwidth_tracker: BandwidthTracker,
-    pub timing_tracker: TimingTracker,
     pub affinity: Arc<AffinityPlan>,
     /// Tracks pre-attach NIC IRQ/RPS affinity snapshots so they can be restored on detach.
     pub nic_affinity_store: Mutex<NicAffinityStore>,
@@ -158,7 +112,6 @@ impl AppState {
             eve_consumer: Arc::new(Mutex::new(eve_consumer)),
             alert_stream_tx: broadcast::channel(1024).0,
             bandwidth_tracker: BandwidthTracker::new(),
-            timing_tracker: TimingTracker::new(),
             affinity,
             nic_affinity_store: Mutex::new(NicAffinityStore::new()),
             audit_logger: Arc::new(NoopAuditLogger),
@@ -173,7 +126,6 @@ impl AppState {
             service: Arc::new(Mutex::new(service)),
             start_time: Instant::now(),
             bandwidth_tracker: BandwidthTracker::new(),
-            timing_tracker: TimingTracker::new(),
             affinity,
             nic_affinity_store: Mutex::new(NicAffinityStore::new()),
             audit_logger: Arc::new(NoopAuditLogger),
@@ -811,7 +763,7 @@ impl QueryRoot {
         })
     }
 
-    /// Get performance statistics (timing histogram, per-protocol stats, bandwidth)
+    /// Get performance statistics (per-protocol stats, L3 breakdown, bandwidth)
     async fn performance_stats<'ctx>(
         &self,
         ctx: &Context<'ctx>,
@@ -838,16 +790,10 @@ impl QueryRoot {
             .sample(&interface, dir_byte, global.rx_bytes, global.tx_bytes)
             .await;
 
-        // Timing / proto / L3 breakdowns are read from the per-interface
-        // GlobalStats fetched above, so the panel is scoped to the selected
-        // interface.  (These used to come from the direction-global getters,
-        // which made every interface display identical values.)
-        // Percentiles are windowed over the samples since the previous poll
-        // (see TimingTracker) rather than the cumulative lifetime histogram.
-        let timing = state
-            .timing_tracker
-            .sample(&interface, dir_byte, &global.proc_hist)
-            .await;
+        // Proto / L3 breakdowns are read from the per-interface GlobalStats
+        // fetched above, so the panel is scoped to the selected interface.
+        // (These used to come from the direction-global getters, which made
+        // every interface display identical values.)
 
         // proto[] is slot-indexed; IP_PROTO_SLOT_PROTOS maps a slot back to
         // its IP protocol number (slot 0 = catch-all, reported as 0/"Other").
@@ -884,7 +830,6 @@ impl QueryRoot {
             .collect();
 
         Ok(PerformanceStatsOutput {
-            timing,
             proto_stats,
             l3_stats,
             rx_bytes_per_sec: rx_bps,
@@ -2236,72 +2181,10 @@ impl MutationRoot {
 
 fn empty_perf_stats() -> PerformanceStatsOutput {
     PerformanceStatsOutput {
-        timing: TimingStatsOutput {
-            p50_ns: 0,
-            p95_ns: 0,
-            p99_ns: 0,
-            p999_ns: 0,
-            total_samples: 0,
-            buckets: vec![0; crate::types::HIST_BUCKETS],
-        },
         proto_stats: vec![],
         l3_stats: vec![],
         rx_bytes_per_sec: 0,
         tx_bytes_per_sec: 0,
-    }
-}
-
-fn compute_timing_stats(hist: &[u64]) -> TimingStatsOutput {
-    let total: u64 = hist.iter().sum();
-    let buckets: Vec<i64> = hist.iter().map(|&v| v as i64).collect();
-
-    if total == 0 {
-        return TimingStatsOutput {
-            p50_ns: 0,
-            p95_ns: 0,
-            p99_ns: 0,
-            p999_ns: 0,
-            total_samples: 0,
-            buckets,
-        };
-    }
-
-    // Linear interpolation within the log2 bucket that contains the target
-    // rank.  Bucket k holds samples in [2^k, 2^(k+1)) ns (bucket 0 holds
-    // 0-1 ns); returning only the bucket midpoint would snap every percentile
-    // onto the 1.5*2^k lattice, making p50/p95/p99 read as exact multiples of
-    // each other and hiding movement within a bucket.
-    let percentile = |frac: f64| -> i64 {
-        let target = ((total as f64 * frac).ceil() as u64).max(1);
-        let mut cumulative = 0u64;
-        for (k, &count) in hist.iter().enumerate() {
-            if count == 0 {
-                continue;
-            }
-            let before = cumulative;
-            cumulative += count;
-            if cumulative >= target {
-                let (lo, width) = if k == 0 {
-                    (0.0, 2.0)
-                } else {
-                    let lo = (1u64 << k) as f64;
-                    (lo, lo)
-                };
-                let into = (target - before) as f64 / count as f64;
-                return (lo + into * width).round() as i64;
-            }
-        }
-        // Unreachable when total > 0; keep a sane upper-bucket fallback.
-        1i64 << (hist.len().saturating_sub(1).min(62))
-    };
-
-    TimingStatsOutput {
-        p50_ns: percentile(0.50),
-        p95_ns: percentile(0.95),
-        p99_ns: percentile(0.99),
-        p999_ns: percentile(0.999),
-        total_samples: total as i64,
-        buckets,
     }
 }
 
@@ -3155,97 +3038,6 @@ mod tests {
         let (rx_bps, tx_bps) = tracker.sample("eth0", 0, 1000, 500).await;
         assert_eq!(rx_bps, 0);
         assert_eq!(tx_bps, 0);
-    }
-
-    // -------------------------------------------------------------------------
-    // Timing stats: interpolated percentiles + per-poll windowing
-    // -------------------------------------------------------------------------
-
-    /// A histogram concentrated in one bucket must interpolate within it:
-    /// percentiles move through [2^k, 2^(k+1)) instead of all snapping to the
-    /// bucket midpoint (the old behavior that made p50/p95/p99 read as exact
-    /// multiples of each other).
-    #[test]
-    fn timing_percentiles_interpolate_within_bucket() {
-        let mut hist = vec![0u64; 64];
-        hist[8] = 1000; // all samples in [256, 512) ns
-        let t = compute_timing_stats(&hist);
-        assert!(t.p50_ns > 256 && t.p50_ns < 512, "p50 {}", t.p50_ns);
-        assert!(t.p95_ns > t.p50_ns, "p95 {} p50 {}", t.p95_ns, t.p50_ns);
-        assert!(t.p99_ns > t.p95_ns, "p99 {} p95 {}", t.p99_ns, t.p95_ns);
-        assert!(t.p999_ns <= 512, "p999 {}", t.p999_ns);
-        assert_eq!(t.total_samples, 1000);
-    }
-
-    #[test]
-    fn timing_percentiles_span_buckets() {
-        let mut hist = vec![0u64; 64];
-        hist[8] = 90; // [256, 512)
-        hist[10] = 10; // [1024, 2048)
-        let t = compute_timing_stats(&hist);
-        assert!(t.p50_ns > 256 && t.p50_ns < 512, "p50 {}", t.p50_ns);
-        // rank 95 of 100 falls 5/10 into bucket 10 → ~1536
-        assert!(t.p95_ns >= 1024 && t.p95_ns < 2048, "p95 {}", t.p95_ns);
-    }
-
-    #[test]
-    fn timing_empty_histogram_is_all_zero() {
-        let t = compute_timing_stats(&vec![0u64; 64]);
-        assert_eq!(t.p50_ns, 0);
-        assert_eq!(t.p999_ns, 0);
-        assert_eq!(t.total_samples, 0);
-    }
-
-    #[tokio::test]
-    async fn timing_tracker_first_sample_uses_cumulative() {
-        let tracker = TimingTracker::new();
-        let mut hist = vec![0u64; 64];
-        hist[8] = 100;
-        let t = tracker.sample("eth0", 0, &hist).await;
-        assert_eq!(t.total_samples, 100);
-    }
-
-    #[tokio::test]
-    async fn timing_tracker_windows_between_polls() {
-        let tracker = TimingTracker::new();
-        let mut hist = vec![0u64; 64];
-        hist[8] = 1_000_000; // large accumulated history in [256, 512)
-        tracker.sample("eth0", 0, &hist).await;
-
-        // New traffic lands exclusively in bucket 12 [4096, 8192): windowed
-        // percentiles must reflect only the delta, not the lifetime histogram.
-        hist[12] = 50;
-        let t = tracker.sample("eth0", 0, &hist).await;
-        assert_eq!(t.total_samples, 50);
-        assert!(t.p50_ns >= 4096 && t.p50_ns < 8192, "p50 {}", t.p50_ns);
-    }
-
-    #[tokio::test]
-    async fn timing_tracker_idle_window_repeats_last_stats() {
-        let tracker = TimingTracker::new();
-        let mut hist = vec![0u64; 64];
-        hist[8] = 100;
-        tracker.sample("eth0", 0, &hist).await;
-        hist[8] = 200;
-        let active = tracker.sample("eth0", 0, &hist).await;
-        // No new samples since the previous poll → previous window's stats.
-        let idle = tracker.sample("eth0", 0, &hist).await;
-        assert_eq!(idle.total_samples, active.total_samples);
-        assert_eq!(idle.p50_ns, active.p50_ns);
-    }
-
-    #[tokio::test]
-    async fn timing_tracker_interfaces_independent() {
-        let tracker = TimingTracker::new();
-        let mut h1 = vec![0u64; 64];
-        h1[8] = 100;
-        let mut h2 = vec![0u64; 64];
-        h2[12] = 10;
-        tracker.sample("eth0", 0, &h1).await;
-        let t2 = tracker.sample("eth1", 0, &h2).await;
-        // eth1's first sample is its own cumulative histogram, not eth0's.
-        assert_eq!(t2.total_samples, 10);
-        assert!(t2.p50_ns >= 4096, "p50 {}", t2.p50_ns);
     }
 
     // -------------------------------------------------------------------------

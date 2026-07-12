@@ -70,22 +70,12 @@ pub struct QuicMetrics {
     pub bytes: u64,
 }
 
-/// Pre-computed latency percentiles for one direction.
-pub struct LatencyMetrics {
-    pub direction: &'static str,
-    pub p50_ns: i64,
-    pub p90_ns: i64,
-    pub p99_ns: i64,
-    pub total_samples: u64,
-}
-
 /// All metric values gathered from the policy service in a single lock window.
 pub struct MetricsSnapshot {
     pub interfaces: Vec<InterfaceMetrics>,
     pub rules: Vec<RuleMetrics>,
     pub protos: Vec<ProtoMetrics>,
     pub l3_protos: Vec<ProtoMetrics>,
-    pub latencies: Vec<LatencyMetrics>,
     pub quic: Vec<QuicMetrics>,
     pub ethertype_stats: Vec<EthertypeMetrics>,
     pub uptime_secs: u64,
@@ -268,37 +258,6 @@ impl MetricsFormatter for PrometheusFormatter {
         let _ = writeln!(buf, "# TYPE policy_engine_uptime_seconds gauge");
         let _ = writeln!(buf, "policy_engine_uptime_seconds {}", snap.uptime_secs);
 
-        if !snap.latencies.is_empty() {
-            let _ = writeln!(buf, "# TYPE policy_engine_processing_time_ns summary");
-            for lm in &snap.latencies {
-                let dir = lm.direction;
-                if lm.total_samples == 0 {
-                    // No samples yet: emit NaN so Grafana shows "no data" rather
-                    // than a flat zero line that obscures other series.
-                    for q in ["0.5", "0.9", "0.99"] {
-                        let _ = writeln!(
-                            buf,
-                            "policy_engine_processing_time_ns{{direction=\"{}\",quantile=\"{}\"}} NaN",
-                            dir, q
-                        );
-                    }
-                } else {
-                    for (q, val) in [("0.5", lm.p50_ns), ("0.9", lm.p90_ns), ("0.99", lm.p99_ns)] {
-                        let _ = writeln!(
-                            buf,
-                            "policy_engine_processing_time_ns{{direction=\"{}\",quantile=\"{}\"}} {}",
-                            dir, q, val
-                        );
-                    }
-                }
-                let _ = writeln!(
-                    buf,
-                    "policy_engine_processing_time_ns_count{{direction=\"{}\"}} {}",
-                    dir, lm.total_samples
-                );
-            }
-        }
-
         buf.into_bytes()
     }
 }
@@ -306,48 +265,6 @@ impl MetricsFormatter for PrometheusFormatter {
 // ---------------------------------------------------------------------------
 // Snapshot collection
 // ---------------------------------------------------------------------------
-
-/// Return interface index for a named interface, or 0 if not found.
-fn bucket_ns(k: usize) -> i64 {
-    if k == 0 {
-        return 1;
-    }
-    let lo = 1u64 << k;
-    let mid = lo + (lo >> 1);
-    mid as i64
-}
-
-fn hist_percentile(hist: &[u64], total: u64, frac: f64) -> i64 {
-    let target = (total as f64 * frac).ceil() as u64;
-    let mut cumulative = 0u64;
-    for (k, &count) in hist.iter().enumerate() {
-        cumulative += count;
-        if cumulative >= target {
-            return bucket_ns(k);
-        }
-    }
-    bucket_ns(hist.len().saturating_sub(1))
-}
-
-fn compute_latency_metrics(direction: &'static str, hist: &[u64]) -> LatencyMetrics {
-    let total: u64 = hist.iter().sum();
-    if total == 0 {
-        return LatencyMetrics {
-            direction,
-            p50_ns: 0,
-            p90_ns: 0,
-            p99_ns: 0,
-            total_samples: 0,
-        };
-    }
-    LatencyMetrics {
-        direction,
-        p50_ns: hist_percentile(hist, total, 0.50),
-        p90_ns: hist_percentile(hist, total, 0.90),
-        p99_ns: hist_percentile(hist, total, 0.99),
-        total_samples: total,
-    }
-}
 
 /// Return interface index for a named interface, or 0 if not found.
 fn ifindex_for(name: &str) -> u32 {
@@ -425,7 +342,6 @@ async fn collect_snapshot(state: &AppState) -> MetricsSnapshot {
     let mut rules = Vec::new();
     let mut protos = Vec::new();
     let mut l3_protos = Vec::new();
-    let mut latencies = Vec::new();
     let mut quic = Vec::new();
     let mut ethertype_stats = Vec::new();
 
@@ -542,16 +458,6 @@ async fn collect_snapshot(state: &AppState) -> MetricsSnapshot {
         }
     }
 
-    // Processing-time histograms (one per direction, not per interface)
-    for dir in [Direction::Ingress, Direction::Egress] {
-        if !service.is_direction_loaded(dir) {
-            continue;
-        }
-        if let Ok(hist) = service.get_processing_time_hist(dir) {
-            latencies.push(compute_latency_metrics(dir_label(dir), &hist));
-        }
-    }
-
     // QUIC version stats (ingress only; egress returns empty)
     if service.is_direction_loaded(Direction::Ingress) {
         if let Ok(quic_vec) = service.get_quic_stats(Direction::Ingress) {
@@ -572,7 +478,6 @@ async fn collect_snapshot(state: &AppState) -> MetricsSnapshot {
         rules,
         protos,
         l3_protos,
-        latencies,
         quic,
         ethertype_stats,
         uptime_secs,
@@ -652,7 +557,6 @@ mod tests {
             rules: vec![],
             protos: vec![],
             l3_protos: vec![],
-            latencies: vec![],
             quic: vec![],
             ethertype_stats: vec![],
             uptime_secs: 42,
@@ -679,7 +583,6 @@ mod tests {
             rules: vec![],
             protos: vec![],
             l3_protos: vec![],
-            latencies: vec![],
             quic: vec![],
             ethertype_stats: vec![],
             uptime_secs: 0,
@@ -714,7 +617,6 @@ mod tests {
             rules: vec![],
             protos: vec![],
             l3_protos: vec![],
-            latencies: vec![],
             quic: vec![],
             ethertype_stats: vec![],
             uptime_secs: 0,
@@ -743,7 +645,6 @@ mod tests {
             }],
             protos: vec![],
             l3_protos: vec![],
-            latencies: vec![],
             quic: vec![],
             ethertype_stats: vec![],
             uptime_secs: 0,
@@ -766,7 +667,6 @@ mod tests {
                 bytes: 50000,
             }],
             l3_protos: vec![],
-            latencies: vec![],
             quic: vec![],
             ethertype_stats: vec![],
             uptime_secs: 0,
@@ -799,45 +699,6 @@ mod tests {
     }
 
     #[test]
-    fn latency_metrics_percentiles() {
-        // Histogram: all 1000 samples in bucket 10 (mid = 1536 ns)
-        let mut hist = vec![0u64; 64];
-        hist[10] = 1000;
-        let lm = compute_latency_metrics("ingress", &hist);
-        assert_eq!(lm.p50_ns, 1536);
-        assert_eq!(lm.p90_ns, 1536);
-        assert_eq!(lm.p99_ns, 1536);
-        assert_eq!(lm.total_samples, 1000);
-    }
-
-    #[test]
-    fn prometheus_formatter_latency_metrics() {
-        let formatter = PrometheusFormatter;
-        let mut hist = vec![0u64; 64];
-        hist[10] = 500;
-        hist[15] = 500;
-        let snap = MetricsSnapshot {
-            interfaces: vec![],
-            rules: vec![],
-            protos: vec![],
-            l3_protos: vec![],
-            latencies: vec![compute_latency_metrics("ingress", &hist)],
-            quic: vec![],
-            ethertype_stats: vec![],
-            uptime_secs: 0,
-        };
-        let output = String::from_utf8(formatter.format(&snap)).unwrap();
-        assert!(output.contains("# TYPE policy_engine_processing_time_ns summary"));
-        assert!(output
-            .contains("policy_engine_processing_time_ns{direction=\"ingress\",quantile=\"0.5\"}"));
-        assert!(output
-            .contains("policy_engine_processing_time_ns{direction=\"ingress\",quantile=\"0.99\"}"));
-        assert!(
-            output.contains("policy_engine_processing_time_ns_count{direction=\"ingress\"} 1000")
-        );
-    }
-
-    #[test]
     fn prometheus_formatter_ethertype_metrics() {
         let formatter = PrometheusFormatter;
         let snap = MetricsSnapshot {
@@ -845,7 +706,6 @@ mod tests {
             rules: vec![],
             protos: vec![],
             l3_protos: vec![],
-            latencies: vec![],
             quic: vec![],
             ethertype_stats: vec![EthertypeMetrics {
                 interface: "eth0".to_string(),
@@ -882,7 +742,6 @@ mod tests {
             rules: vec![],
             protos: vec![],
             l3_protos: vec![],
-            latencies: vec![],
             quic: vec![],
             ethertype_stats: vec![],
             uptime_secs: 0,
@@ -910,7 +769,6 @@ mod tests {
             rules: vec![],
             protos: vec![],
             l3_protos: vec![],
-            latencies: vec![],
             quic: vec![],
             ethertype_stats: vec![],
             uptime_secs: 99,

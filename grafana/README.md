@@ -5,7 +5,7 @@ Importable dashboards for the policy engine + controller. Naming is
 
 | File | Title | Datasource(s) | What it shows |
 |------|-------|---------------|---------------|
-| `engine-data-plane.json` | Policy engine — data plane | Prometheus | Single-node BPF/policy metrics (`policy_engine_*`): rx/tx, drops, per-rule stats, processing latency, protocol breakdown. |
+| `engine-data-plane.json` | Policy engine — data plane | Prometheus | Single-node BPF/policy metrics (`policy_engine_*`): rx/tx, drops, per-rule stats, protocol breakdown. |
 | `engine-flows.json` | Policy engine — IPFIX flows | Elasticsearch | IPFIX flow records exported by the engine. Only useful when the engine's IPFIX exporter is wired to an ES sink — see `docs/ipfix-flow-export.md`. |
 | `fleet-data-plane.json` | Controller Fleet Overview | Prometheus | Multi-node view of the same `policy_engine_*` metrics, plus controller-side `fleet_*` (enrollment, online status, cert expiry). Filterable by `$hostname`. |
 | `controller-events.json` | Controller Fleet — events & alerts | Prometheus **+** Infinity | Top section: controller's event pipeline + alert metrics (`event_*`, `alert_*`). Bottom section: REST drill-in into individual events and alert history via `/api/v1/events*` and `/api/v1/alerts/history`. |

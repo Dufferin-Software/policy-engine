@@ -209,20 +209,16 @@ static __noinline __u8 check_mac_rule_xdp(const __u8 *pkt_src,
  * mismatch sni_idx >= sni_count → exhausted, return XDP_PASS
  */
 struct pkt_meta {
-  struct flow_key flow; /* 40 bytes */
-  __u32 pkt_len;        /* 4  bytes */
-  __u16 l4_off;         /* 2  bytes — L4 header offset from start of packet */
-  __u8 sni_count;       /* 1  byte  — number of valid entries in sni_pending */
-  __u8 sni_idx;         /* 1  byte  — next entry for xdp_sni_inspect to check */
-  __u8 sni_seen;        /* 1  byte  — non-zero once match_sni_in_packet parsed a
-                                       ClientHello (sni_result != 0).  Gates the
-                                       no-match PASS verdict write so TCP SYNs
-                                       and other non-TLS segments don't poison
-                                       the cache before the real CH arrives. */
-  __u8 _sni_pad[5];     /* explicit padding so the layout is obvious — t0 below
-                           is 8-byte aligned regardless of compiler choice */
-  __u64
-      t0;                                             /* 8  bytes — packet start timestamp for processing-time histogram */
+  struct flow_key flow;                               /* 40 bytes */
+  __u32 pkt_len;                                      /* 4  bytes */
+  __u16 l4_off;                                       /* 2  bytes — L4 header offset from start of packet */
+  __u8 sni_count;                                     /* 1  byte  — number of valid entries in sni_pending */
+  __u8 sni_idx;                                       /* 1  byte  — next entry for xdp_sni_inspect to check */
+  __u8 sni_seen;                                      /* 1  byte  — non-zero once match_sni_in_packet parsed a
+                                                                     ClientHello (sni_result != 0).  Gates the
+                                                                     no-match PASS verdict write so TCP SYNs
+                                                                     and other non-TLS segments don't poison
+                                                                     the cache before the real CH arrives. */
   __u16 l3_off;                                       /* 2  bytes — L3 header offset (for FIB forwarding in tail calls) */
   __u16 eth_proto;                                    /* 2  bytes — ethertype after VLAN stripping (for FIB forwarding) */
   struct sni_pending_entry sni_pending[MAX_L4_RULES]; /* 8 × 80 = 640 bytes */
@@ -573,11 +569,9 @@ int xdp_sni_inspect(struct xdp_md *ctx) {
      * this packet (sni_seen).  Otherwise this is a pre-handshake segment
      * (TCP SYN, ACK, etc.) and caching PASS here would poison the cache
      * before the real CH arrives. */
-    __u64 sni_now = bpf_ktime_get_ns();
     if (meta->sni_seen)
-      xdp_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now,
+      xdp_sni_write_verdict(&meta->flow, ACTION_PASS, bpf_ktime_get_ns(),
                             ctx->ingress_ifindex);
-    record_proc_time_at(sni_gs, meta->t0, sni_now);
     FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, XDP_PASS);
   }
 
@@ -694,7 +688,6 @@ int xdp_sni_inspect(struct xdp_md *ctx) {
     if (final_verdict == XDP_DROP) {
       xdp_sni_write_verdict(&meta->flow, ACTION_DROP, sni_now,
                             ctx->ingress_ifindex);
-      record_proc_time_at(gs, meta->t0, sni_now);
       FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, rule_id, ACTION_DROP, XDP_DROP);
     }
     goto next_rule;
@@ -708,13 +701,9 @@ next_rule:
    * Seed the verdict cache only if at least one rule's parser proved this
    * packet carries a real ClientHello (see comment at the top of the function
    * for why pre-CH segments must not poison the cache). */
-  {
-    __u64 sni_now = bpf_ktime_get_ns();
-    if (meta->sni_seen)
-      xdp_sni_write_verdict(&meta->flow, ACTION_PASS, sni_now,
-                            ctx->ingress_ifindex);
-    record_proc_time_at(sni_gs, meta->t0, sni_now);
-  }
+  if (meta->sni_seen)
+    xdp_sni_write_verdict(&meta->flow, ACTION_PASS, bpf_ktime_get_ns(),
+                          ctx->ingress_ifindex);
   FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, XDP_PASS);
 }
 
@@ -745,11 +734,6 @@ int xdp_quic_initial_inspect(struct xdp_md *ctx) {
   struct pkt_meta *meta = bpf_map_lookup_elem(&pkt_scratch, &zero);
   if (!meta)
     return XDP_PASS;
-
-  /* For the processing-time histogram at pass_through (replaces the old
-   * standalone histogram map lookup — net-neutral cost). */
-  __u32 q_ifindex = ctx->ingress_ifindex % MAX_INTERFACES;
-  struct global_stats *q_gs = bpf_map_lookup_elem(&global_stats, &q_ifindex);
 
   void *data = (void *)(long)ctx->data;
   const void *data_end = (void *)(long)ctx->data_end;
@@ -856,7 +840,6 @@ int xdp_quic_initial_inspect(struct xdp_md *ctx) {
    * tail-call per packet, which is bounded (a handshake is <100 packets). */
 
 pass_through:
-  record_proc_time(q_gs, meta->t0);
   FLOW_CACHE_TAIL_CALL(ctx, &meta->flow, meta->pkt_len, 0, ACTION_PASS, XDP_PASS);
 }
 
@@ -864,8 +847,8 @@ pass_through:
  * Check the flow verdict cache for a cached PASS/DROP decision.
  *
  * Returns the XDP verdict (XDP_PASS / XDP_DROP) on a live cache hit, having
- * already updated the relevant counters and recorded timing, or -1 when there
- * is no usable cached decision and the caller should continue to policy lookup.
+ * already updated the relevant counters, or -1 when there is no usable cached
+ * decision and the caller should continue to policy lookup.
  *
  * On a hit, *rule_id_out is set to the verdict's originating rule_id (0 for
  * default / SNI / IPS verdicts) so the caller can attribute the packet in the
@@ -874,7 +857,7 @@ pass_through:
 static __always_inline int
 check_flow_verdict_cache(struct global_stats *stats,
                          const struct flow_key *flow, __u32 ifindex,
-                         __u32 pkt_len, __u64 t0, __u64 *rule_id_out) {
+                         __u32 pkt_len, __u64 *rule_id_out) {
   struct flow_verdict *fv = xdp_verdict_lookup(flow, ifindex);
   if (!fv)
     return -1;
@@ -903,8 +886,6 @@ check_flow_verdict_cache(struct global_stats *stats,
     if (fv->rule_id && stats)
       stats->policy_matches++;
     *rule_id_out = fv->rule_id;
-    /* Reuse 'now' already read above — avoids an extra clock call */
-    record_proc_time_at(stats, t0, now);
     return XDP_DROP;
   } else if (fv->action == ACTION_PASS) {
     /* Cached PASS verdict: flow previously inspected and not flagged.
@@ -920,7 +901,6 @@ check_flow_verdict_cache(struct global_stats *stats,
     if (fv->rule_id && stats)
       stats->policy_matches++;
     *rule_id_out = fv->rule_id;
-    record_proc_time_at(stats, t0, now);
     return XDP_PASS;
   }
 
@@ -942,7 +922,7 @@ check_flow_verdict_cache(struct global_stats *stats,
 static __always_inline __u32
 xdp_apply_l4_rules(struct xdp_md *ctx, struct global_stats *stats,
                    struct dst_lpm_value *policy, struct flow_key *flow_key,
-                   __u64 t0, __u32 pkt_len, const __u8 *pkt_src_mac,
+                   __u64 now_ns, __u32 pkt_len, const __u8 *pkt_src_mac,
                    const __u8 *pkt_dst_mac, struct pkt_meta *meta,
                    __u64 *fc_rule_id, __u8 *cacheable) {
   __u8 cnt = policy->count;
@@ -961,11 +941,11 @@ xdp_apply_l4_rules(struct xdp_md *ctx, struct global_stats *stats,
                              rule->rule_id)) {
         if (rule->sni_match_type == SNI_MATCH_NONE) {
           /* Non-SNI rule: apply immediately */
-          update_rule_stats(rule->rule_id, pkt_len, t0);
+          update_rule_stats(rule->rule_id, pkt_len, now_ns);
           if (*fc_rule_id == 0)
             *fc_rule_id = rule->rule_id;
-          __u32 v =
-              process_rule_actions(ctx, stats, rule, flow_key, t0, cacheable);
+          __u32 v = process_rule_actions(ctx, stats, rule, flow_key, now_ns,
+                                         cacheable);
           if (v == XDP_DROP) {
             *fc_rule_id = rule->rule_id; /* override with the DROP rule */
             dropped = 1;
@@ -1001,14 +981,12 @@ xdp_apply_l4_rules(struct xdp_md *ctx, struct global_stats *stats,
  */
 static __always_inline void
 xdp_fill_sni_meta(struct pkt_meta *meta, const struct flow_key *flow_key,
-                  __u32 pkt_len, int l4_off, __u64 t0, int l3_off,
-                  __u16 eth_proto) {
+                  __u32 pkt_len, int l4_off, int l3_off, __u16 eth_proto) {
   __builtin_memcpy(&meta->flow, flow_key, sizeof(*flow_key));
   meta->pkt_len = pkt_len;
   meta->l4_off = (__u16)l4_off;
   meta->sni_idx = 0;
   meta->sni_seen = 0;
-  meta->t0 = t0;
   meta->l3_off = (__u16)l3_off;
   meta->eth_proto = eth_proto;
 }
@@ -1022,7 +1000,6 @@ int xdp_policy_main(struct xdp_md *ctx) {
   __u16 eth_proto = 0;
   void *data = (void *)(long)ctx->data;
   const void *data_end = (void *)(long)ctx->data_end;
-  __u64 t0 = bpf_ktime_get_ns();
   __u64 fc_rule_id = 0; /* rule_id for flow cache: set to the first matching rule */
 
   /* Count ALL ingress packets (including non-IP, BUM, malformed) */
@@ -1044,7 +1021,6 @@ int xdp_policy_main(struct xdp_md *ctx) {
   if ((void *)(eth + 1) > data_end) {
     if (stats)
       stats->parse_errors++;
-    record_proc_time(stats, t0);
     return XDP_PASS;
   }
 
@@ -1062,7 +1038,6 @@ int xdp_policy_main(struct xdp_md *ctx) {
     /* Failed to parse ethertype - treat as parse error */
     if (stats)
       stats->parse_errors++;
-    record_proc_time(stats, t0);
     return XDP_PASS;
   }
 
@@ -1100,7 +1075,6 @@ int xdp_policy_main(struct xdp_md *ctx) {
       update_nonip_sender_stats(ctx->ingress_ifindex, pkt_src_mac, eth_proto);
     }
 
-    record_proc_time(stats, t0);
     return XDP_PASS;
   }
 
@@ -1118,7 +1092,6 @@ int xdp_policy_main(struct xdp_md *ctx) {
   if (xdp_urpf_check(ctx, stats, eth_proto, l3_off, pkt_len)) {
     // todo: we should probably have 2 classes of drop, POLICY_DROP and URPF_DROP.
     update_action_stats(stats, ACTION_DROP);
-    record_proc_time(stats, t0);
     return XDP_DROP;
   }
 
@@ -1127,12 +1100,8 @@ int xdp_policy_main(struct xdp_md *ctx) {
    * source.  A hit short-circuits the policy lookup at XDP line rate. */
   __u64 fv_rule_id = 0;
   int cached_verdict = check_flow_verdict_cache(
-      stats, &flow_key, ctx->ingress_ifindex, pkt_len, t0, &fv_rule_id);
-  /* Timing already recorded by check_flow_verdict_cache on a hit (which
-   * reuses its expiry-check timestamp, avoiding a second ktime call);
-   * recording again here would double-count the packet in the histogram.
-   *
-   * A hit must still exit through FLOW_CACHE_TAIL_CALL: returning the verdict
+      stats, &flow_key, ctx->ingress_ifindex, pkt_len, &fv_rule_id);
+  /* A hit must still exit through FLOW_CACHE_TAIL_CALL: returning the verdict
    * directly here would skip per-flow IPFIX accounting AND the FIB-forwarding
    * chain for every post-first packet of a flow (xdp_flow_cache_update chains
    * to xdp_fib_dispatch for PASS verdicts), stranding cached-PASS traffic in
@@ -1141,6 +1110,13 @@ int xdp_policy_main(struct xdp_md *ctx) {
     FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, fv_rule_id,
                          cached_verdict == XDP_DROP ? ACTION_DROP : ACTION_PASS,
                          cached_verdict);
+
+  /* Everything from here down is the verdict-cache miss path, and all of it
+   * needs a timestamp: rule last_seen/log rate limiting, INSPECT TTLs, and the
+   * verdict-cache expiry seeded below.  Read the clock once, here, rather than
+   * at program entry — the paths above (parse errors, uRPF drop, and above all
+   * the cache hit, which is the steady-state fast path) then never touch it. */
+  __u64 now_ns = bpf_ktime_get_ns();
 
   /* Lookup policy (two-level LPM: src prefix → dst prefix → L4 rules).
    * Scoped per-interface by ctx->ingress_ifindex. */
@@ -1168,9 +1144,9 @@ int xdp_policy_main(struct xdp_md *ctx) {
     /* Cleared by xdp_apply_l4_rules if any matched rule carries a LOG / INSPECT
      * / TAIL_CALL action; gates the policy verdict seed below. */
     __u8 cacheable = 1;
-    __u32 final_verdict = xdp_apply_l4_rules(ctx, stats, policy, &flow_key, t0,
-                                             pkt_len, pkt_src_mac, pkt_dst_mac,
-                                             meta, &fc_rule_id, &cacheable);
+    __u32 final_verdict = xdp_apply_l4_rules(
+        ctx, stats, policy, &flow_key, now_ns, pkt_len, pkt_src_mac,
+        pkt_dst_mac, meta, &fc_rule_id, &cacheable);
     __u8 dropped = (final_verdict == XDP_DROP);
 
     /* If any SNI rules were queued (and no DROP already), tail-call to the
@@ -1185,28 +1161,23 @@ int xdp_policy_main(struct xdp_md *ctx) {
        * flow metadata the inspection program needs.  sni_count is preserved
        * (set by the rule loop above); the rest is written here on the cold
        * SNI path only. */
-      xdp_fill_sni_meta(meta, &flow_key, pkt_len, l4_off, t0, l3_off,
-                        eth_proto);
-      /* Timing is recorded by the inspection tail-call program at its terminal
-       * returns so that the full inspection path is included in the histogram. */
+      xdp_fill_sni_meta(meta, &flow_key, pkt_len, l4_off, l3_off, eth_proto);
       if (flow_key.protocol == PROTO_UDP)
         bpf_tail_call(ctx, &xdp_dispatcher, XDP_DISPATCHER_QUIC_SLOT);
       else
         bpf_tail_call(ctx, &xdp_dispatcher, XDP_DISPATCHER_SNI_SLOT);
       /* Tail call slot not loaded — fail open */
-      record_proc_time(stats, t0);
       update_action_stats(stats, ACTION_PASS);
       FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, fc_rule_id, ACTION_PASS, XDP_PASS);
     }
 
-    record_proc_time(stats, t0);
     /* Seed the policy verdict cache so every subsequent packet on this 5-tuple
      * short-circuits at the verdict-cache check above instead of re-walking the
      * two-level LPM trie.  Only for cacheable flows (pure PASS/DROP); LOG /
      * INSPECT / SNI flows are excluded so they keep re-evaluating. */
     if (cacheable)
       xdp_policy_write_verdict(&flow_key, dropped ? ACTION_DROP : ACTION_PASS,
-                               fc_rule_id, t0, ctx->ingress_ifindex);
+                               fc_rule_id, now_ns, ctx->ingress_ifindex);
     if (final_verdict == XDP_PASS)
       goto fib_and_pass;
     FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, fc_rule_id, ACTION_DROP, final_verdict);
@@ -1220,10 +1191,9 @@ int xdp_policy_main(struct xdp_md *ctx) {
      * walk on subsequent packets.  Flushed on any rule change. */
     xdp_policy_write_verdict(&flow_key,
                              action == ACTION_DROP ? ACTION_DROP : ACTION_PASS,
-                             0, t0, ctx->ingress_ifindex);
+                             0, now_ns, ctx->ingress_ifindex);
 
     /* Return appropriate XDP verdict */
-    record_proc_time(stats, t0);
     switch (action) {
     case ACTION_DROP:
       FLOW_CACHE_TAIL_CALL(ctx, &flow_key, pkt_len, 0, ACTION_DROP, XDP_DROP);

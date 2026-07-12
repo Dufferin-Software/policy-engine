@@ -803,24 +803,6 @@ pub struct ServerFeaturesOutput {
     pub ipfix: bool,
 }
 
-/// Processing-time percentile statistics.
-///
-/// Computed over the packets processed since the previous poll of the same
-/// (interface, direction) — not the cumulative lifetime histogram — so the
-/// values track current behavior.  The first poll reports lifetime stats; an
-/// idle poll window repeats the previous window's values.
-#[derive(SimpleObject, Clone, Debug)]
-pub struct TimingStatsOutput {
-    pub p50_ns: i64,
-    pub p95_ns: i64,
-    pub p99_ns: i64,
-    pub p999_ns: i64,
-    /// Samples in the measured window
-    pub total_samples: i64,
-    /// log2(ns) histogram buckets for the measured window
-    pub buckets: Vec<i64>,
-}
-
 /// Per-protocol traffic statistics
 #[derive(SimpleObject, Clone, Debug)]
 pub struct ProtoStatsOutput {
@@ -833,7 +815,6 @@ pub struct ProtoStatsOutput {
 /// Combined performance statistics output
 #[derive(SimpleObject, Clone, Debug)]
 pub struct PerformanceStatsOutput {
-    pub timing: TimingStatsOutput,
     /// L4 (IP) protocol breakdown — keyed by IP protocol number
     pub proto_stats: Vec<ProtoStatsOutput>,
     /// L3 protocol breakdown — keyed by ethertype (0x0800=IPv4, 0x86DD=IPv6, 0x0806=ARP, 0=Other)
