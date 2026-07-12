@@ -450,9 +450,16 @@ tc_check_flow_verdict_cache(struct global_stats *gs,
   if (!fv)
     return -1;
 
-  __u64 now = bpf_ktime_get_ns();
-  if (fv->expires_ns != 0 && now >= fv->expires_ns)
+  /* Fine clock only when the entry could actually be expiring -- see the
+   * matching comment in xdp_policy.bpf.c's check_flow_verdict_cache.  Policy-
+   * seeded verdicts never expire, so this is the rare case. */
+  if (fv->expires_ns != 0 && bpf_ktime_get_ns() >= fv->expires_ns)
     return -1;
+
+  /* Coarse clock for last_seen_ns: tick granularity is far finer than anything
+   * that reads it (verdict_harvest.rs, flow aging), and it costs a load rather
+   * than an RDTSC. */
+  __u64 now = bpf_ktime_get_coarse_ns();
 
   if (fv->action == ACTION_DROP) {
     __sync_fetch_and_add(&fv->packets, 1);

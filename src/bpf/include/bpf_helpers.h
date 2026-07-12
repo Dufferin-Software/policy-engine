@@ -105,6 +105,13 @@ static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
 static long (*bpf_probe_read)(void *dst, __u32 size,
                               const void *unsafe_ptr) = (void *)4;
 static __u64 (*bpf_ktime_get_ns)(void) = (void *)5;
+/* CLOCK_MONOTONIC, same base as bpf_ktime_get_ns, but read from the timekeeper's
+ * cached value instead of the hardware clock: no RDTSC, just a load.  Granularity
+ * is one timer tick (~1-4 ms), so it is only for timestamps nobody reads at finer
+ * resolution than that -- flow last-seen, aging, second-scale TTLs.  On the
+ * verdict-cache hit path the fine clock cost ~45 cycles/packet (11.6% of it), all
+ * to stamp a field userspace harvests on a 30-second sweep. */
+static __u64 (*bpf_ktime_get_coarse_ns)(void) = (void *)160;
 static long (*bpf_trace_printk)(const char *fmt, __u32 fmt_size,
                                 ...) = (void *)6;
 static __u32 (*bpf_get_prandom_u32)(void) = (void *)7;

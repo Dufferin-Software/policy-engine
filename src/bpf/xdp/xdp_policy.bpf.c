@@ -862,9 +862,21 @@ check_flow_verdict_cache(struct global_stats *stats,
   if (!fv)
     return -1;
 
-  __u64 now = bpf_ktime_get_ns();
-  if (fv->expires_ns != 0 && now >= fv->expires_ns)
+  /* Expiry: only the SNI / INSPECT verdicts carry a TTL.  Every verdict the
+   * plain policy path seeds has expires_ns == POLICY_VERDICT_EXPIRES_NS (0,
+   * never expires), and those are the overwhelming majority of cache entries,
+   * so the fine clock is read only on the rare packet that could actually be
+   * expiring.  It used to be read unconditionally, above this branch. */
+  if (fv->expires_ns != 0 && bpf_ktime_get_ns() >= fv->expires_ns)
     return -1;
+
+  /* last_seen_ns wants a timestamp, not a stopwatch: its only readers are
+   * verdict_harvest.rs (a 30-second sweep, 500 ms rate-limited reads) and flow
+   * aging, none of which can tell one timer tick from another.  The coarse
+   * clock is a load from the timekeeper's cached value rather than an RDTSC,
+   * and on this path the fine one was costing ~45 cycles/packet -- 11.6% of the
+   * whole verdict-cache fast path, spent entirely on precision nobody reads. */
+  __u64 now = bpf_ktime_get_coarse_ns();
 
   if (fv->action == ACTION_DROP) {
     __sync_fetch_and_add(&fv->packets, 1);
