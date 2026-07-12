@@ -42,11 +42,15 @@ fn emit_build_info() {
 
 fn main() {
     emit_build_info();
-    let out_dir =
-        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"))
-            .join("src")
-            .join("bpf")
-            .join(".output");
+
+    // OUT_DIR, not the source tree.  The skeletons are compiled with different
+    // clang flags per feature (-DSURICATA_IPS below), so a single shared path
+    // under src/ makes them a cross-configuration hazard: `cargo build
+    // --all-features` would leave an IPS-compiled skeleton behind, and a later
+    // default build — whose build-script fingerprint is still valid, so this
+    // file never reruns — would link it and silently run the IPS datapath.
+    // OUT_DIR is per-configuration, so each feature set gets its own.
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
 
     std::fs::create_dir_all(&out_dir).unwrap();
 

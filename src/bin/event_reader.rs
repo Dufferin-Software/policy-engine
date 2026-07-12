@@ -17,13 +17,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-// Generated skeletons
-#[path = "../bpf/.output/xdp_policy.skel.rs"]
-mod xdp_policy_skel;
+// Generated skeletons.  OUT_DIR, not the source tree: the skeleton's clang
+// flags depend on the feature set, so a shared path under src/ lets one
+// configuration's build leave its skeleton behind for another's.
+mod xdp_policy_skel {
+    include!(concat!(env!("OUT_DIR"), "/xdp_policy.skel.rs"));
+}
 use xdp_policy_skel::*;
 
-#[path = "../bpf/.output/tc_policy.skel.rs"]
-mod tc_policy_skel;
+mod tc_policy_skel {
+    include!(concat!(env!("OUT_DIR"), "/tc_policy.skel.rs"));
+}
 use tc_policy_skel::*;
 
 // Map names exposed by BPF programs
