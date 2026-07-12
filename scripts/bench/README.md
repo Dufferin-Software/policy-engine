@@ -1,5 +1,128 @@
 # Datapath benchmarking
 
+There are two tools, and they answer different questions. Pick deliberately.
+
+| | `policy-progbench` | `xdp-bench.py` |
+|---|---|---|
+| **question** | did this patch make the *program* cheaper? | what does the *appliance* do? |
+| **method** | `BPF_PROG_TEST_RUN` — the kernel replays one synthetic packet through `xdp_policy_main` in a tight loop | pktgen over a real wire into a real NIC |
+| **needs** | root on one box. No NIC, no generator, no wire. | a TX box, a DUT, and a link fast enough to saturate the DUT |
+| **metric** | cycles/packet | cycles/packet, pps, cache misses |
+| **resolves** | ~1% changes | whatever the rig's noise floor allows |
+| **blind to** | cache/LRU pressure across many flows | small changes — the program is a minority of measured cycles |
+
+**Start with `policy-progbench`.** It is the one that can actually see a few
+percent, it needs no hardware, and every optimisation to the datapath's
+*instructions* shows up in it. Reach for the packet rig when you need to know
+what the box in the field does, or when the change is about cache behaviour
+under many flows — which `progbench` cannot see (it replays one packet, so every
+map stays hot in L1).
+
+Note the rig has its own ceiling: `protectli ↔ fws-2277` is 1GbE, whose 64-byte
+line rate is 1.488 Mpps. No DUT will plateau below that, so `xdp-bench.py`
+cannot currently prove saturation on that link and will say so rather than
+pretend.
+
+---
+
+# `policy-progbench` — per-packet program cost
+
+```bash
+sudo policy-progbench --profile policy -o old.json --label "baseline"
+# ... make the change, cargo build ...
+sudo policy-progbench --profile policy -o new.json --label "SoA dst_lpm_value"
+policy-progbench --compare old.json new.json
+```
+
+## Read cycles/pkt, never ns/pkt
+
+The tool reports both; only cycles means anything across two runs. The core
+clock moves with thermal and power state — this dev laptop ranges 0.8–4.5 GHz —
+and `cargo build` sits between your A run and your B run, heating the CPU. So
+**ns is biased against whichever build you measured second.**
+
+Measured on the same unchanged program, cold vs. after a 45s CPU load:
+
+```
+                  cold (A)      hot (B)      delta
+  cycles/pkt         619.7        623.0      +0.5%   noise
+  ns/pkt             139.0        144.0      +3.6%   <-- pure thermal artifact
+```
+
+A 3.6% "regression" that is nothing but a warm CPU is bigger than most of the
+wins we are chasing. `instructions/pkt` is steadier still (2137.3 vs 2137.4 for
+the same program) and is the sharpest signal for a pure instruction-count change.
+
+## Contention: `--threads` and `--flows`
+
+**A single thread cannot see the things most worth fixing on the fast path.** A
+shared LRU-list lock, or a cache line bouncing between cores, costs nothing at
+all until two CPUs want it at once. Run `--threads 1` and `--threads N` and
+compare: a contention fix leaves the 1-thread number alone and drops the
+N-thread one.
+
+The two flow modes stress different structures, and measuring the wrong one will
+make a real fix look like nothing:
+
+| | what contends | the fix it can see |
+|---|---|---|
+| `--flows shared` | every thread drives the **same** 5-tuple, so all CPUs hit one verdict-cache entry and its counters | the atomics on the verdict entry (cache-line ping-pong, elephant flows) |
+| `--flows distinct` | every thread drives **its own** 5-tuple, so the CPUs contend on the map's LRU list rather than one entry | `BPF_F_NO_COMMON_LRU` |
+
+`--compare` refuses to diff two runs with different `--threads`/`--flows`:
+contention *is* the thing being measured, so a delta across settings says
+nothing about the code.
+
+**One thread per physical core.** The tool refuses a CPU range that puts two
+threads on SMT siblings — they share execution units, so cycles/pkt roughly
+doubles for reasons that have nothing to do with our maps, and it looks exactly
+like the contention you are hunting. On this dev box CPU 0's sibling is CPU 8,
+so `--threads 8` is fine and `--threads 9` is not.
+
+## The two profiles
+
+The datapath **caches its own verdicts**: the first packet of a flow walks the
+LPM trie, then `xdp_policy_write_verdict` seeds `flow_verdict_cache` so every
+later packet on that 5-tuple short-circuits. The profiles are the two sides of
+that.
+
+**`--profile verdict`** — steady state, and the overwhelming majority of packets
+in the field: parse, stats, one LRU hash lookup. Use for anything touching
+`flow_verdict_cache`, `global_stats`, or parsing.
+
+**`--profile policy`** — the two-level LPM walk (src group → dst prefix → L4
+rule), which in production happens once per flow. The only profile that
+exercises `dst_lpm_value` and `l4_rule`. There is no runtime switch to disable
+the verdict cache, so the bench forces the walk to repeat by giving the matching
+rule a rate-limited `LOG` action — the datapath marks `LOG` flows non-cacheable.
+Absolute numbers from this profile are therefore "LPM walk + LOG bookkeeping";
+the LOG cost is identical in both halves of an A/B, so it cannot manufacture or
+hide a delta.
+
+## Sampling
+
+`--reloads` is the unit of repetition that matters, not `--rounds`. Rounds
+within one load of the BPF object share its maps and JIT placement, so they
+agree to well under 1% and *flatter* the real uncertainty. The reported
+min/max/spread are across reloads.
+
+## It checks it measured what it claims
+
+Every run reads back the datapath's own stats counters and refuses to let you
+believe a number that came from the wrong code path — a rule that silently
+failed to match, or a stale cached verdict short-circuiting the LPM walk, would
+otherwise look like a spectacular improvement. It also records the program's
+tag, so comparing a build against itself (forgot to rebuild) is caught rather
+than reported as noise.
+
+`--profile policy` refuses to run if `policy-engine` has XDP attached: the bench
+installs its own rules into the shared pinned maps and would corrupt a live
+policy.
+
+---
+
+# `xdp-bench.py` — the packet rig
+
 `xdp-bench.py` measures the XDP policy engine's **per-packet cost** on real
 hardware, and diffs two builds.
 

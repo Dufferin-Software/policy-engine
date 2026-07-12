@@ -168,6 +168,19 @@ impl BpfManager {
         self.tc_skel.is_some()
     }
 
+    /// Borrow the XDP entry program (`xdp_policy_main`).
+    ///
+    /// Exposed for the BPF_PROG_TEST_RUN microbenchmark (`policy-progbench`),
+    /// which needs the program fd to run the datapath against a synthetic
+    /// packet with no NIC and no traffic generator in the way.  Nothing on the
+    /// serving path should reach for this — attach goes through
+    /// `attach_ingress`.
+    pub fn xdp_main_prog(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.xdp_skel
+            .as_ref()
+            .map(|skel| skel.progs.xdp_policy_main.as_fd())
+    }
+
     /// Whether BPF maps were reused from a previous run's pins.
     ///
     /// `true`  → daemon restart with same BPF binary; kernel maps already hold

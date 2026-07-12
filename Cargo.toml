@@ -82,3 +82,9 @@ path = "src/bin/server.rs"
 [[bin]]
 name = "policy-event-reader"
 path = "src/bin/event_reader.rs"
+
+# Datapath microbenchmark (BPF_PROG_TEST_RUN).  A developer tool, not part of
+# the shipped product — see debian/ for what the packages install.
+[[bin]]
+name = "policy-progbench"
+path = "src/bin/progbench.rs"
