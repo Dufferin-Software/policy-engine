@@ -27,12 +27,104 @@ pretend.
 
 # `policy-progbench` — per-packet program cost
 
+## Running it
+
+It is a dev tool, not part of the shipped packages, so build it from the repo:
+
 ```bash
-sudo policy-progbench --profile policy -o old.json --label "baseline"
-# ... make the change, cargo build ...
-sudo policy-progbench --profile policy -o new.json --label "SoA dst_lpm_value"
-policy-progbench --compare old.json new.json
+cargo build --release --bin policy-progbench
 ```
+
+Needs **root** (it loads BPF and opens perf counters) and a kernel with
+`BPF_PROG_TEST_RUN` — anything current. It creates *nothing* on the system: the
+kernel insists `ctx->ingress_ifindex` names a real netdev, so it uses `lo`, and
+no packet ever leaves the box.
+
+```bash
+# the fast path — what a steady-state packet costs
+sudo ./target/release/policy-progbench --profile verdict
+```
+
+```
+  cpu       11th Gen Intel(R) Core(TM) i7-11850H (pinned to CPU 0)
+  datapath  xdp_policy_main tag=2842fc913203f590
+  threads   1 (CPUs 0..0), shared flow(s)
+  sampling  5 reloads x 5 rounds x 2000000 invocations/thread
+  verdict   XDP_PASS
+
+  metric                   median        min        max   spread
+  -------------------- ---------- ---------- ---------- --------
+  cycles/pkt                328.3      322.5      340.5     2.8%
+  instructions/pkt        1287.3
+  ipc                        3.92
+  ns/pkt                     71.0                           1.4%
+
+  path      confirmed: 5100001 rx, 5100001 policy match(es), 5100000 verdict-cache hit(s)
+```
+
+That `path confirmed` line is not decoration. The tool reads back the datapath's
+own stats counters and tells you whether the packets really took the path the
+profile claims — see [It checks it measured what it claims](#it-checks-it-measured-what-it-claims).
+
+**Stop `policy-engine` first.** The bench installs its own rules into the shared
+pinned maps, so it refuses to run while the service has XDP attached to an
+interface rather than corrupt a live policy:
+
+```bash
+sudo systemctl stop policy-engine
+```
+
+## Comparing two builds
+
+This is the whole point. Save a result, change the code, save another, diff:
+
+```bash
+sudo ./target/release/policy-progbench --profile verdict -o old.json --label baseline
+
+# ... make the datapath change, then:
+cargo build --release --bin policy-progbench
+
+sudo ./target/release/policy-progbench --profile verdict -o new.json --label "coarse clock"
+
+./target/release/policy-progbench --compare old.json new.json   # no root needed
+```
+
+The real diff that produced commit `a16e7e2` (taking the RDTSC off the fast path):
+
+```
+  metric                        A          B      delta   verdict
+  -------------------- ---------- ---------- ----------   --------
+  cycles/pkt                372.7      328.3     -11.9%   better
+  instructions/pkt        1280.3     1287.3      +0.5%
+  ipc                        3.44       3.92
+  ns/pkt                     80.0       71.0     -11.2%   informational
+```
+
+Instructions *up*, cycles *down*, IPC up — the signature of removing a
+serialising instruction rather than removing work.
+
+`--compare` refuses to diff runs with different `--profile`, `--threads` or
+`--flows` (they are different experiments), warns if the two runs loaded the same
+program tag (you forgot to rebuild), and marks anything inside the combined
+run-to-run spread as **`noise`** rather than letting you read a story into it.
+
+## The knobs
+
+| flag | default | what it is for |
+|---|---|---|
+| `--profile verdict\|policy` | `verdict` | which code path — see [The two profiles](#the-two-profiles) |
+| `--threads N` | `1` | CPUs hammering the same maps; the only way to see contention |
+| `--flows shared\|distinct` | `shared` | whether those CPUs collide on one cache entry or on the LRU list |
+| `--repeat N` | `2000000` | program invocations per round |
+| `--rounds N` | `5` | rounds per load (medians away scheduler noise) |
+| `--reloads N` | `5` | full teardown+reload cycles — **this** is the error bar |
+| `--rules N` | `64` | decoy dst prefixes, so the LPM trie isn't a single leaf |
+| `--pkt-size N` | `64` | frame size on the wire |
+| `--cpu N` | `0` | first CPU to pin to |
+| `-o FILE`, `--label` | — | save a result for `--compare` |
+
+A full run takes about 30 seconds. `--reloads 1 --rounds 3 --repeat 400000` is a
+quick look, at the cost of a wider error bar.
 
 ## Read cycles/pkt, never ns/pkt
 
@@ -115,9 +207,42 @@ otherwise look like a spectacular improvement. It also records the program's
 tag, so comparing a build against itself (forgot to rebuild) is caught rather
 than reported as noise.
 
-`--profile policy` refuses to run if `policy-engine` has XDP attached: the bench
-installs its own rules into the shared pinned maps and would corrupt a live
-policy.
+It refuses to run if `policy-engine` has XDP attached: the bench installs its own
+rules into the shared pinned maps and would corrupt a live policy.
+
+One thing it cannot subtract: **about 3% of the absolute cycles/pkt is the
+`BPF_PROG_TEST_RUN` harness itself** (`bpf_test_run`, `bpf_test_timer_continue`),
+not your datapath. It is constant across builds, so it cannot distort an A/B —
+but the absolute figure is very slightly flattering to reality.
+
+## Going deeper: which *part* of the program?
+
+`progbench` tells you the program got cheaper. To find out *where* the cycles
+are, profile the run — the JIT'd subprograms and the kernel helpers they call
+show up as ordinary symbols:
+
+```bash
+sudo perf record -F 9999 -e cycles -C 0 -o perf.data -- \
+  ./target/release/policy-progbench --profile verdict \
+  --reloads 1 --rounds 40 --repeat 2000000
+
+sudo perf report -i perf.data --stdio --sort symbol --percent-limit 1
+```
+
+Pin `perf` to the same CPU the bench pins itself to (`-C 0` matches the default
+`--cpu 0`), and give it enough rounds that the measured loop dominates the BPF
+load at the start.
+
+This is how the fast path's costs were found. As of `a16e7e2` the verdict-cache
+hit path breaks down roughly as:
+
+| share | what |
+|---|---|
+| ~31% | JIT'd `xdp_policy_main` body (stats bumps, inlined logic) |
+| ~14% | `htab_map_hash` — jhash over the 20-byte verdict-cache key |
+| ~12% | `parse_l3l4` + `parse_packet` (`__noinline` subprograms) |
+| ~2% | `bpf_ktime_get_coarse_ns` — was 11.6% before `a16e7e2` |
+| ~3% | the harness (see above) |
 
 ---
 
