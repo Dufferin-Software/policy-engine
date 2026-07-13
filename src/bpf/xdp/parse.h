@@ -7,9 +7,9 @@
  * Parse packet and extract 5-tuple flow key.
  * Returns L4 header byte offset from start of packet on success, -1 on error.
  */
-static __noinline int parse_packet(const struct xdp_md *ctx,
-                                   struct flow_key *key, int l3_off,
-                                   __u16 eth_proto) {
+static __always_inline int parse_packet(const struct xdp_md *ctx,
+                                        struct flow_key *key, int l3_off,
+                                        __u16 eth_proto) {
   void *data = (void *)(long)ctx->data;
   const void *data_end = (void *)(long)ctx->data_end;
   __builtin_memset(key, 0, sizeof(*key));

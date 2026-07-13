@@ -211,7 +211,13 @@ struct flow_key {
   __u8 protocol;
   __u8 af;     /* Address family: AF_INET or AF_INET6 */
   __u16 flags; /* FLOW_FLAG_* bitmask */
-} __attribute__((packed));
+};
+_Static_assert(sizeof(struct flow_key) == 40, "flow_key layout changed");
+_Static_assert(__builtin_offsetof(struct flow_key, sport) == 32, "flow_key");
+_Static_assert(__builtin_offsetof(struct flow_key, dport) == 34, "flow_key");
+_Static_assert(__builtin_offsetof(struct flow_key, protocol) == 36, "flow_key");
+_Static_assert(__builtin_offsetof(struct flow_key, af) == 37, "flow_key");
+_Static_assert(__builtin_offsetof(struct flow_key, flags) == 38, "flow_key");
 
 /*
  * Action entry for a rule (embedded in policy_value)
@@ -284,7 +290,10 @@ struct flow_verdict_key_v4 {
   __u8 protocol;
   __u8 _pad[3];
   __u32 ifindex;
-} __attribute__((packed)); /* 20 bytes */
+}; /* 20 bytes */
+_Static_assert(sizeof(struct flow_verdict_key_v4) == 20, "v4 key layout");
+_Static_assert(__builtin_offsetof(struct flow_verdict_key_v4, ifindex) == 16,
+               "v4 key layout");
 
 struct flow_verdict_key_v6 {
   __u32 saddr[4];
@@ -294,7 +303,10 @@ struct flow_verdict_key_v6 {
   __u8 protocol;
   __u8 _pad[3];
   __u32 ifindex;
-} __attribute__((packed)); /* 44 bytes */
+}; /* 44 bytes */
+_Static_assert(sizeof(struct flow_verdict_key_v6) == 44, "v6 key layout");
+_Static_assert(__builtin_offsetof(struct flow_verdict_key_v6, ifindex) == 40,
+               "v6 key layout");
 
 /*
  * Flows-to-inspect key (used in the flows_to_inspect hash map).
