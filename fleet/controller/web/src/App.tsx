@@ -41,20 +41,34 @@ function UtcClock() {
   )
 }
 
+function pushTabToUrl(t: Tab): void {
+  const p = new URLSearchParams(window.location.search)
+  p.set('tab', t)
+  history.replaceState(null, '', `?${p.toString()}`)
+}
+
 export default function App() {
-  const [tab, setTab] = useState<Tab>('fleet')
+  const [tab, setTab] = useState<Tab>(() => {
+    const t = new URLSearchParams(window.location.search).get('tab')
+    return (t && TABS.some((x) => x.id === t) ? t : 'fleet') as Tab
+  })
   const [selectedNode, setSelectedNode] = useState<
     { nodeId: string; initialTab?: NodeTab } | null
   >(null)
 
+  function changeTab(t: Tab) {
+    pushTabToUrl(t)
+    setTab(t)
+  }
+
   function navigateToNode(target: { nodeId: string; initialTab?: NodeTab }) {
     setSelectedNode(target)
-    setTab('fleet')
+    changeTab('fleet')
   }
 
   function goHome() {
     setSelectedNode(null)
-    setTab('fleet')
+    changeTab('fleet')
   }
 
   return (
@@ -72,7 +86,7 @@ export default function App() {
           {TABS.map((t) => (
             <button
               key={t.id}
-              onClick={() => setTab(t.id)}
+              onClick={() => changeTab(t.id)}
               className={`px-4 py-1.5 rounded text-sm transition-colors ${
                 tab === t.id
                   ? 'bg-blue-700 text-white'

@@ -16,7 +16,7 @@
 use anyhow::{Context, Result};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
+    Algorithm, Argon2, Params,
 };
 use sqlx::{Row, SqlitePool};
 
@@ -137,6 +137,21 @@ impl OperatorStore {
         if operator.disabled_at.is_some() {
             return Ok(None);
         }
+
+        // Re-hash if the stored params are outdated (cost tuning path).
+        // Non-fatal — a failure here never prevents a successful login.
+        if hash_is_stale(&parsed) {
+            if let Ok(new_hash) = hash_password(password) {
+                let _ = sqlx::query(
+                    "UPDATE operators SET password_hash = ? WHERE id = ?",
+                )
+                .bind(&new_hash)
+                .bind(operator.id)
+                .execute(&self.pool)
+                .await;
+            }
+        }
+
         Ok(Some(operator))
     }
 
@@ -218,6 +233,30 @@ impl OperatorStore {
             .await
             .context("touch operator last_login_at")?;
         Ok(())
+    }
+}
+
+/// True when the stored PHC hash should be upgraded on the next successful
+/// login — wrong algorithm or params that differ from the current defaults.
+fn hash_is_stale(parsed: &PasswordHash<'_>) -> bool {
+    if parsed.algorithm != Algorithm::Argon2id.ident() {
+        return true;
+    }
+    let current = Params::default();
+    // ParamsString::to_string() yields the comma-separated PHC params section
+    // ("m=19456,t=2,p=1").  Parse the three fields we care about directly.
+    let s = parsed.params.to_string();
+    let get = |key: &str| -> Option<u32> {
+        s.split(',').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            if k == key { v.parse().ok() } else { None }
+        })
+    };
+    match (get("m"), get("t"), get("p")) {
+        (Some(m), Some(t), Some(p)) => {
+            m != current.m_cost() || t != current.t_cost() || p != current.p_cost()
+        }
+        _ => true,
     }
 }
 
@@ -348,5 +387,79 @@ mod tests {
     #[test]
     fn dummy_hash_is_well_formed() {
         PasswordHash::new(DUMMY_HASH).expect("dummy hash must parse");
+    }
+
+    #[tokio::test]
+    async fn stale_hash_upgraded_on_successful_verify() {
+        let pool = pool().await;
+        let store = OperatorStore::new(pool.clone());
+
+        // Hash with deliberately cheap params so they differ from Argon2::default().
+        let cheap = Argon2::new(
+            Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            Params::new(8 * 1024, 1, 1, None).unwrap(),
+        );
+        let salt = SaltString::generate(&mut OsRng);
+        let cheap_hash = cheap.hash_password(b"mypassword", &salt).unwrap().to_string();
+
+        sqlx::query(
+            "INSERT INTO operators (username, password_hash, created_at) VALUES ('upgtest', ?, 0)",
+        )
+        .bind(&cheap_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let op = store
+            .verify_password("upgtest", "mypassword")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let new_hash: String =
+            sqlx::query_scalar("SELECT password_hash FROM operators WHERE id = ?")
+                .bind(op.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_ne!(new_hash, cheap_hash, "stored hash must be upgraded after verify");
+
+        // Upgraded hash must still accept the original password.
+        assert!(
+            store.verify_password("upgtest", "mypassword").await.unwrap().is_some(),
+            "upgraded hash must still verify"
+        );
+    }
+
+    #[test]
+    fn hash_is_stale_detects_wrong_algorithm() {
+        // argon2d is not our preferred algorithm.
+        let hash_str = "$argon2d$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0c2FsdA$rj3iA9hxYsNvz5dXyKMaTQ";
+        let parsed = PasswordHash::new(hash_str).unwrap();
+        assert!(hash_is_stale(&parsed));
+    }
+
+    #[test]
+    fn hash_is_stale_detects_low_cost() {
+        // m_cost=8192 is well below the argon2 default of 19456.
+        let cheap = Argon2::new(
+            Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            Params::new(8 * 1024, 1, 1, None).unwrap(),
+        );
+        let salt = SaltString::generate(&mut OsRng);
+        let h = cheap.hash_password(b"x", &salt).unwrap().to_string();
+        let parsed = PasswordHash::new(&h).unwrap();
+        assert!(hash_is_stale(&parsed));
+    }
+
+    #[test]
+    fn hash_is_stale_accepts_current_defaults() {
+        let salt = SaltString::generate(&mut OsRng);
+        let h = Argon2::default().hash_password(b"x", &salt).unwrap().to_string();
+        let parsed = PasswordHash::new(&h).unwrap();
+        assert!(!hash_is_stale(&parsed));
     }
 }

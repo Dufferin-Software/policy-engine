@@ -193,6 +193,46 @@ function buildFilter(f: FilterForm) {
 const PAGE_SIZE = 100
 const LIVE_BUFFER_MAX = 200
 
+// ── URL filter state persistence ───────────────────────────────────────────
+// The filter is written to search params so that:
+//   1. Navigating away and back restores the state.
+//   2. A URL can be shared / linked from Grafana.
+// We replaceState (not pushState) to avoid spam in the browser history stack.
+// App.tsx owns the `tab` param; we preserve it and update only filter keys.
+
+const FILTER_KEYS: (keyof FilterForm)[] = [
+  'since', 'until', 'action', 'nodeId', 'ruleId',
+  'srcIp', 'dstIp', 'sport', 'dport', 'proto', 'sniLike',
+]
+
+function readFilterFromUrl(): FilterForm {
+  const p = new URLSearchParams(window.location.search)
+  return {
+    since:   p.get('since')   ?? '',
+    until:   p.get('until')   ?? '',
+    action:  (p.get('action') ?? '') as ActionFilter,
+    nodeId:  p.get('nodeId')  ?? '',
+    ruleId:  p.get('ruleId')  ?? '',
+    srcIp:   p.get('srcIp')   ?? '',
+    dstIp:   p.get('dstIp')   ?? '',
+    sport:   p.get('sport')   ?? '',
+    dport:   p.get('dport')   ?? '',
+    proto:   p.get('proto')   ?? '',
+    sniLike: p.get('sniLike') ?? '',
+  }
+}
+
+function pushFilterToUrl(f: FilterForm): void {
+  const p = new URLSearchParams(window.location.search)
+  for (const k of FILTER_KEYS) {
+    const v = f[k]
+    if (v) p.set(k, v)
+    else p.delete(k)
+  }
+  const qs = p.toString()
+  history.replaceState(null, '', qs ? `?${qs}` : window.location.pathname)
+}
+
 // ── Live WS event normalization ────────────────────────────────────────────
 
 interface WireEvent {
@@ -335,9 +375,9 @@ interface EventsViewProps {
 }
 
 export default function EventsView({ onNavigateToNode }: EventsViewProps = {}) {
-  const [form, setForm] = useState<FilterForm>(EMPTY_FORM)
+  const [form, setForm] = useState<FilterForm>(() => readFilterFromUrl())
   // `applied` is what actually drives the queries; form is the editing buffer.
-  const [applied, setApplied] = useState<FilterForm>(EMPTY_FORM)
+  const [applied, setApplied] = useState<FilterForm>(() => readFilterFromUrl())
   const [items, setItems] = useState<EventRow[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
   const [liveEnabled, setLiveEnabled] = useState(false)
@@ -499,6 +539,7 @@ export default function EventsView({ onNavigateToNode }: EventsViewProps = {}) {
   const onApply = (e: React.FormEvent) => {
     e.preventDefault()
     setApplied(form)
+    pushFilterToUrl(form)
     setItems([])
     setCursor(null)
     refetchPage({ filter: buildFilter(form), limit: PAGE_SIZE, cursor: null })
@@ -507,6 +548,7 @@ export default function EventsView({ onNavigateToNode }: EventsViewProps = {}) {
   const onReset = () => {
     setForm(EMPTY_FORM)
     setApplied(EMPTY_FORM)
+    pushFilterToUrl(EMPTY_FORM)
     setItems([])
     setCursor(null)
     refetchPage({ filter: undefined, limit: PAGE_SIZE, cursor: null })
@@ -518,6 +560,7 @@ export default function EventsView({ onNavigateToNode }: EventsViewProps = {}) {
     const next: FilterForm = { ...applied, since: sinceLocal, until: untilLocal }
     setForm(next)
     setApplied(next)
+    pushFilterToUrl(next)
     setItems([])
     setCursor(null)
     refetchPage({ filter: buildFilter(next), limit: PAGE_SIZE, cursor: null })
@@ -529,6 +572,7 @@ export default function EventsView({ onNavigateToNode }: EventsViewProps = {}) {
     const next: FilterForm = { ...applied, ...patch }
     setForm(next)
     setApplied(next)
+    pushFilterToUrl(next)
     setItems([])
     setCursor(null)
     refetchPage({ filter: buildFilter(next), limit: PAGE_SIZE, cursor: null })
