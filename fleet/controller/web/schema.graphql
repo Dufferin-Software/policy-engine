@@ -324,6 +324,11 @@ type EventOutput {
 	"""
 	id: String!
 	timestamp: DateTime!
+	"""
+	Wall-clock time at which the controller received this event's batch.
+	Compare with timestamp to detect clock skew between agent and controller.
+	"""
+	receivedAt: DateTime!
 	nodeId: String!
 	ruleId: String!
 	action: String!

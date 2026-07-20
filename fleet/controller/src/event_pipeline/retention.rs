@@ -186,6 +186,7 @@ mod tests {
                 old_event(now_ns - 10_000_000_000), // 10s old
                 old_event(now_ns),                  // just now
             ],
+            0,
         );
 
         let metrics = Arc::new(EventPipelineMetrics::new());

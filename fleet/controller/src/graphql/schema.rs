@@ -3046,7 +3046,7 @@ mod tests {
 
         let h = make_harness().await;
         // test_admin principal is tenant_id 1 (the bootstrapped default).
-        h.events.insert_batch(1, &[evt("n1"), evt("n2")]);
+        h.events.insert_batch(1, &[evt("n1"), evt("n2")], 0);
 
         let res = h
             .schema

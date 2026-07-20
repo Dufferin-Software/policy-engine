@@ -10,7 +10,7 @@
 //! counted as `event_ingest_dropped_total{reason="persist_overflow"}`.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
 
@@ -64,6 +64,10 @@ fn ingest(
     events: &EventStore,
     metrics: &EventPipelineMetrics,
 ) {
+    let received_at_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64;
     metrics.record_received(&batch.node_id, batch.events_json.len() as u64);
 
     let mut parsed: Vec<PolicyEvent> = Vec::with_capacity(batch.events_json.len());
@@ -90,7 +94,7 @@ fn ingest(
     }
 
     let start = Instant::now();
-    let stats = events.insert_batch(tenant_id, &parsed);
+    let stats = events.insert_batch(tenant_id, &parsed, received_at_ns);
     metrics.record_inserted(stats.inserted as u64);
     if stats.evicted > 0 {
         metrics.record_dropped(DropReason::PersistOverflow, stats.evicted as u64);

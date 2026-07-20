@@ -28,6 +28,9 @@ pub struct StoredEvent {
     pub tenant_id: i64,
     pub node_id: String,
     pub ts_ns: i64,
+    /// Wall-clock nanoseconds when the controller received this event's batch.
+    /// Useful for detecting clock skew between agent and controller clocks.
+    pub received_at_ns: i64,
     pub rule_id: i64,
     pub action: Action,
     pub verdict: i64,
@@ -237,9 +240,12 @@ impl EventStore {
         }
     }
 
-    /// Append a batch of parsed events. Events with malformed IP payloads
-    /// are skipped (they should never survive [`super::types::parse_policy_event`]).
-    pub fn insert_batch(&self, tenant_id: i64, events: &[PolicyEvent]) -> InsertStats {
+    /// Append a batch of parsed events. `received_at_ns` is the controller
+    /// wall-clock time (CLOCK_REALTIME, nanoseconds) when the batch arrived —
+    /// stamp it once per batch rather than per-event to keep overhead minimal.
+    /// Events with malformed IP payloads are skipped (they should never
+    /// survive [`super::types::parse_policy_event`]).
+    pub fn insert_batch(&self, tenant_id: i64, events: &[PolicyEvent], received_at_ns: i64) -> InsertStats {
         let mut stats = InsertStats::default();
         if events.is_empty() {
             return stats;
@@ -257,6 +263,7 @@ impl EventStore {
                 tenant_id,
                 node_id: ev.node_id.clone(),
                 ts_ns: ev.ts_ns,
+                received_at_ns,
                 rule_id: ev.rule_id,
                 action: ev.action,
                 verdict: ev.verdict,
@@ -389,7 +396,7 @@ mod tests {
     #[test]
     fn insert_then_list_round_trips() {
         let store = EventStore::new();
-        let stats = store.insert_batch(TENANT, &[evt(1000, Action::Drop), evt(2000, Action::Log)]);
+        let stats = store.insert_batch(TENANT, &[evt(1000, Action::Drop), evt(2000, Action::Log)], 0);
         assert_eq!(stats.inserted, 2);
         assert_eq!(stats.evicted, 0);
         let rows = store.list(TENANT, &EventFilter::default(), 10);
@@ -401,7 +408,7 @@ mod tests {
     #[test]
     fn list_filters_by_action() {
         let store = EventStore::new();
-        store.insert_batch(TENANT, &[evt(1, Action::Drop), evt(2, Action::Log)]);
+        store.insert_batch(TENANT, &[evt(1, Action::Drop), evt(2, Action::Log)], 0);
         let drops = store.list(
             TENANT,
             &EventFilter {
@@ -420,7 +427,7 @@ mod tests {
         let mut e_other = evt(1, Action::Drop);
         e_other.src_ip = vec![192, 168, 1, 1];
         e_other.dst_ip = vec![192, 168, 1, 2];
-        store.insert_batch(TENANT, &[evt(2, Action::Drop), e_other]);
+        store.insert_batch(TENANT, &[evt(2, Action::Drop), e_other], 0);
 
         let by_src = store.list(
             TENANT,
@@ -455,6 +462,7 @@ mod tests {
                 evt(2, Action::Drop),
                 evt(3, Action::Drop),
             ],
+            0,
         );
         let page1 = store.list(TENANT, &EventFilter::default(), 2);
         assert_eq!(page1.len(), 2);
@@ -481,6 +489,7 @@ mod tests {
                 evt(2, Action::Drop),
                 evt(3, Action::Log),
             ],
+            0,
         );
         let buckets = store.aggregate(TENANT, &EventFilter::default(), GroupBy::Action);
         let map: HashMap<_, _> = buckets.into_iter().map(|b| (b.key, b.count)).collect();
@@ -491,7 +500,7 @@ mod tests {
     #[test]
     fn aggregate_by_src_ip_returns_dotted_string() {
         let store = EventStore::new();
-        store.insert_batch(TENANT, &[evt(1, Action::Drop), evt(2, Action::Drop)]);
+        store.insert_batch(TENANT, &[evt(1, Action::Drop), evt(2, Action::Drop)], 0);
         let buckets = store.aggregate(TENANT, &EventFilter::default(), GroupBy::SrcIp);
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].key, "10.0.0.1");
@@ -509,6 +518,7 @@ mod tests {
                 evt(61_000_000_000, Action::Drop),
                 evt(120_000_000_000, Action::Drop),
             ],
+            0,
         );
         let buckets = store.aggregate(TENANT, &EventFilter::default(), GroupBy::Minute);
         assert_eq!(buckets.len(), 2);
@@ -526,6 +536,7 @@ mod tests {
                 evt(2, Action::Drop),
                 evt(3, Action::Drop),
             ],
+            0,
         );
         assert_eq!(stats.inserted, 3);
         assert_eq!(stats.evicted, 1);
@@ -538,7 +549,7 @@ mod tests {
     #[test]
     fn prune_deletes_old_rows() {
         let store = EventStore::new();
-        store.insert_batch(TENANT, &[evt(100, Action::Drop), evt(200, Action::Drop)]);
+        store.insert_batch(TENANT, &[evt(100, Action::Drop), evt(200, Action::Drop)], 0);
         let removed = store.prune_older_than(TENANT, 150);
         assert_eq!(removed, 1);
         let remaining = store.list(TENANT, &EventFilter::default(), 10);
@@ -549,8 +560,8 @@ mod tests {
     #[test]
     fn clear_empties_tenant_buffer() {
         let store = EventStore::new();
-        store.insert_batch(TENANT, &[evt(1, Action::Drop), evt(2, Action::Drop)]);
-        store.insert_batch(2, &[evt(3, Action::Drop)]);
+        store.insert_batch(TENANT, &[evt(1, Action::Drop), evt(2, Action::Drop)], 0);
+        store.insert_batch(2, &[evt(3, Action::Drop)], 0);
         assert_eq!(store.clear(TENANT, None), 2);
         assert!(store.list(TENANT, &EventFilter::default(), 10).is_empty());
         // Other tenants untouched.
@@ -562,7 +573,7 @@ mod tests {
         let store = EventStore::new();
         let mut e2 = evt(2, Action::Drop);
         e2.node_id = "n2".into();
-        store.insert_batch(TENANT, &[evt(1, Action::Drop), e2]);
+        store.insert_batch(TENANT, &[evt(1, Action::Drop), e2], 0);
         assert_eq!(store.clear(TENANT, Some("n1")), 1);
         let rows = store.list(TENANT, &EventFilter::default(), 10);
         assert_eq!(rows.len(), 1);
@@ -572,8 +583,8 @@ mod tests {
     #[test]
     fn tenants_are_isolated() {
         let store = EventStore::new();
-        store.insert_batch(1, &[evt(1, Action::Drop)]);
-        store.insert_batch(2, &[evt(2, Action::Drop), evt(3, Action::Drop)]);
+        store.insert_batch(1, &[evt(1, Action::Drop)], 0);
+        store.insert_batch(2, &[evt(2, Action::Drop), evt(3, Action::Drop)], 0);
         assert_eq!(store.list(1, &EventFilter::default(), 10).len(), 1);
         assert_eq!(store.list(2, &EventFilter::default(), 10).len(), 2);
     }
@@ -585,7 +596,7 @@ mod tests {
         e.sni = Some("www.Example.com".into());
         let mut e2 = evt(2, Action::Drop);
         e2.sni = Some("api.other.net".into());
-        store.insert_batch(TENANT, &[e, e2]);
+        store.insert_batch(TENANT, &[e, e2], 0);
 
         let f = |pat: &str| EventFilter {
             sni_like: Some(pat.to_string()),
@@ -597,7 +608,7 @@ mod tests {
         assert_eq!(store.list(TENANT, &f("api.other.ne_"), 10).len(), 1);
         assert_eq!(store.list(TENANT, &f("%nomatch%"), 10).len(), 0);
         // No-SNI events never match a LIKE filter.
-        store.insert_batch(TENANT, &[evt(3, Action::Drop)]);
+        store.insert_batch(TENANT, &[evt(3, Action::Drop)], 0);
         assert_eq!(store.list(TENANT, &f("%"), 10).len(), 2);
     }
 

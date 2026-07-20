@@ -17,14 +17,14 @@
 //! - `alert_dispatched_total{kind, result=ok|err}`
 //! - `alert_dispatch_retries_total{kind}`
 //! - `alert_dispatch_failed_total{kind}`
-//! - `alert_dispatcher_queue_depth` (gauge — placeholder, 0 until the
-//!   per-receiver queue + worker pool lands)
+//! - `alert_dispatcher_queue_depth{kind}` (gauge — per-provider, live
+//!   backlog of enqueued-but-not-yet-delivered jobs)
 //! - `notifications_silenced_total` (incremented by `dispatcher::is_silenced`
 //!   when an active silence's MatchSpec matches a notification's sample event)
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FireKind {
@@ -77,7 +77,11 @@ pub struct AlertPipelineMetrics {
     silenced: AtomicU64,
     groups_active: AtomicU64,
     groups_evicted: AtomicU64,
-    queue_depth: AtomicU64,
+    /// Per-provider live enqueued-job gauges. Registered by
+    /// [`register_provider_queue`] at dispatcher construction time; the
+    /// returned `Arc<AtomicU64>` is owned jointly by the dispatcher (to
+    /// increment on enqueue) and the worker (to decrement on delivery).
+    queue_depths: Mutex<HashMap<String, Arc<AtomicU64>>>,
 }
 
 impl AlertPipelineMetrics {
@@ -118,8 +122,13 @@ impl AlertPipelineMetrics {
         self.groups_evicted.store(n, Ordering::Relaxed);
     }
 
-    pub fn set_queue_depth(&self, n: u64) {
-        self.queue_depth.store(n, Ordering::Relaxed);
+    /// Register a per-provider queue-depth gauge and return the shared
+    /// `Arc<AtomicU64>`. The dispatcher increments it on enqueue; the
+    /// worker decrements it on delivery. Call once per provider kind at
+    /// dispatcher construction time.
+    pub fn register_provider_queue(&self, kind: &str) -> Arc<AtomicU64> {
+        let mut g = self.queue_depths.lock().unwrap();
+        Arc::clone(g.entry(kind.to_string()).or_insert_with(|| Arc::new(AtomicU64::new(0))))
     }
 
     pub fn render(&self, tenant_slug: &str) -> String {
@@ -138,7 +147,6 @@ impl AlertPipelineMetrics {
         out.push_str("# HELP alert_fired_total Notifications emitted by the grouper, by kind.\n");
         out.push_str("# TYPE alert_fired_total counter\n");
         for (k, v) in self.fired.snapshot() {
-            // k = "<rule_id>,<kind>"
             if let Some((rid, kind)) = k.split_once(',') {
                 out.push_str(&format!(
                     "alert_fired_total{{tenant=\"{t}\",rule_id=\"{rid}\",kind=\"{kind}\"}} {v}\n"
@@ -201,14 +209,19 @@ impl AlertPipelineMetrics {
             "notifications_silenced_total{{tenant=\"{t}\"}} {silenced}\n\n"
         ));
 
-        let qd = self.queue_depth.load(Ordering::Relaxed);
         out.push_str(
-            "# HELP alert_dispatcher_queue_depth Per-receiver dispatcher backlog (gauge; 0 until per-receiver queues land).\n",
+            "# HELP alert_dispatcher_queue_depth Per-provider enqueued-but-not-yet-delivered jobs (gauge).\n",
         );
         out.push_str("# TYPE alert_dispatcher_queue_depth gauge\n");
-        out.push_str(&format!(
-            "alert_dispatcher_queue_depth{{tenant=\"{t}\"}} {qd}\n"
-        ));
+        let depths = self.queue_depths.lock().unwrap();
+        let mut kinds: Vec<&String> = depths.keys().collect();
+        kinds.sort();
+        for kind in kinds {
+            let depth = depths[kind].load(Ordering::Relaxed);
+            out.push_str(&format!(
+                "alert_dispatcher_queue_depth{{tenant=\"{t}\",kind=\"{kind}\"}} {depth}\n"
+            ));
+        }
 
         out
     }
@@ -234,7 +247,10 @@ mod tests {
         m.record_silenced();
         m.set_groups_active(17);
         m.set_groups_evicted(4);
-        m.set_queue_depth(0);
+        let wh_depth = m.register_provider_queue("webhook");
+        let em_depth = m.register_provider_queue("email");
+        wh_depth.store(3, Ordering::Relaxed);
+        em_depth.store(0, Ordering::Relaxed);
 
         let txt = m.render("default");
         assert!(txt.contains("alert_matched_total{tenant=\"default\",rule_id=\"42\"} 5"));
@@ -257,16 +273,24 @@ mod tests {
         assert!(txt.contains("alert_dispatch_retries_total{tenant=\"default\",kind=\"webhook\"} 6"));
         assert!(txt.contains("alert_dispatch_failed_total{tenant=\"default\",kind=\"webhook\"} 1"));
         assert!(txt.contains("notifications_silenced_total{tenant=\"default\"} 1"));
-        assert!(txt.contains("alert_dispatcher_queue_depth{tenant=\"default\"} 0"));
+        // Per-provider depth — sorted alphabetically: email then webhook.
+        assert!(
+            txt.contains("alert_dispatcher_queue_depth{tenant=\"default\",kind=\"email\"} 0"),
+            "email depth missing:\n{txt}"
+        );
+        assert!(
+            txt.contains("alert_dispatcher_queue_depth{tenant=\"default\",kind=\"webhook\"} 3"),
+            "webhook depth missing:\n{txt}"
+        );
     }
 
     #[test]
     fn no_calls_renders_empty_per_label_blocks_but_keeps_help() {
         let m = AlertPipelineMetrics::new();
         let txt = m.render("default");
-        // Header lines are emitted even with no samples — Prom scrapes can
-        // pick them up for type info.
         assert!(txt.contains("# TYPE alert_matched_total counter"));
         assert!(txt.contains("alert_groups_active{tenant=\"default\"} 0"));
+        // No providers registered yet → depth block has HELP/TYPE but no lines.
+        assert!(txt.contains("# TYPE alert_dispatcher_queue_depth gauge"));
     }
 }

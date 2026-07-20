@@ -126,6 +126,10 @@ pub struct EventOutput {
     /// Opaque numeric ID — also the pagination cursor.
     pub id: String,
     pub timestamp: DateTime<Utc>,
+    /// Wall-clock time at which the controller received this event's batch.
+    /// Compare with `timestamp` to detect clock skew between agent and
+    /// controller.
+    pub received_at: DateTime<Utc>,
     pub node_id: String,
     pub rule_id: String,
     pub action: String,
@@ -150,6 +154,7 @@ impl From<StoredEvent> for EventOutput {
         Self {
             id: e.id.to_string(),
             timestamp: Utc.timestamp_nanos(e.ts_ns),
+            received_at: Utc.timestamp_nanos(e.received_at_ns),
             node_id: e.node_id,
             rule_id: e.rule_id.to_string(),
             action: e.action.as_str().to_string(),

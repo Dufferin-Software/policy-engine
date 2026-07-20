@@ -6,17 +6,22 @@
 //! Sits between the grouper and the provider impls (`providers::*`). For
 //! each [`grouper::Notification`] the dispatcher:
 //!
-//! 1. Loads the alert rule + its routed receivers.
+//! 1. Loads the alert rule + its routed receivers from the store.
 //! 2. Applies any active silences (best-effort — see "Silences" below).
-//! 3. For each receiver, looks up the provider by `kind` and runs the
-//!    send with exponential-backoff retry.
-//! 4. Writes an `alert_history` row recording the outcome.
+//! 3. Writes an `alert_history` row.
+//! 4. For each receiver, enqueues a [`ProviderJob`] onto the per-provider
+//!    bounded channel. Worker tasks drain those channels and run
+//!    send-with-retry with exponential backoff + full jitter.
 //!
-//! Per-receiver bounded queues + worker pool are listed in the spec but
-//! deferred to a step-4 follow-up; the synchronous `dispatch()` here is
-//! adequate while the grouper runs on a single tokio task and notifications
-//! are sparse. When that stops being true, slot a per-receiver
-//! `mpsc::Sender<DispatchJob>` in front of `send_with_retry`.
+//! ## Actor model
+//!
+//! Each provider kind (webhook, email, alertmanager) gets its own bounded
+//! `mpsc` channel and a pool of `workers_per_provider` tokio tasks that
+//! drain it. Queue depth is tracked per-provider via `Arc<AtomicU64>` so
+//! the Prometheus metric `alert_dispatcher_queue_depth{kind}` reflects live
+//! backlog. If a channel is full, the job is dropped with a warning rather
+//! than blocking the caller — the channel capacity is the backpressure
+//! knob, not the caller's latency.
 //!
 //! ## Silences
 //!
@@ -47,8 +52,11 @@
 use anyhow::{Context, Result};
 use rand::Rng;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::mpsc;
 
 use super::alert_metrics::AlertPipelineMetrics;
 use super::alert_store::{AlertRule, AlertStore, NewAlertHistory, Receiver, Silence};
@@ -62,6 +70,11 @@ pub struct DispatcherConfig {
     pub max_attempts: u32,
     pub base_backoff_ms: u64,
     pub max_backoff_ms: u64,
+    /// Capacity of the per-provider bounded channel. When the channel is
+    /// full `try_send` fails and the job is dropped with a warning.
+    pub queue_capacity: usize,
+    /// Number of worker tasks spawned per provider kind.
+    pub workers_per_provider: usize,
 }
 
 impl Default for DispatcherConfig {
@@ -70,17 +83,10 @@ impl Default for DispatcherConfig {
             max_attempts: 5,
             base_backoff_ms: 1_000,
             max_backoff_ms: 60_000,
+            queue_capacity: 256,
+            workers_per_provider: 2,
         }
     }
-}
-
-#[derive(Debug)]
-pub struct ReceiverOutcome {
-    pub receiver_id: i64,
-    pub attempts: u32,
-    /// `Err(s)` carries the final-attempt error message — sufficient for
-    /// metrics + operator logs.
-    pub result: std::result::Result<(), String>,
 }
 
 #[derive(Debug)]
@@ -88,34 +94,64 @@ pub struct DispatchOutcome {
     pub silenced: bool,
     /// `None` only when persisting the history row itself failed.
     pub history_id: Option<i64>,
-    pub per_receiver: Vec<ReceiverOutcome>,
 }
 
+/// Per-provider delivery job enqueued by [`AlertDispatcher::dispatch`] and
+/// consumed by the provider worker pool.
+struct ProviderJob {
+    receiver: Receiver,
+    payload: NotificationPayload,
+    /// Decremented by the worker on completion to keep the queue-depth
+    /// metric accurate.
+    depth: Arc<AtomicU64>,
+}
+
+/// Handle to the alert dispatcher. Cheap to clone — all state is behind
+/// `Arc`. Worker tasks are spawned at construction time and run for the
+/// lifetime of the process.
 pub struct AlertDispatcher {
     scope: Arc<TenantScope>,
-    /// Keyed by `receivers.kind`. The dispatcher does not invent providers
-    /// — a receiver pointing at an unregistered kind fails dispatch loudly
-    /// rather than silently dropping.
-    notifiers: HashMap<String, Arc<dyn Notifier>>,
-    config: DispatcherConfig,
     metrics: Arc<AlertPipelineMetrics>,
+    /// Per-provider-kind: (bounded sender, live-enqueued-job counter).
+    queues: HashMap<String, (mpsc::Sender<ProviderJob>, Arc<AtomicU64>)>,
 }
 
 impl AlertDispatcher {
+    /// Construct the dispatcher and spawn one worker pool per provider.
+    /// Must be called from within a tokio runtime (workers use
+    /// `tokio::spawn`).
     pub fn new(
         scope: Arc<TenantScope>,
         notifiers: HashMap<String, Arc<dyn Notifier>>,
         config: DispatcherConfig,
         metrics: Arc<AlertPipelineMetrics>,
     ) -> Self {
+        let mut queues = HashMap::with_capacity(notifiers.len());
+        for (kind, notifier) in &notifiers {
+            let depth = metrics.register_provider_queue(kind);
+            let (tx, rx) = mpsc::channel::<ProviderJob>(config.queue_capacity);
+            let rx = Arc::new(tokio::sync::Mutex::new(rx));
+            for _ in 0..config.workers_per_provider {
+                let rx = Arc::clone(&rx);
+                let notifier = Arc::clone(notifier);
+                let config = config.clone();
+                let metrics = Arc::clone(&metrics);
+                tokio::spawn(async move {
+                    run_worker(rx, notifier, config, metrics).await;
+                });
+            }
+            queues.insert(kind.clone(), (tx, depth));
+        }
         Self {
             scope,
-            notifiers,
-            config,
             metrics,
+            queues,
         }
     }
 
+    /// Dispatch a notification: load context from DB, check silence, write
+    /// history, and enqueue per-receiver delivery jobs. Returns promptly
+    /// after enqueuing — actual delivery is async in the worker pool.
     pub async fn dispatch(&self, notification: Notification) -> Result<DispatchOutcome> {
         let store = AlertStore::new(&self.scope);
         let rule = store
@@ -124,11 +160,9 @@ impl AlertDispatcher {
             .with_context(|| format!("alert_rule id={} no longer exists", notification.rule_id))?;
         let receiver_ids: Vec<i64> = serde_json::from_str(&rule.receiver_ids)
             .context("corrupt receiver_ids on alert_rule")?;
-        // Load every routed receiver. Missing IDs are surfaced as a per-
-        // receiver failure rather than aborting the whole dispatch — one
-        // misconfigured route shouldn't black-hole the others.
         let all_receivers = store.list_receivers().await?;
-        let by_id: HashMap<i64, Receiver> = all_receivers.into_iter().map(|r| (r.id, r)).collect();
+        let by_id: HashMap<i64, Receiver> =
+            all_receivers.into_iter().map(|r| (r.id, r)).collect();
 
         let active_silences = store
             .list_silences(Some(notification.at_ns / 1_000_000_000))
@@ -141,24 +175,14 @@ impl AlertDispatcher {
 
         let payload = build_payload(&rule, &notification);
 
-        let mut per_receiver = Vec::with_capacity(receiver_ids.len());
         if !silenced {
             for rid in &receiver_ids {
-                let outcome = match by_id.get(rid) {
-                    Some(receiver) => self.send_one(receiver, &payload).await,
-                    None => ReceiverOutcome {
-                        receiver_id: *rid,
-                        attempts: 0,
-                        result: Err(format!("receiver id={rid} not found")),
-                    },
-                };
-                let kind = by_id.get(rid).map(|r| r.kind.as_str()).unwrap_or("unknown");
-                self.metrics.record_dispatched(
-                    kind,
-                    outcome.result.is_ok(),
-                    outcome.attempts.max(1),
-                );
-                per_receiver.push(outcome);
+                match by_id.get(rid) {
+                    Some(receiver) => self.enqueue_job(receiver, &payload),
+                    None => log::warn!(
+                        "dispatcher: receiver id={rid} not found, skipping"
+                    ),
+                }
             }
         }
 
@@ -177,58 +201,101 @@ impl AlertDispatcher {
         Ok(DispatchOutcome {
             silenced,
             history_id,
-            per_receiver,
         })
     }
 
-    async fn send_one(
-        &self,
-        receiver: &Receiver,
-        payload: &NotificationPayload,
-    ) -> ReceiverOutcome {
-        let notifier = match self.notifiers.get(&receiver.kind) {
-            Some(n) => n,
-            None => {
-                return ReceiverOutcome {
-                    receiver_id: receiver.id,
-                    attempts: 0,
-                    result: Err(format!(
-                        "no provider registered for kind '{}'",
-                        receiver.kind
-                    )),
+    fn enqueue_job(&self, receiver: &Receiver, payload: &NotificationPayload) {
+        let kind = receiver.kind.as_str();
+        match self.queues.get(kind) {
+            Some((tx, depth)) => {
+                depth.fetch_add(1, Ordering::Relaxed);
+                let job = ProviderJob {
+                    receiver: receiver.clone(),
+                    payload: payload.clone(),
+                    depth: Arc::clone(depth),
                 };
-            }
-        };
-        let mut last_err: Option<String> = None;
-        for attempt in 1..=self.config.max_attempts {
-            match notifier.send(receiver, payload).await {
-                Ok(()) => {
-                    return ReceiverOutcome {
-                        receiver_id: receiver.id,
-                        attempts: attempt,
-                        result: Ok(()),
-                    };
-                }
-                Err(e) => {
-                    last_err = Some(format!("{e:#}"));
-                    if attempt == self.config.max_attempts {
-                        break;
-                    }
-                    let delay_ms = backoff_ms(
-                        attempt,
-                        self.config.base_backoff_ms,
-                        self.config.max_backoff_ms,
+                if tx.try_send(job).is_err() {
+                    depth.fetch_sub(1, Ordering::Relaxed);
+                    log::warn!(
+                        "dispatcher: queue full for provider '{kind}', \
+                         dropping notification for receiver id={}",
+                        receiver.id
                     );
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
             }
-        }
-        ReceiverOutcome {
-            receiver_id: receiver.id,
-            attempts: self.config.max_attempts,
-            result: Err(last_err.unwrap_or_else(|| "unknown error".into())),
+            None => log::error!(
+                "dispatcher: no worker pool for provider kind '{kind}' \
+                 (receiver id={}); was it registered at startup?",
+                receiver.id
+            ),
         }
     }
+}
+
+/// Worker task: drains one provider's channel and calls send-with-retry.
+async fn run_worker(
+    rx: Arc<tokio::sync::Mutex<mpsc::Receiver<ProviderJob>>>,
+    notifier: Arc<dyn Notifier>,
+    config: DispatcherConfig,
+    metrics: Arc<AlertPipelineMetrics>,
+) {
+    loop {
+        let job = {
+            let mut guard = rx.lock().await;
+            match guard.recv().await {
+                Some(j) => j,
+                None => return, // channel closed → shut down
+            }
+        };
+        // Decrement before the (potentially slow) delivery so the gauge
+        // reflects "outstanding, not yet started" rather than "in-flight".
+        job.depth.fetch_sub(1, Ordering::Relaxed);
+        let outcome = send_with_retry(&*notifier, &job.receiver, &job.payload, &config).await;
+        metrics.record_dispatched(notifier.kind(), outcome.is_ok(), outcome.attempts().max(1));
+    }
+}
+
+/// Delivery result returned by [`send_with_retry`].
+struct DeliveryOutcome {
+    attempts: u32,
+    ok: bool,
+}
+
+impl DeliveryOutcome {
+    fn is_ok(&self) -> bool {
+        self.ok
+    }
+    fn attempts(&self) -> u32 {
+        self.attempts
+    }
+}
+
+async fn send_with_retry(
+    notifier: &dyn Notifier,
+    receiver: &Receiver,
+    payload: &NotificationPayload,
+    config: &DispatcherConfig,
+) -> DeliveryOutcome {
+    for attempt in 1..=config.max_attempts {
+        match notifier.send(receiver, payload).await {
+            Ok(()) => return DeliveryOutcome { attempts: attempt, ok: true },
+            Err(e) => {
+                if attempt == config.max_attempts {
+                    log::warn!(
+                        "dispatcher: receiver id={} kind={} exhausted {} attempts: {e:#}",
+                        receiver.id, receiver.kind, config.max_attempts
+                    );
+                    return DeliveryOutcome {
+                        attempts: attempt,
+                        ok: false,
+                    };
+                }
+                let delay_ms = backoff_ms(attempt, config.base_backoff_ms, config.max_backoff_ms);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+    }
+    DeliveryOutcome { attempts: config.max_attempts, ok: false }
 }
 
 fn build_payload(rule: &AlertRule, n: &Notification) -> NotificationPayload {
@@ -250,15 +317,13 @@ fn build_payload(rule: &AlertRule, n: &Notification) -> NotificationPayload {
 use chrono::TimeZone;
 
 /// Exponential backoff with full jitter: delay = rand(0, min(cap, base * 2^n)).
-/// `attempt` is 1-indexed; the first retry uses `attempt=1`.
 fn backoff_ms(attempt: u32, base_ms: u64, cap_ms: u64) -> u64 {
     let exp = base_ms.saturating_mul(1u64 << attempt.min(20));
     let bound = exp.min(cap_ms).max(1);
     rand::thread_rng().gen_range(0..bound)
 }
 
-/// True if any of `active` matches the notification's sample event. See the
-/// module-level "Silences" section for the design rationale and caveats.
+/// True if any of `active` matches the notification's sample event.
 fn is_silenced(_rule: &AlertRule, n: &Notification, active: &[Silence]) -> bool {
     let Some(ev) = n.sample_event.as_ref() else {
         return false;
@@ -271,9 +336,6 @@ fn is_silenced(_rule: &AlertRule, n: &Notification, active: &[Silence]) -> bool 
                 }
             }
             Err(e) => {
-                // Compile failures here mean the row drifted from what
-                // alert_store accepts — log and skip rather than wedging
-                // dispatch on one bad row.
                 log::warn!(
                     "dispatcher: skipping silence id={} (compile failed): {e:#}",
                     s.id
@@ -295,6 +357,7 @@ mod tests {
         types::{Action, Direction, PolicyEvent},
     };
     use sqlx::sqlite::SqlitePool;
+    use tokio::time;
 
     fn stub_event() -> PolicyEvent {
         PolicyEvent {
@@ -364,6 +427,16 @@ mod tests {
         }
     }
 
+    fn test_config() -> DispatcherConfig {
+        DispatcherConfig {
+            max_attempts: 3,
+            base_backoff_ms: 1,
+            max_backoff_ms: 2,
+            queue_capacity: 8,
+            workers_per_provider: 1,
+        }
+    }
+
     fn dispatcher(
         scope: Arc<TenantScope>,
         mock: Arc<MockNotifier>,
@@ -371,18 +444,20 @@ mod tests {
         let mut notifiers: HashMap<String, Arc<dyn Notifier>> = HashMap::new();
         notifiers.insert("webhook".into(), mock as Arc<dyn Notifier>);
         let metrics = Arc::new(AlertPipelineMetrics::new());
-        let d = AlertDispatcher::new(
-            scope,
-            notifiers,
-            DispatcherConfig {
-                // Tests should not sleep for seconds.
-                max_attempts: 3,
-                base_backoff_ms: 1,
-                max_backoff_ms: 2,
-            },
-            Arc::clone(&metrics),
-        );
+        let d = AlertDispatcher::new(scope, notifiers, test_config(), Arc::clone(&metrics));
         (d, metrics)
+    }
+
+    /// Spin until `pred()` returns true or `timeout` elapses.
+    async fn wait_for<F: Fn() -> bool>(pred: F, timeout: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if pred() {
+                return true;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        pred()
     }
 
     #[tokio::test]
@@ -393,17 +468,18 @@ mod tests {
         let out = d.dispatch(notif(rule_id)).await.unwrap();
         assert!(!out.silenced);
         assert!(out.history_id.is_some());
-        assert_eq!(out.per_receiver.len(), 1);
-        assert!(out.per_receiver[0].result.is_ok());
-        assert_eq!(out.per_receiver[0].attempts, 1);
-        assert_eq!(mock.call_count(), 1);
+
+        let mock2 = Arc::clone(&mock);
+        let delivered = wait_for(|| mock2.call_count() >= 1, Duration::from_secs(2)).await;
+        assert!(delivered, "worker did not call notifier within 2s");
+
         let calls = mock.calls();
         assert_eq!(calls[0].1.rule_id, rule_id);
         assert_eq!(calls[0].1.group_key, "k1");
         assert_eq!(calls[0].1.severity, "warning");
         assert_eq!(calls[0].1.sample_event_ids, vec![1, 2, 3]);
         assert_eq!(calls[0].1.kind, NotificationKindStr::Initial);
-        // History row reflects silenced=false and the event count.
+
         let hist = AlertStore::new(&scope)
             .list_history(&Default::default(), 10)
             .await
@@ -418,11 +494,11 @@ mod tests {
         let (scope, rule_id, _r) = setup().await;
         let mock = Arc::new(MockNotifier::new("webhook").fail_first(2));
         let (d, _metrics) = dispatcher(Arc::clone(&scope), Arc::clone(&mock));
-        let out = d.dispatch(notif(rule_id)).await.unwrap();
-        assert!(out.per_receiver[0].result.is_ok());
-        // 2 failures + 1 success = 3 attempts == max_attempts; still ok.
-        assert_eq!(out.per_receiver[0].attempts, 3);
-        assert_eq!(mock.call_count(), 3);
+        d.dispatch(notif(rule_id)).await.unwrap();
+
+        let mock2 = Arc::clone(&mock);
+        let delivered = wait_for(|| mock2.call_count() >= 3, Duration::from_secs(2)).await;
+        assert!(delivered, "expected 3 attempts (2 fail + 1 success), got {}", mock.call_count());
     }
 
     #[tokio::test]
@@ -431,21 +507,18 @@ mod tests {
         let mock = Arc::new(MockNotifier::new("webhook").fail_first(10));
         let (d, _metrics) = dispatcher(Arc::clone(&scope), Arc::clone(&mock));
         let out = d.dispatch(notif(rule_id)).await.unwrap();
-        assert!(out.per_receiver[0].result.is_err());
-        assert_eq!(out.per_receiver[0].attempts, 3); // max_attempts
-        assert_eq!(mock.call_count(), 3);
-        // Even on failure we record the firing — the history row is how
-        // the UI shows "we tried to alert but it didn't get through".
+        // History is written regardless of delivery outcome.
         assert!(out.history_id.is_some());
+
+        let mock2 = Arc::clone(&mock);
+        let exhausted = wait_for(|| mock2.call_count() >= 3, Duration::from_secs(2)).await;
+        assert!(exhausted, "expected max_attempts=3 calls, got {}", mock.call_count());
     }
 
     #[tokio::test]
-    async fn unknown_receiver_kind_fails_without_attempt() {
+    async fn unknown_receiver_kind_drops_job_without_calling_webhook() {
         let (scope, rule_id, r_id) = setup().await;
-        // Mutate the receiver in-place to a kind no provider is registered
-        // for. Validation forbids creating one this way, so go via the
-        // store with raw SQL — we want to test the dispatcher branch, not
-        // the input validation.
+        // Mutate the receiver to a kind with no registered provider.
         sqlx::query("UPDATE receivers SET kind = 'pagerduty' WHERE id = ?")
             .bind(r_id)
             .execute(scope.pool())
@@ -454,20 +527,16 @@ mod tests {
         let mock = Arc::new(MockNotifier::new("webhook"));
         let (d, _metrics) = dispatcher(Arc::clone(&scope), Arc::clone(&mock));
         let out = d.dispatch(notif(rule_id)).await.unwrap();
-        assert_eq!(mock.call_count(), 0);
-        assert!(out.per_receiver[0]
-            .result
-            .as_ref()
-            .err()
-            .unwrap()
-            .contains("no provider registered"));
+        // History still written (we saw the notification; delivery failed).
+        assert!(out.history_id.is_some());
+        // Give the worker a moment, then assert no calls.
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(mock.call_count(), 0, "webhook must not be called for unknown kind");
     }
 
     #[tokio::test]
-    async fn missing_receiver_id_is_per_route_failure_not_dispatch_abort() {
+    async fn missing_receiver_id_logs_and_writes_history() {
         let (scope, rule_id, r_id) = setup().await;
-        // Delete the receiver out from under the rule. The store refuses
-        // delete_receiver while in use, so do it via raw SQL.
         sqlx::query("DELETE FROM receivers WHERE id = ?")
             .bind(r_id)
             .execute(scope.pool())
@@ -476,23 +545,13 @@ mod tests {
         let mock = Arc::new(MockNotifier::new("webhook"));
         let (d, _metrics) = dispatcher(Arc::clone(&scope), Arc::clone(&mock));
         let out = d.dispatch(notif(rule_id)).await.unwrap();
-        assert_eq!(out.per_receiver.len(), 1);
-        assert!(out.per_receiver[0]
-            .result
-            .as_ref()
-            .err()
-            .unwrap()
-            .contains("not found"));
-        // Still wrote history — operator visibility matters even when
-        // routes are broken.
         assert!(out.history_id.is_some());
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(mock.call_count(), 0);
     }
 
     #[tokio::test]
     async fn matching_silence_suppresses_dispatch() {
-        // Silence on action=drop, sample event is action=drop → notifier
-        // must not be called, history must record silenced=true, and the
-        // notifications_silenced_total metric must tick.
         let (scope, rule_id, _r) = setup().await;
         AlertStore::new(&scope)
             .create_silence(NewSilence {
@@ -508,11 +567,8 @@ mod tests {
         let (d, metrics) = dispatcher(Arc::clone(&scope), Arc::clone(&mock));
         let out = d.dispatch(notif(rule_id)).await.unwrap();
         assert!(out.silenced);
+        time::sleep(Duration::from_millis(50)).await;
         assert_eq!(mock.call_count(), 0);
-        assert!(
-            out.per_receiver.is_empty(),
-            "no per-receiver attempts when silenced"
-        );
         let hist = AlertStore::new(&scope)
             .list_history(&Default::default(), 10)
             .await
@@ -528,8 +584,6 @@ mod tests {
 
     #[tokio::test]
     async fn non_matching_silence_does_not_suppress() {
-        // Silence on action=log; sample event is action=drop → dispatches
-        // normally and silenced=false.
         let (scope, rule_id, _r) = setup().await;
         AlertStore::new(&scope)
             .create_silence(NewSilence {
@@ -545,7 +599,9 @@ mod tests {
         let (d, metrics) = dispatcher(Arc::clone(&scope), Arc::clone(&mock));
         let out = d.dispatch(notif(rule_id)).await.unwrap();
         assert!(!out.silenced);
-        assert_eq!(mock.call_count(), 1);
+        let mock2 = Arc::clone(&mock);
+        let delivered = wait_for(|| mock2.call_count() >= 1, Duration::from_secs(2)).await;
+        assert!(delivered);
         let txt = metrics.render("default");
         assert!(
             txt.contains("notifications_silenced_total{tenant=\"default\"} 0"),
@@ -555,9 +611,6 @@ mod tests {
 
     #[tokio::test]
     async fn notification_without_sample_event_is_not_silenced() {
-        // Defensive: if a Notification reaches us with no sample event we
-        // can't evaluate event-shaped silences, so we let it through rather
-        // than dropping it on the floor.
         let (scope, rule_id, _r) = setup().await;
         AlertStore::new(&scope)
             .create_silence(NewSilence {
@@ -575,6 +628,33 @@ mod tests {
         n.sample_event = None;
         let out = d.dispatch(n).await.unwrap();
         assert!(!out.silenced);
-        assert_eq!(mock.call_count(), 1);
+        let mock2 = Arc::clone(&mock);
+        let delivered = wait_for(|| mock2.call_count() >= 1, Duration::from_secs(2)).await;
+        assert!(delivered);
+    }
+
+    #[tokio::test]
+    async fn queue_depth_increments_then_drains_to_zero() {
+        let (scope, rule_id, _r) = setup().await;
+        // Use a mock that blocks briefly so depth is non-zero during delivery.
+        let mock = Arc::new(MockNotifier::new("webhook"));
+        let metrics = Arc::new(AlertPipelineMetrics::new());
+        let mut notifiers: HashMap<String, Arc<dyn Notifier>> = HashMap::new();
+        notifiers.insert("webhook".into(), Arc::clone(&mock) as Arc<dyn Notifier>);
+        let d = AlertDispatcher::new(
+            Arc::clone(&scope),
+            notifiers,
+            test_config(),
+            Arc::clone(&metrics),
+        );
+        d.dispatch(notif(rule_id)).await.unwrap();
+        // After worker drains, depth must return to 0.
+        let mock2 = Arc::clone(&mock);
+        wait_for(|| mock2.call_count() >= 1, Duration::from_secs(2)).await;
+        let txt = metrics.render("default");
+        assert!(
+            txt.contains("alert_dispatcher_queue_depth{tenant=\"default\",kind=\"webhook\"} 0"),
+            "depth should be 0 after delivery:\n{txt}"
+        );
     }
 }

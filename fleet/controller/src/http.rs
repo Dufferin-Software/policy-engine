@@ -860,6 +860,7 @@ mod rest_tests {
                     sni: None,
                 },
             ],
+            0,
         );
         (scope, events)
     }

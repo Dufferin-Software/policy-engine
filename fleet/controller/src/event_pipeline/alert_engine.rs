@@ -504,6 +504,8 @@ mod tests {
                 max_attempts: 1,
                 base_backoff_ms: 1,
                 max_backoff_ms: 1,
+                queue_capacity: 8,
+                workers_per_provider: 1,
             },
         };
         let handle = spawn_alert_engine(
@@ -555,6 +557,8 @@ mod tests {
                 max_attempts: 1,
                 base_backoff_ms: 1,
                 max_backoff_ms: 1,
+                queue_capacity: 8,
+                workers_per_provider: 1,
             },
         };
         let handle = spawn_alert_engine(
@@ -628,6 +632,8 @@ mod tests {
                 max_attempts: 1,
                 base_backoff_ms: 1,
                 max_backoff_ms: 1,
+                queue_capacity: 8,
+                workers_per_provider: 1,
             },
         };
         let handle = spawn_alert_engine(

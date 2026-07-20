@@ -13,6 +13,7 @@ const EVENTS_QUERY = gql`
       items {
         id
         timestamp
+        receivedAt
         nodeId
         ruleId
         action
@@ -87,6 +88,7 @@ const AGGREGATE_QUERY = gql`
 interface EventRow {
   id: string
   timestamp: string
+  receivedAt: string
   nodeId: string
   ruleId: string
   action: string
@@ -226,6 +228,7 @@ function normalizeLive(w: WireEvent): EventRow | null {
   return {
     id: `live-${w.timestamp_ns}-${Math.random().toString(36).slice(2, 8)}`,
     timestamp: new Date(w.timestamp_ns / 1_000_000).toISOString(),
+    receivedAt: new Date().toISOString(),
     nodeId: w.node_id ?? '',
     ruleId: String(w.rule_id),
     action,
@@ -724,6 +727,19 @@ export default function EventsView({ onNavigateToNode }: EventsViewProps = {}) {
               >
                 <td className="px-3 py-1.5 text-gray-500 whitespace-nowrap">
                   {formatTs(r.timestamp)}
+                  {(() => {
+                    const skewMs = (new Date(r.receivedAt).getTime() - new Date(r.timestamp).getTime())
+                    if (Math.abs(skewMs) < 1000) return null
+                    const s = (skewMs / 1000).toFixed(1)
+                    return (
+                      <span
+                        className="ml-1.5 text-xs text-orange-400"
+                        title={`Clock skew: agent timestamp vs controller receipt time (${s}s)`}
+                      >
+                        {skewMs > 0 ? `+${s}s` : `${s}s`}
+                      </span>
+                    )
+                  })()}
                 </td>
                 <td className={`px-3 py-1.5 font-semibold ${ACTION_COLOR[r.action] ?? 'text-gray-300'}`}>
                   {r.action}
