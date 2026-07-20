@@ -8,3 +8,5 @@
 *.profraw
 /coverage
 node_modules
+__pycache__/
+*.pyc
