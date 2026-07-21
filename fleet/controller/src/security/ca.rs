@@ -5,9 +5,10 @@ use anyhow::{Context, Result};
 use rand::RngCore;
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SerialNumber, PKCS_ECDSA_P256_SHA256,
-    PKCS_ECDSA_P384_SHA384,
+    ExtendedKeyUsagePurpose, Ia5String, IsCa, KeyPair, KeyUsagePurpose, SanType, SerialNumber,
+    PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384,
 };
+use std::net::IpAddr;
 use std::path::Path;
 use time::OffsetDateTime;
 
@@ -78,8 +79,15 @@ pub trait CertificateAuthority: Send + Sync {
         ttl_secs: u64,
     ) -> Result<IssuedCert>;
 
-    /// Issue a TLS server certificate for the given DNS name(s).
-    fn issue_server_cert(&self, san_dns: &str, ttl_secs: u64) -> Result<IssuedCert>;
+    /// Issue a TLS server certificate covering the given SAN entries.
+    ///
+    /// Each entry is parsed as an `iPAddress` SAN when it parses as an
+    /// `IpAddr`, otherwise as a `dNSName` SAN; the first entry is also used as
+    /// the certificate Common Name. Agents validate the address they connect
+    /// with against these SANs, so every name **and IP** an agent might use to
+    /// reach the controller must be listed — a cert with only a DNS SAN makes
+    /// mTLS by IP fail hostname verification. Errors if `sans` is empty.
+    fn issue_server_cert(&self, sans: &[String], ttl_secs: u64) -> Result<IssuedCert>;
 }
 
 /// [`CertificateAuthority`] backed by key files on disk.
@@ -245,14 +253,30 @@ impl CertificateAuthority for FileCertificateAuthority {
         })
     }
 
-    fn issue_server_cert(&self, san_dns: &str, ttl_secs: u64) -> Result<IssuedCert> {
+    fn issue_server_cert(&self, sans: &[String], ttl_secs: u64) -> Result<IssuedCert> {
+        let primary = sans
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("issue_server_cert requires at least one SAN entry"))?;
+
         let server_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
             .context("Failed to generate server key")?;
 
         let serial_bytes = random_serial();
-        let mut params = CertificateParams::new(vec![san_dns.to_string()])
-            .context("Failed to create server cert params")?;
-        params.distinguished_name.push(DnType::CommonName, san_dns);
+        // Build the SAN list explicitly so IP-address entries become
+        // `iPAddress` GeneralNames rather than being encoded as `dNSName`.
+        // WebPKI matches an IP the agent connects with only against an
+        // `iPAddress` SAN; a `dNSName` holding "192.0.2.1" would not satisfy
+        // it. `rcgen::CertificateParams::new` does this IP/DNS split itself,
+        // but we spell it out so the behaviour is obvious and testable.
+        let alt_names = sans
+            .iter()
+            .map(|s| san_type(s))
+            .collect::<Result<Vec<_>>>()?;
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = alt_names;
+        params
+            .distinguished_name
+            .push(DnType::CommonName, primary.as_str());
         params.is_ca = IsCa::ExplicitNoCa;
         // Pin `not_before` to issuance time. `CertificateParams::default()`
         // leaves it at rcgen's 1975 sentinel, which makes
@@ -278,6 +302,19 @@ impl CertificateAuthority for FileCertificateAuthority {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Classify a SAN string: a value that parses as an `IpAddr` becomes an
+/// `iPAddress` SAN, everything else a `dNSName`. DNS names are IA5 (ASCII)
+/// only — a non-ASCII name is rejected rather than silently mangled.
+fn san_type(s: &str) -> Result<SanType> {
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        Ok(SanType::IpAddress(ip))
+    } else {
+        let dns = Ia5String::try_from(s.to_string())
+            .with_context(|| format!("SAN {s:?} is not a valid IP or DNS name"))?;
+        Ok(SanType::DnsName(dns))
+    }
+}
 
 fn build_ca_params(common_name: &str) -> Result<CertificateParams> {
     let mut params = CertificateParams::default();
@@ -443,10 +480,68 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ca = make_ca(&dir);
         let issued = ca
-            .issue_server_cert("controller.example.com", 365 * 86_400)
+            .issue_server_cert(&["controller.example.com".to_string()], 365 * 86_400)
             .unwrap();
         assert!(issued.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(issued.key_pem.contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[test]
+    fn test_issue_server_cert_rejects_empty_sans() {
+        let dir = TempDir::new().unwrap();
+        let ca = make_ca(&dir);
+        let err = ca
+            .issue_server_cert(&[], 3600)
+            .expect_err("a server cert with no SANs is useless and must be rejected");
+        assert!(format!("{err:#}").contains("at least one SAN"));
+    }
+
+    /// The whole point of the multi-SAN change: a cert issued for a mix of DNS
+    /// names and IP addresses must encode the IPs as `iPAddress` GeneralNames
+    /// (not `dNSName`), otherwise agents connecting to the controller by IP
+    /// fail WebPKI hostname verification.
+    #[test]
+    fn test_issue_server_cert_encodes_ip_and_dns_sans() {
+        use x509_parser::extensions::GeneralName;
+        use x509_parser::prelude::FromDer;
+        let dir = TempDir::new().unwrap();
+        let ca = make_ca(&dir);
+        let issued = ca
+            .issue_server_cert(
+                &[
+                    "policy-controller".to_string(),
+                    "192.168.1.235".to_string(),
+                    "fd00::1".to_string(),
+                ],
+                3600,
+            )
+            .unwrap();
+
+        let mut reader = issued.cert_pem.as_bytes();
+        let der = rustls_pemfile::certs(&mut reader).next().unwrap().unwrap();
+        let (_rest, parsed) = x509_parser::certificate::X509Certificate::from_der(&der).unwrap();
+        let san = parsed
+            .subject_alternative_name()
+            .unwrap()
+            .expect("cert must carry a SAN extension");
+
+        let mut dns = Vec::new();
+        let mut ips = Vec::new();
+        for name in &san.value.general_names {
+            match name {
+                GeneralName::DNSName(n) => dns.push(n.to_string()),
+                GeneralName::IPAddress(bytes) => ips.push(bytes.len()),
+                _ => {}
+            }
+        }
+        assert_eq!(dns, vec!["policy-controller".to_string()], "DNS SANs");
+        // One 4-byte (v4) and one 16-byte (v6) iPAddress SAN.
+        ips.sort_unstable();
+        assert_eq!(
+            ips,
+            vec![4, 16],
+            "IPv4 + IPv6 iPAddress SANs must be present"
+        );
     }
 
     /// Build a real CSR from a fresh P-256 keypair so we can drive
@@ -573,7 +668,9 @@ mod tests {
             ),
             (
                 "server cert",
-                ca.issue_server_cert("controller", 3600).unwrap().cert_pem,
+                ca.issue_server_cert(&["controller".to_string()], 3600)
+                    .unwrap()
+                    .cert_pem,
             ),
             ("CSR-signed", {
                 let (_k, csr) = make_csr_pem("n1");

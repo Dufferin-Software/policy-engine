@@ -298,7 +298,7 @@ Controller CA (P-384, self-signed, 10yr)
   /var/lib/policy-controller/ca.key   (0600)
   /var/lib/policy-controller/ca.crt   (distributed to agents)
       │
-      ├── Controller gRPC server cert (1yr, includes DNS SAN)
+      ├── Controller gRPC server cert (1yr, DNS + IP SANs from config)
       └── Node client certs (90d default, CommonName = node_id)
 ```
 
@@ -520,7 +520,8 @@ http_addr        = "0.0.0.0:8443"               # operator API
 enrollment_addr  = "0.0.0.0:7776"               # gRPC enrollment (TLS)
 management_addr  = "0.0.0.0:7777"               # gRPC management (mTLS)
 ca_common_name   = "Policy Controller CA"
-server_san       = "controller.local"            # DNS SAN for server cert
+server_san       = "policy-controller"           # primary name: cert CN + first SAN + bundle-URL host
+extra_server_sans = ["10.0.0.5", "controller.local"]  # extra SANs agents may connect via; IPs → iPAddress SANs
 node_cert_ttl_days = 90                          # issued node cert TTL
 web_root         = "/usr/share/policy-controller/web"  # optional web UI
 ```

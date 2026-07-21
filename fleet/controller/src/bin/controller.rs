@@ -260,8 +260,10 @@ async fn main() -> Result<()> {
         .parse()
         .context("Invalid enrollment_addr")?;
 
+    let server_cert_sans = cfg.server_cert_sans();
+    log::info!("Server certificate SANs: {}", server_cert_sans.join(", "));
     let enrollment_server_cert = ca
-        .issue_server_cert("policy-controller", cfg.node_cert_ttl_secs)
+        .issue_server_cert(&server_cert_sans, cfg.node_cert_ttl_secs)
         .context("Failed to issue enrollment server cert")?;
     // Append the CA cert to the chain the enrollment endpoint presents.
     // ZTP agents pin SHA-256 of the CA cert DER and walk the presented chain
@@ -289,7 +291,7 @@ async fn main() -> Result<()> {
         enrollment_cert_holder.clone(),
         Arc::clone(&ca),
         RenewalConfig {
-            san_dns: "policy-controller".to_string(),
+            sans: server_cert_sans.clone(),
             ttl_secs: cfg.node_cert_ttl_secs,
             extra_chain_pem: Some(ca_cert_pem.clone()),
             label: "enrollment",
@@ -340,7 +342,7 @@ async fn main() -> Result<()> {
         .context("Invalid management_addr")?;
 
     let mgmt_server_cert = ca
-        .issue_server_cert("policy-controller", cfg.node_cert_ttl_secs)
+        .issue_server_cert(&server_cert_sans, cfg.node_cert_ttl_secs)
         .context("Failed to issue management server cert")?;
     let mgmt_cert_holder = Arc::new(
         ReloadableServerCert::from_pem(&mgmt_server_cert.cert_pem, &mgmt_server_cert.key_pem, None)
@@ -362,7 +364,7 @@ async fn main() -> Result<()> {
         mgmt_cert_holder,
         Arc::clone(&ca),
         RenewalConfig {
-            san_dns: "policy-controller".to_string(),
+            sans: server_cert_sans.clone(),
             ttl_secs: cfg.node_cert_ttl_secs,
             extra_chain_pem: None,
             label: "management",

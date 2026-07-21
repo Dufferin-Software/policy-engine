@@ -41,7 +41,7 @@ impl CertificateAuthority for NopCa {
     fn issue_node_cert_from_csr(&self, _: &str, _: &str, _: u64) -> anyhow::Result<IssuedCert> {
         unreachable!("print-schema does not issue certs")
     }
-    fn issue_server_cert(&self, _: &str, _: u64) -> anyhow::Result<IssuedCert> {
+    fn issue_server_cert(&self, _: &[String], _: u64) -> anyhow::Result<IssuedCert> {
         unreachable!("print-schema does not issue certs")
     }
 }

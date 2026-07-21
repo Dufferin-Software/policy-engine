@@ -35,9 +35,24 @@ pub struct ControllerConfig {
     #[serde(default = "default_ca_cn")]
     pub ca_common_name: String,
 
-    /// DNS SAN for the controller's gRPC server certificate.
+    /// Primary name for the controller's gRPC server certificate.
+    ///
+    /// Used as the certificate Common Name, as the first SAN, and as the host
+    /// in the enrollment/management URLs baked into bootstrap bundles. Usually
+    /// a DNS name, but an IP is accepted too (it is then encoded as an
+    /// `iPAddress` SAN like any `extra_server_sans` entry).
     #[serde(default = "default_server_san")]
     pub server_san: String,
+
+    /// Additional SANs for the controller's gRPC server certificate.
+    ///
+    /// Every name or IP that an agent might use to reach the controller must
+    /// appear here (or as `server_san`). Entries that parse as an `IpAddr`
+    /// become `iPAddress` SANs, so agents can connect straight to the
+    /// controller's IP without a matching DNS record — otherwise the mTLS leg
+    /// fails hostname verification against a DNS-only cert. Defaults to empty.
+    #[serde(default)]
+    pub extra_server_sans: Vec<String>,
 
     /// Node certificate TTL in seconds.
     ///
@@ -64,6 +79,7 @@ impl Default for ControllerConfig {
             management_addr: default_management_addr(),
             ca_common_name: default_ca_cn(),
             server_san: default_server_san(),
+            extra_server_sans: Vec::new(),
             node_cert_ttl_secs: default_node_cert_ttl_secs(),
             web_root: default_web_root(),
         }
@@ -105,6 +121,21 @@ impl ControllerConfig {
         Ok(())
     }
 
+    /// Full SAN list for the controller's gRPC server certificate:
+    /// `server_san` followed by `extra_server_sans`, de-duplicated while
+    /// preserving order (so `server_san` stays first and thus the CN). Passed
+    /// straight to [`crate::security::ca::CertificateAuthority::issue_server_cert`].
+    pub fn server_cert_sans(&self) -> Vec<String> {
+        let mut sans = Vec::with_capacity(1 + self.extra_server_sans.len());
+        sans.push(self.server_san.clone());
+        for s in &self.extra_server_sans {
+            if !sans.contains(s) {
+                sans.push(s.clone());
+            }
+        }
+        sans
+    }
+
     pub fn ca_key_path(&self) -> PathBuf {
         self.data_dir.join("ca.key")
     }
@@ -139,7 +170,9 @@ fn default_ca_cn() -> String {
 }
 
 fn default_server_san() -> String {
-    "controller.local".to_string()
+    // Matches the DNS name the ZTP flow (and `scripts/e2e-deploy.py`) pins in
+    // each node's /etc/hosts, so the default cert validates out of the box.
+    "policy-controller".to_string()
 }
 
 fn default_node_cert_ttl_secs() -> u64 {
@@ -205,6 +238,29 @@ mod tests {
         };
         cfg.validate()
             .expect("60s TTL is allowed (test mode), only WARN-logged");
+    }
+
+    #[test]
+    fn test_server_cert_sans_prepends_primary_and_dedups() {
+        let cfg = ControllerConfig {
+            server_san: "policy-controller".to_string(),
+            extra_server_sans: vec![
+                "192.168.1.235".to_string(),
+                "controller.local".to_string(),
+                // Duplicate of the primary — must not appear twice.
+                "policy-controller".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.server_cert_sans(),
+            vec![
+                "policy-controller".to_string(),
+                "192.168.1.235".to_string(),
+                "controller.local".to_string(),
+            ],
+            "primary SAN must come first, extras follow, duplicates dropped"
+        );
     }
 
     #[test]

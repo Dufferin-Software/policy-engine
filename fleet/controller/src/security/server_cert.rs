@@ -113,9 +113,11 @@ fn build_certified_key(
 /// Configuration for the server-cert renewal task. One per renewable
 /// endpoint (enrollment, management).
 pub struct RenewalConfig {
-    /// SAN/CN to embed in the renewed cert. Must match the SNI agents
-    /// connect with, otherwise the handshake fails verification.
-    pub san_dns: String,
+    /// SANs to embed in the renewed cert (first entry is also the CN). Must
+    /// cover every name/IP agents connect with, otherwise the handshake fails
+    /// verification. See
+    /// [`crate::security::ca::CertificateAuthority::issue_server_cert`].
+    pub sans: Vec<String>,
     /// TTL applied to each renewed cert.
     pub ttl_secs: u64,
     /// If `Some`, the CA cert PEM is appended to the renewed chain. Use
@@ -175,7 +177,7 @@ pub fn spawn_renewal(
                 continue;
             }
 
-            match ca.issue_server_cert(&cfg.san_dns, cfg.ttl_secs) {
+            match ca.issue_server_cert(&cfg.sans, cfg.ttl_secs) {
                 Ok(new_cert) => match cert_holder.replace(
                     &new_cert.cert_pem,
                     &new_cert.key_pem,
@@ -269,7 +271,9 @@ mod tests {
     fn from_pem_builds_resolver_with_initial_cert() {
         install_provider_once();
         let (_dir, ca) = test_ca();
-        let cert = ca.issue_server_cert("controller.local", 3600).unwrap();
+        let cert = ca
+            .issue_server_cert(&["controller.local".to_string()], 3600)
+            .unwrap();
         let holder = ReloadableServerCert::from_pem(&cert.cert_pem, &cert.key_pem, None).unwrap();
         // The resolver returns *something* — we can't synthesize a ClientHello
         // easily, so go straight to the inner key.
@@ -281,7 +285,9 @@ mod tests {
     fn from_pem_appends_extra_chain() {
         install_provider_once();
         let (_dir, ca) = test_ca();
-        let cert = ca.issue_server_cert("controller.local", 3600).unwrap();
+        let cert = ca
+            .issue_server_cert(&["controller.local".to_string()], 3600)
+            .unwrap();
         let ca_pem = ca.ca_cert_pem();
         let holder =
             ReloadableServerCert::from_pem(&cert.cert_pem, &cert.key_pem, Some(&ca_pem)).unwrap();
@@ -293,11 +299,15 @@ mod tests {
     fn replace_swaps_cert_chain() {
         install_provider_once();
         let (_dir, ca) = test_ca();
-        let first = ca.issue_server_cert("controller.local", 3600).unwrap();
+        let first = ca
+            .issue_server_cert(&["controller.local".to_string()], 3600)
+            .unwrap();
         let holder = ReloadableServerCert::from_pem(&first.cert_pem, &first.key_pem, None).unwrap();
         let first_der = holder.inner.read().unwrap().cert[0].clone();
 
-        let second = ca.issue_server_cert("controller.local", 3600).unwrap();
+        let second = ca
+            .issue_server_cert(&["controller.local".to_string()], 3600)
+            .unwrap();
         holder
             .replace(&second.cert_pem, &second.key_pem, None)
             .unwrap();
@@ -314,7 +324,9 @@ mod tests {
     fn parse_renew_at_is_near_two_thirds() {
         install_provider_once();
         let (_dir, ca) = test_ca();
-        let cert = ca.issue_server_cert("controller.local", 600).unwrap();
+        let cert = ca
+            .issue_server_cert(&["controller.local".to_string()], 600)
+            .unwrap();
         let (nb, na, renew_at) = parse_renew_at(&cert.cert_pem).unwrap();
         let lifetime = (na - nb).num_seconds();
         let offset = (renew_at - nb).num_seconds();

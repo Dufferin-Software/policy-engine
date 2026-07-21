@@ -71,11 +71,12 @@ CONTROLLER_IP="${1:-}"
 CONTROLLER_NAME="${2:-}"
 WIPE_STATE="${3:-}"
 
-# The controller's mgmt/enrollment server cert has a fixed DNS SAN
-# (policy-controller). mTLS validates the URL host against that SAN, so the
-# bundle must reach the controller by that NAME, not an IP. Pin it in
-# /etc/hosts (idempotent, marker-tagged) so name resolution points at the
-# controller. Skipped when the caller passes an empty name (--no-hosts).
+# The controller's mgmt server cert validates the bundle URL host against its
+# SANs. In name mode the cert's DNS SAN is a name (e.g. policy-controller), so
+# nodes must reach the controller by that NAME: pin it in /etc/hosts
+# (idempotent, marker-tagged). Skipped when the caller passes an empty name
+# (--no-hosts / --by-ip, where the bundle URL is the controller IP and the
+# cert carries a matching iPAddress SAN, so no name resolution is needed).
 if [ -n "$CONTROLLER_NAME" ] && [ -n "$CONTROLLER_IP" ]; then
     echo "  pinning /etc/hosts: $CONTROLLER_IP $CONTROLLER_NAME"
     sed -i '/# policy-engine-e2e$/d' /etc/hosts
@@ -266,6 +267,34 @@ def wait_for_controller(api: str, dry_run: bool, timeout: int = 60) -> None:
 
 
 # ── phases ───────────────────────────────────────────────────────────────────
+def bundle_host(args: argparse.Namespace) -> str:
+    """Host embedded in the bundle's controller/enrollment URLs. In --by-ip
+    mode that's the controller's IP (now a cert SAN); otherwise the DNS name
+    that nodes resolve via /etc/hosts."""
+    return args.controller_host if args.by_ip else args.controller_name
+
+
+def write_controller_config(args: argparse.Namespace, r: Runner) -> None:
+    """Write /etc/policy-controller/config.toml so the server cert covers the
+    controller's IP. Only used in --by-ip mode; must run after the deb install
+    (so the package's default config can't clobber it) and before the restart
+    (so the freshly-issued cert picks up the IP SAN)."""
+    config = (
+        "# Managed by scripts/e2e-deploy.py --by-ip — regenerated each run.\n"
+        f'server_san = "{args.controller_name}"\n'
+        f'extra_server_sans = ["{args.controller_host}"]\n'
+    )
+    step("Controller: writing config.toml (IP in extra_server_sans)")
+    r.run(["sudo", "install", "-d", "-m", "0755", "/etc/policy-controller"], check=False)
+    # `capture=True` swallows tee's stdout echo of the config body.
+    r.run(
+        ["sudo", "tee", "/etc/policy-controller/config.toml"],
+        stdin_text=config,
+        capture=True,
+    )
+    ok(f"server cert SANs: {args.controller_name}, {args.controller_host}")
+
+
 def controller_phase(args: argparse.Namespace, r: Runner, ctrl_debs: list[Path]) -> None:
     if not args.skip_controller:
         step("Controller: stop + wipe DB + install")
@@ -288,9 +317,19 @@ def controller_phase(args: argparse.Namespace, r: Runner, ctrl_debs: list[Path])
                 ]
             )
         r.run(["sudo", "apt-get", "install", "-y", "--reinstall", *map(str, ctrl_debs)])
+        # Config must land after the install (which may drop a default config)
+        # and before the restart so the reissued server cert carries the IP SAN.
+        if args.by_ip:
+            write_controller_config(args, r)
         r.run(["sudo", "systemctl", "restart", "policy-controller.service"])
     else:
         step("Controller: skipped (reusing running controller)")
+        if args.by_ip:
+            warn(
+                "--by-ip with --skip-controller: not rewriting config.toml or "
+                "reissuing the cert — the running controller must already list "
+                f"{args.controller_host} in extra_server_sans, or mTLS will fail"
+            )
 
     step(f"Controller: waiting for HTTP API at {args.controller_api}")
     wait_for_controller(args.controller_api, r.dry_run)
@@ -357,7 +396,7 @@ def add_operator(args: argparse.Namespace, r: Runner) -> None:
 def create_bundle(
     args: argparse.Namespace, r: Runner, token: str, bundle_path: Path
 ) -> None:
-    mgmt_url = f"https://{args.controller_name}:7777"
+    mgmt_url = f"https://{bundle_host(args)}:7777"
     step(f"Controller: creating enrollment bundle (mgmt url: {mgmt_url})")
     argv = [
         "policy-controller-client",
@@ -584,6 +623,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--controller-name yourself)",
     )
     p.add_argument(
+        "--by-ip",
+        action="store_true",
+        help="connect nodes straight to the controller's IP (no DNS/hosts). "
+        "Writes /etc/policy-controller/config.toml with the controller IP in "
+        "extra_server_sans so the server cert covers it, embeds the IP in the "
+        "bundle URLs, and skips the /etc/hosts pin. Requires reinstalling the "
+        "controller (not compatible with --skip-controller).",
+    )
+    p.add_argument(
         "--controller-api",
         default="http://127.0.0.1:8443",
         help="base URL of the local controller HTTP API (default: %(default)s)",
@@ -661,6 +709,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    # In --by-ip mode the bundle URL is the controller IP, so there is no name
+    # to pin: the /etc/hosts edit is pointless and would just add a bogus entry.
+    if args.by_ip:
+        args.no_hosts = True
     r = Runner(args.dry_run)
     # Baseline for the enrolment check: a node counts as freshly enrolled only
     # if its lastSeen is at or after this instant. The controller runs on this
@@ -737,8 +789,10 @@ def main(argv: list[str]) -> int:
     step("Summary")
     print(f"  feature:        {args.feature} ({engine_pkg})")
     print(f"  controller ui:  {args.controller_api}")
-    print(f"  bundle mgmt url:https://{args.controller_name}:7777  (embedded for nodes)")
-    if not args.no_hosts:
+    print(f"  bundle mgmt url:https://{bundle_host(args)}:7777  (embedded for nodes)")
+    if args.by_ip:
+        print(f"  node reach:     direct to {args.controller_host} (cert IP SAN, no hosts pin)")
+    elif not args.no_hosts:
         print(f"  node hosts pin: {args.controller_host} {args.controller_name}")
     print(f"  engine state:   {'WIPED' if args.wipe_state else 'preserved'}")
     print(f"  nodes:          {' '.join(args.nodes)}")

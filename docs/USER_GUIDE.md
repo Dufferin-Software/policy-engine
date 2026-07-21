@@ -556,6 +556,11 @@ http_addr       = "0.0.0.0:8443"
 enrollment_addr = "0.0.0.0:7776"
 management_addr = "0.0.0.0:7777"
 server_san      = "controller.yourdomain.com"
+# Every name/IP an agent might use to reach the controller must be on the
+# cert. List the extras here — entries that parse as an IP become iPAddress
+# SANs, so agents can connect straight to the controller's IP without a
+# matching DNS record. Omit if agents only ever use `server_san`.
+extra_server_sans = ["203.0.113.10"]
 node_cert_ttl_days = 90
 ```
 

@@ -116,7 +116,9 @@ mod tests {
             "Test CA",
         )
         .unwrap();
-        let server = ca.issue_server_cert("policy-controller", 3600).unwrap();
+        let server = ca
+            .issue_server_cert(&["policy-controller".to_string()], 3600)
+            .unwrap();
         let watch = RevocationWatch::new(RevokedSerials::default());
 
         let cfg = build_management_server_config(
@@ -141,7 +143,9 @@ mod tests {
             "Test CA",
         )
         .unwrap();
-        let server = ca.issue_server_cert("policy-controller", 3600).unwrap();
+        let server = ca
+            .issue_server_cert(&["policy-controller".to_string()], 3600)
+            .unwrap();
         let watch = RevocationWatch::new(RevokedSerials::default());
 
         let err = build_management_server_config("", make_resolver(&server), watch.subscribe())
