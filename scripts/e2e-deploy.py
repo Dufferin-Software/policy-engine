@@ -3,7 +3,7 @@
 
 Does the tedious loop by hand so you don't have to:
 
-  Controller (this machine, "dev node"):
+  Controller (this machine by default, or --controller-ssh <dest>):
     stop controller -> wipe DB -> install controller + web + client debs ->
     wait for it to come up -> mint an operator API token -> mint a ZTP
     enrollment bundle.
@@ -19,7 +19,11 @@ relative to the repo). Build them yourself first with `make deb` /
 `make deb FEATURES=...` when you want fresh binaries.
 
 Usage:
+    # controller on this dev machine
     scripts/e2e-deploy.py --feature ips node-a node-b root@10.0.0.5
+
+    # controller on a separate box (debs are shipped there over ssh)
+    scripts/e2e-deploy.py --controller-ssh root@10.0.0.2 --by-ip node-a node-b
 
 Run with --help for all options.
 """
@@ -36,6 +40,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -48,6 +53,11 @@ ENGINE_PKG = {
     "ipfix": "policy-engine-ipfix",
     "ips-ipfix": "policy-engine-ips-ipfix",
 }
+
+# Only used in DNS/hosts mode; --by-ip deliberately has no name default. Must
+# match the controller's own `default_server_san()` so an unconfigured
+# controller's cert validates against the name we pin in the nodes' /etc/hosts.
+DEFAULT_CONTROLLER_NAME = "policy-controller"
 
 CONTROLLER_PKGS = [
     "policy-controller",
@@ -188,7 +198,7 @@ class Runner:
         if self.dry_run:
             print(f"{DIM}+ {shown}{RESET}")
             if stdin_text:
-                print(f"{DIM}  (stdin: <remote-script>){RESET}")
+                print(f"{DIM}  (stdin: {len(stdin_text)} bytes){RESET}")
             return None
         return subprocess.run(
             argv,
@@ -198,6 +208,89 @@ class Runner:
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.PIPE if capture else None,
         )
+
+
+# ── where the controller lives ───────────────────────────────────────────────
+class ControllerHost:
+    """The machine the controller runs on: this one, or a remote box over ssh.
+
+    Every controller-side action (deb install, config write, mint-token,
+    add-operator, policy-controller-client calls) goes through here, so the
+    local and remote paths stay identical apart from the ssh wrapper.
+    """
+
+    STAGE = "/tmp/pe-e2e-ctrl"
+
+    def __init__(self, runner: Runner, ssh_dest: str | None, ssh_opts: list[str]) -> None:
+        self.r = runner
+        self.ssh_dest = ssh_dest
+        self.ssh_opts = ssh_opts
+
+    @property
+    def remote(self) -> bool:
+        return self.ssh_dest is not None
+
+    @property
+    def label(self) -> str:
+        return self.ssh_dest if self.ssh_dest else "this machine"
+
+    def _wrap(self, argv: list[str]) -> list[str]:
+        """Local argv, or the same argv re-quoted for a remote shell."""
+        if not self.remote:
+            return argv
+        return [
+            "ssh",
+            *self.ssh_opts,
+            self.ssh_dest,
+            " ".join(shlex.quote(a) for a in argv),
+        ]
+
+    def run(self, argv: list[str], *, sudo: bool = False, **kw):
+        return self.r.run(self._wrap(["sudo", *argv] if sudo else list(argv)), **kw)
+
+    def run_script(self, script: str, *, sudo: bool = False, **kw):
+        """Run a bash snippet on the controller host.
+
+        The script travels in argv (not stdin) so callers keep stdin free for
+        data — e.g. piping a password into add-operator, or a config body into
+        a file. sudo passes that stdin straight through.
+        """
+        argv = ["bash", "-c", script]
+        return self.r.run(self._wrap(["sudo", *argv] if sudo else argv), **kw)
+
+    def probe(self, argv: list[str]) -> subprocess.CompletedProcess:
+        """Run a read-only query on the controller host, bypassing the Runner
+        (so it still answers under --dry-run). Raises on failure."""
+        return subprocess.run(self._wrap(argv), check=True, text=True, capture_output=True)
+
+    def put(self, paths: list[Path]) -> list[str]:
+        """Make `paths` available on the controller host, returning the paths
+        to use there. Local: the originals. Remote: scp'd into STAGE."""
+        if not self.remote:
+            return [str(p) for p in paths]
+        self.r.run(
+            ["ssh", *self.ssh_opts, self.ssh_dest,
+             f"rm -rf {self.STAGE} && mkdir -p {self.STAGE}"]
+        )
+        self.r.run(
+            ["scp", *self.ssh_opts, *map(str, paths), f"{self.ssh_dest}:{self.STAGE}/"]
+        )
+        return [f"{self.STAGE}/{p.name}" for p in paths]
+
+    def now_utc(self) -> datetime:
+        """The controller's clock, as an aware UTC datetime.
+
+        Used as the enrolment-freshness baseline. Locally our clock *is* the
+        controller's; remotely it may be skewed, so ask the far end.
+        """
+        if not self.remote or self.r.dry_run:
+            return datetime.now(timezone.utc)
+        proc = self.run(["date", "-u", "+%s"], capture=True, check=False)
+        try:
+            return datetime.fromtimestamp(int((proc.stdout or "").strip()), timezone.utc)
+        except (ValueError, AttributeError):
+            warn(f"could not read {self.ssh_dest}'s clock; using local time as baseline")
+            return datetime.now(timezone.utc)
 
 
 # ── deb resolution ───────────────────────────────────────────────────────────
@@ -216,53 +309,72 @@ def resolve_deb(deb_dir: Path, pkg: str) -> Path:
 
 
 # ── controller-host autodetection ────────────────────────────────────────────
-def autodetect_host() -> str:
-    """Primary outbound IPv4 address of this machine."""
-    try:
-        out = subprocess.run(
-            ["ip", "-4", "route", "get", "1.1.1.1"],
-            check=True,
-            text=True,
-            capture_output=True,
-        ).stdout.split()
-        if "src" in out:
+def autodetect_host(host: ControllerHost) -> str:
+    """Primary outbound IPv4 address of the controller machine — the address
+    the nodes will be pointed at."""
+    if host.remote and host.r.dry_run:
+        return "<controller-ip>"
+    for argv in (["ip", "-4", "route", "get", "1.1.1.1"], ["hostname", "-I"]):
+        try:
+            proc = host.probe(argv)
+        except Exception:
+            continue
+        out = proc.stdout.split()
+        if argv[0] == "ip" and "src" in out:
             return out[out.index("src") + 1]
-    except Exception:
-        pass
-    try:
-        out = subprocess.run(
-            ["hostname", "-I"], check=True, text=True, capture_output=True
-        ).stdout.split()
-        if out:
+        if argv[0] == "hostname" and out:
             return out[0]
-    except Exception:
-        pass
     raise DeployError(
         "could not autodetect controller host; pass --controller-host <addr>"
     )
 
 
-def wait_for_controller(api: str, dry_run: bool, timeout: int = 60) -> None:
-    if dry_run:
-        print(f"{DIM}+ wait for {api}/health{RESET}")
+# Probes the controller's HTTP listener from the controller host itself, so
+# this works regardless of what a firewall lets through to the dev machine.
+# A bound socket is the same readiness signal the local urllib check uses.
+_PROBE_SCRIPT = r"""
+for _ in $(seq 1 %(timeout)d); do
+    if (exec 3<>/dev/tcp/%(host)s/%(port)d) 2>/dev/null; then exit 0; fi
+    sleep 1
+done
+exit 1
+"""
+
+
+def wait_for_controller(api: str, host: ControllerHost, timeout: int = 60) -> None:
+    if host.r.dry_run:
+        print(f"{DIM}+ wait for {api}/health on {host.label}{RESET}")
         return
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        for path in ("/health", "/"):
-            try:
-                with urllib.request.urlopen(api + path, timeout=2):
+
+    if host.remote:
+        parsed = urllib.parse.urlsplit(api)
+        script = _PROBE_SCRIPT % {
+            "timeout": timeout,
+            "host": parsed.hostname or "127.0.0.1",
+            "port": parsed.port or 8443,
+        }
+        proc = host.run_script(script, check=False, capture=True)
+        if proc.returncode == 0:
+            ok("controller is up")
+            return
+    else:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for path in ("/health", "/"):
+                try:
+                    with urllib.request.urlopen(api + path, timeout=2):
+                        ok("controller is up")
+                        return
+                except urllib.error.HTTPError:
+                    # Any HTTP response means the server is listening.
                     ok("controller is up")
                     return
-            except urllib.error.HTTPError:
-                # Any HTTP response means the server is listening.
-                ok("controller is up")
-                return
-            except Exception:
-                pass
-        time.sleep(1)
+                except Exception:
+                    pass
+            time.sleep(1)
     raise DeployError(
         "controller did not come up within "
-        f"{timeout}s (check: journalctl -u policy-controller)"
+        f"{timeout}s (check: journalctl -u policy-controller on {host.label})"
     )
 
 
@@ -274,73 +386,175 @@ def bundle_host(args: argparse.Namespace) -> str:
     return args.controller_host if args.by_ip else args.controller_name
 
 
-def write_controller_config(args: argparse.Namespace, r: Runner) -> None:
-    """Write /etc/policy-controller/config.toml so the server cert covers the
-    controller's IP. Only used in --by-ip mode; must run after the deb install
-    (so the package's default config can't clobber it) and before the restart
-    (so the freshly-issued cert picks up the IP SAN)."""
-    config = (
-        "# Managed by scripts/e2e-deploy.py --by-ip — regenerated each run.\n"
-        f'server_san = "{args.controller_name}"\n'
-        f'extra_server_sans = ["{args.controller_host}"]\n'
+def controller_sans(args: argparse.Namespace) -> list[str]:
+    """Server-cert SANs for the controller, primary entry first.
+
+    The primary is special twice over: it becomes the cert CN, and the
+    controller uses `server_san` as the host of the enrollment URLs its web UI
+    pre-fills — so it must be whatever the nodes actually dial.
+
+      --by-ip:  the IP leads (a legal primary SAN — it's encoded as an
+                iPAddress GeneralName), and a name only appears if one was
+                asked for explicitly.
+      otherwise: the DNS name leads, with the IP carried as an extra SAN so a
+                node that connects by address still validates.
+    """
+    sans = (
+        [args.controller_host, args.controller_name]
+        if args.by_ip
+        else [args.controller_name, args.controller_host]
     )
-    step("Controller: writing config.toml (IP in extra_server_sans)")
-    r.run(["sudo", "install", "-d", "-m", "0755", "/etc/policy-controller"], check=False)
-    # `capture=True` swallows tee's stdout echo of the config body.
-    r.run(
-        ["sudo", "tee", "/etc/policy-controller/config.toml"],
-        stdin_text=config,
+    out: list[str] = []
+    for s in sans:
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+# ControllerConfig is a flat table (no `[section]`s), so dropping the two SAN
+# keys and appending replacements is a safe edit that leaves any other operator
+# settings — web_root, node_cert_ttl_secs, bind addresses — untouched. Only
+# single-line `extra_server_sans = [...]` is recognised, which is all this
+# script ever writes.
+_WRITE_CONFIG_SCRIPT = r"""
+set -eu
+CFG=/etc/policy-controller/config.toml
+install -d -m 0755 /etc/policy-controller
+[ -f "$CFG" ] || : > "$CFG"
+sed -i -E '/^[[:space:]]*(server_san|extra_server_sans)[[:space:]]*=/d;
+           /^# server SANs managed by scripts\/e2e-deploy\.py/d' "$CFG"
+cat >> "$CFG"
+"""
+
+
+def write_controller_config(args: argparse.Namespace, host: ControllerHost) -> None:
+    """Point the controller's server cert at the SANs the nodes will dial.
+
+    Runs on every deploy: the certs are re-issued from this config at each
+    startup, and without it the controller keeps its built-in default
+    (`policy-controller`) while the bundle sends nodes to some other name —
+    which fails the mTLS leg with "certificate not valid for name ...".
+
+    Must land after the deb install and before the restart so the freshly
+    issued cert picks the SANs up.
+    """
+    sans = controller_sans(args)
+    extra = ", ".join(f'"{s}"' for s in sans[1:])
+    block = (
+        "# server SANs managed by scripts/e2e-deploy.py — regenerated each run.\n"
+        f'server_san = "{sans[0]}"\n'
+        f"extra_server_sans = [{extra}]\n"
+    )
+    step(f"Controller: setting server-cert SANs in config.toml ({', '.join(sans)})")
+    host.run_script(_WRITE_CONFIG_SCRIPT, sudo=True, stdin_text=block, capture=True)
+    ok(f"server cert SANs: {', '.join(sans)}")
+
+
+# Marker logged by the controller at startup, listing the SANs it actually
+# issued its gRPC server certs with. Added by commit e6299ee (2026-07-21)
+# alongside configurable SANs; controllers built before that hardcode
+# DnsName("policy-controller") and silently ignore server_san, so its absence
+# is the tell-tale for a stale binary.
+_SAN_LOG_MARKER = "Server certificate SANs:"
+
+
+def verify_cert_sans(args: argparse.Namespace, host: ControllerHost) -> None:
+    """Check the controller issued its server certs with the SANs we asked for.
+
+    Config alone doesn't prove it: a controller older than e6299ee parses
+    server_san happily and then issues certs for "policy-controller" anyway,
+    which fails every node's management mTLS leg with a hostname-verification
+    error that says nothing about the real cause.
+    """
+    want = controller_sans(args)[0]
+    proc = host.run(
+        ["journalctl", "-u", "policy-controller.service", "-n", "200", "--no-pager"],
+        sudo=True,
         capture=True,
+        check=False,
     )
-    ok(f"server cert SANs: {args.controller_name}, {args.controller_host}")
+    if proc is None or proc.returncode != 0:
+        warn("could not read the controller journal — skipping server-SAN check")
+        return
+    lines = [ln for ln in (proc.stdout or "").splitlines() if _SAN_LOG_MARKER in ln]
+    if not lines:
+        warn(
+            "the controller never logged its server-cert SANs — this build "
+            "predates configurable SANs (commit e6299ee, 2026-07-21) and will "
+            'issue certs for "policy-controller" no matter what config.toml '
+            f"says, so nodes dialling {want} will fail mTLS hostname "
+            "verification. Rebuild the debs with 'make deb' and rerun."
+        )
+        return
+    issued = lines[-1].split(_SAN_LOG_MARKER, 1)[1].strip()
+    if want in [s.strip() for s in issued.split(",")]:
+        ok(f"controller issued server certs for: {issued}")
+    else:
+        warn(
+            f"controller issued server certs for [{issued}] but the nodes will "
+            f"dial {want} — their mTLS leg will fail hostname verification"
+        )
 
 
-def controller_phase(args: argparse.Namespace, r: Runner, ctrl_debs: list[Path]) -> None:
+def controller_phase(
+    args: argparse.Namespace, host: ControllerHost, ctrl_debs: list[Path]
+) -> None:
     if not args.skip_controller:
-        step("Controller: stop + wipe DB + install")
-        r.run(["sudo", "systemctl", "stop", "policy-controller.service"], check=False)
-        r.run(
+        step(f"Controller ({host.label}): stop + wipe DB + install")
+        host.run(["systemctl", "stop", "policy-controller.service"], sudo=True, check=False)
+        host.run(
             [
-                "sudo", "rm", "-f",
+                "rm", "-f",
                 "/var/lib/policy-controller/controller.db",
                 "/var/lib/policy-controller/controller.db-wal",
                 "/var/lib/policy-controller/controller.db-shm",
-            ]
+            ],
+            sudo=True,
         )
         if args.wipe_ca:
             warn("wiping controller CA (ca.key/ca.crt)")
-            r.run(
+            host.run(
                 [
-                    "sudo", "rm", "-f",
+                    "rm", "-f",
                     "/var/lib/policy-controller/ca.key",
                     "/var/lib/policy-controller/ca.crt",
-                ]
+                ],
+                sudo=True,
             )
-        r.run(["sudo", "apt-get", "install", "-y", "--reinstall", *map(str, ctrl_debs)])
+        # Ship the debs over first when the controller is remote; local installs
+        # read them straight out of the deb dir.
+        staged = host.put(ctrl_debs)
+        host.run(["apt-get", "install", "-y", "--reinstall", *staged], sudo=True)
         # Config must land after the install (which may drop a default config)
-        # and before the restart so the reissued server cert carries the IP SAN.
-        if args.by_ip:
-            write_controller_config(args, r)
-        r.run(["sudo", "systemctl", "restart", "policy-controller.service"])
+        # and before the restart so the reissued server cert carries our SANs.
+        write_controller_config(args, host)
+        host.run(["systemctl", "restart", "policy-controller.service"], sudo=True)
     else:
         step("Controller: skipped (reusing running controller)")
-        if args.by_ip:
-            warn(
-                "--by-ip with --skip-controller: not rewriting config.toml or "
-                "reissuing the cert — the running controller must already list "
-                f"{args.controller_host} in extra_server_sans, or mTLS will fail"
-            )
+        warn(
+            "--skip-controller: not rewriting config.toml or reissuing the "
+            "server cert — the running controller must already carry "
+            f"{controller_sans(args)[0]} as a server-cert SAN, or the nodes' "
+            "mTLS leg will fail hostname verification"
+        )
 
-    step(f"Controller: waiting for HTTP API at {args.controller_api}")
-    wait_for_controller(args.controller_api, r.dry_run)
+    step(f"Controller: waiting for HTTP API at {args.controller_api} (on {host.label})")
+    wait_for_controller(args.controller_api, host)
+    # Only meaningful against a controller we just restarted; under
+    # --skip-controller the journal may predate the current config.
+    if not args.skip_controller and not host.r.dry_run:
+        verify_cert_sans(args, host)
 
 
-def mint_token(args: argparse.Namespace, r: Runner) -> str:
+def mint_token(args: argparse.Namespace, host: ControllerHost) -> str:
     step("Controller: minting operator API token")
     token_name = f"e2e-{int(time.time())}"
-    argv = ["sudo", "policy-controller-mint-token", "--name", token_name, "--role", "operator"]
-    proc = r.run(argv, capture=True)
-    if r.dry_run:
+    proc = host.run(
+        ["policy-controller-mint-token", "--name", token_name, "--role", "operator"],
+        sudo=True,
+        capture=True,
+    )
+    if host.r.dry_run:
         return "DRY_RUN_TOKEN"
     token = (proc.stdout or "").strip()
     if not token:
@@ -349,39 +563,33 @@ def mint_token(args: argparse.Namespace, r: Runner) -> str:
     return token
 
 
-def add_operator(args: argparse.Namespace, r: Runner) -> None:
+# add-operator has no --password flag: it reads a file (or prompts a TTY). The
+# password arrives on stdin and never touches an argv, so it stays out of the
+# process table on either host; the 0600 temp file is removed either way.
+_ADD_OPERATOR_SCRIPT = r"""
+set -u
+umask 077
+pw=$(mktemp /tmp/pe-e2e-pw.XXXXXX)
+trap 'rm -f "$pw"' EXIT
+cat > "$pw"
+sudo policy-controller-add-operator --username %(user)s --password-file "$pw" --role admin
+"""
+
+
+def add_operator(args: argparse.Namespace, host: ControllerHost) -> None:
     """Create a controller-web operator account (argon2id-hashed password)."""
     if args.no_operator:
         return
     step(f"Controller: creating operator '{args.operator_user}' (role admin)")
-    if r.dry_run:
-        r.run(
-            [
-                "sudo", "policy-controller-add-operator",
-                "--username", args.operator_user,
-                "--password-file", "<tmp>",
-                "--role", "admin",
-            ]
-        )
+    script = _ADD_OPERATOR_SCRIPT % {"user": shlex.quote(args.operator_user)}
+    proc = host.run_script(
+        script,
+        stdin_text=args.operator_password + "\n",
+        check=False,
+        capture=True,
+    )
+    if host.r.dry_run:
         return
-    # add-operator has no --password flag; it reads a file (or prompts a TTY).
-    fd, pw_path = tempfile.mkstemp(prefix="pe-e2e-pw.")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(args.operator_password + "\n")
-        os.chmod(pw_path, 0o600)
-        proc = r.run(
-            [
-                "sudo", "policy-controller-add-operator",
-                "--username", args.operator_user,
-                "--password-file", pw_path,
-                "--role", "admin",
-            ],
-            check=False,
-            capture=True,
-        )
-    finally:
-        Path(pw_path).unlink(missing_ok=True)
     if proc is not None and proc.returncode != 0:
         warn(
             f"could not create operator '{args.operator_user}' "
@@ -394,10 +602,12 @@ def add_operator(args: argparse.Namespace, r: Runner) -> None:
 
 
 def create_bundle(
-    args: argparse.Namespace, r: Runner, token: str, bundle_path: Path
+    args: argparse.Namespace, host: ControllerHost, token: str, bundle_path: Path
 ) -> None:
     mgmt_url = f"https://{bundle_host(args)}:7777"
     step(f"Controller: creating enrollment bundle (mgmt url: {mgmt_url})")
+    # Runs on the controller host; its stdout (the bundle) comes back to us and
+    # is written locally, ready to scp on to each node.
     argv = [
         "policy-controller-client",
         "--url", args.controller_api,
@@ -409,8 +619,8 @@ def create_bundle(
         "--label", args.label,
         "--bundle-only",
     ]
-    proc = r.run(argv, capture=True, redact=token)
-    if r.dry_run:
+    proc = host.run(argv, capture=True, redact=token)
+    if host.r.dry_run:
         return
     bundle = (proc.stdout or "").strip()
     if not bundle:
@@ -535,7 +745,7 @@ def _node_label(n: dict) -> str:
 
 
 def verify_enrolment(
-    args: argparse.Namespace, r: Runner, token: str, since: datetime
+    args: argparse.Namespace, host: ControllerHost, token: str, since: datetime
 ) -> None:
     """Poll until every deployed node has checked in since `since`, then show
     the node table."""
@@ -543,8 +753,8 @@ def verify_enrolment(
         return
     base = ["policy-controller-client", "--url", args.controller_api, "--token", token]
     step(f"Verifying enrolment (checked in since {since.isoformat(timespec='seconds')})")
-    if r.dry_run:
-        r.run([*base, "nodes", "list", "--status", "active"], redact=token)
+    if host.r.dry_run:
+        host.run([*base, "nodes", "list", "--status", "active"], redact=token)
         return
 
     expected = len(args.nodes)
@@ -552,7 +762,7 @@ def verify_enrolment(
     nodes: list[dict] = []
     fresh: list[dict] = []
     while time.monotonic() < deadline:
-        proc = r.run(
+        proc = host.run(
             [*base, "--json", "nodes", "list", "--status", "active"],
             capture=True,
             check=False,
@@ -582,7 +792,7 @@ def verify_enrolment(
             warn(f"  stale/not-yet-connected: {_node_label(n)} "
                  f"(lastSeen={n.get('lastSeen') or 'never'})")
     # Show the human-readable table regardless.
-    r.run([*base, "nodes", "list", "--status", "active"], check=False, redact=token)
+    host.run([*base, "nodes", "list", "--status", "active"], check=False, redact=token)
 
 
 # ── argument parsing ─────────────────────────────────────────────────────────
@@ -605,16 +815,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="directory holding the prebuilt .deb files (default: the repo's parent)",
     )
     p.add_argument(
+        "--controller-ssh",
+        default=None,
+        metavar="DEST",
+        help="ssh destination of the machine to install the controller on "
+        "(e.g. root@10.0.0.2). The controller debs are copied there and every "
+        "controller-side command runs over ssh. Default: this machine.",
+    )
+    p.add_argument(
         "--controller-host",
         default=None,
         help="IP the NODES route to for this controller. Pinned in each node's "
-        "/etc/hosts as <controller-name>. Default: this machine's primary IP.",
+        "/etc/hosts as <controller-name>. Default: the controller machine's "
+        "primary IP (autodetected locally, or over ssh with --controller-ssh).",
     )
     p.add_argument(
         "--controller-name",
-        default="policy-controller",
+        default=None,
         help="DNS name embedded in the bundle URLs; must match the controller's "
-        "server-cert SAN (default: policy-controller)",
+        f"server-cert SAN (default: {DEFAULT_CONTROLLER_NAME}). Under --by-ip "
+        "there is no default at all — the controller is addressed purely by IP "
+        "— and passing one only adds it as an extra cert SAN.",
     )
     p.add_argument(
         "--no-hosts",
@@ -625,16 +846,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--by-ip",
         action="store_true",
-        help="connect nodes straight to the controller's IP (no DNS/hosts). "
-        "Writes /etc/policy-controller/config.toml with the controller IP in "
-        "extra_server_sans so the server cert covers it, embeds the IP in the "
-        "bundle URLs, and skips the /etc/hosts pin. Requires reinstalling the "
-        "controller (not compatible with --skip-controller).",
+        help="connect nodes straight to the controller's IP (no DNS/hosts at "
+        "all). Writes /etc/policy-controller/config.toml with the controller IP "
+        "as server_san so the server cert covers it and the web UI's own bundle "
+        "URLs use it too, embeds the IP in the bundle URLs, and skips the "
+        "/etc/hosts pin. Requires reinstalling the controller (not compatible "
+        "with --skip-controller).",
     )
     p.add_argument(
         "--controller-api",
         default="http://127.0.0.1:8443",
-        help="base URL of the local controller HTTP API (default: %(default)s)",
+        help="base URL of the controller HTTP API, as seen FROM the controller "
+        "machine (default: %(default)s)",
     )
     p.add_argument("--ttl", default="1h", help="enrollment-token TTL (default: %(default)s)")
     p.add_argument(
@@ -644,7 +867,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--ssh-opts",
         default="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
-        help="extra options passed to ssh/scp",
+        help="extra options passed to ssh/scp (nodes and --controller-ssh alike)",
     )
     p.add_argument(
         "--skip-controller",
@@ -711,13 +934,18 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     # In --by-ip mode the bundle URL is the controller IP, so there is no name
     # to pin: the /etc/hosts edit is pointless and would just add a bogus entry.
+    # A name is only carried if one was asked for explicitly (as an extra SAN).
     if args.by_ip:
         args.no_hosts = True
+    elif not args.controller_name:
+        args.controller_name = DEFAULT_CONTROLLER_NAME
     r = Runner(args.dry_run)
+    host = ControllerHost(r, args.controller_ssh, shlex.split(args.ssh_opts))
     # Baseline for the enrolment check: a node counts as freshly enrolled only
-    # if its lastSeen is at or after this instant. The controller runs on this
-    # same host, so its clock and ours agree (no skew to compensate for).
-    started = datetime.now(timezone.utc)
+    # if its lastSeen is at or after this instant — read off the controller's
+    # own clock, which is ours when it runs here and may be skewed when it
+    # doesn't.
+    started = host.now_utc()
 
     repo_root = Path(__file__).resolve().parent.parent
     deb_dir = (args.deb_dir or repo_root.parent).resolve()
@@ -733,10 +961,10 @@ def main(argv: list[str]) -> int:
         print(f"   {d.name}")
 
     if not args.controller_host:
-        args.controller_host = autodetect_host()
+        args.controller_host = autodetect_host(host)
         warn(
             f"autodetected controller host: {args.controller_host} "
-            "(override with --controller-host)"
+            f"(on {host.label}; override with --controller-host)"
         )
 
     fd, bundle_name = tempfile.mkstemp(prefix="pe-e2e-bundle.", suffix=".b64", dir="/tmp")
@@ -746,10 +974,10 @@ def main(argv: list[str]) -> int:
     failed: list[str] = []
     token = "<tok>"
     try:
-        controller_phase(args, r, ctrl_debs)
-        token = mint_token(args, r)
-        add_operator(args, r)
-        create_bundle(args, r, token, bundle_path)
+        controller_phase(args, host, ctrl_debs)
+        token = mint_token(args, host)
+        add_operator(args, host)
+        create_bundle(args, host, token, bundle_path)
 
         # Under --dry-run or a single node, run sequentially with live inline
         # output. Otherwise fan out across threads (SSH is I/O-bound) and print
@@ -777,7 +1005,7 @@ def main(argv: list[str]) -> int:
                     if not success:
                         failed.append(target)
 
-        verify_enrolment(args, r, token, started)
+        verify_enrolment(args, host, token, started)
     finally:
         if args.keep_bundle:
             if bundle_path.exists() and bundle_path.stat().st_size:
@@ -788,7 +1016,13 @@ def main(argv: list[str]) -> int:
     # ── summary ──────────────────────────────────────────────────────────────
     step("Summary")
     print(f"  feature:        {args.feature} ({engine_pkg})")
-    print(f"  controller ui:  {args.controller_api}")
+    print(f"  controller on:  {host.label}")
+    # The API URL is controller-local; from here you reach it on its real address.
+    ui_url = args.controller_api
+    if host.remote:
+        parsed = urllib.parse.urlsplit(args.controller_api)
+        ui_url = f"{parsed.scheme}://{args.controller_host}:{parsed.port or 8443}"
+    print(f"  controller ui:  {ui_url}")
     print(f"  bundle mgmt url:https://{bundle_host(args)}:7777  (embedded for nodes)")
     if args.by_ip:
         print(f"  node reach:     direct to {args.controller_host} (cert IP SAN, no hosts pin)")
@@ -799,11 +1033,20 @@ def main(argv: list[str]) -> int:
     if not args.no_operator:
         print(f"  operator login: {args.operator_user} / {args.operator_password}")
     print(f"  api token:      {token}")
-    print(
-        f"{DIM}  rerun a client command with:\n"
-        f"    export POLICY_CONTROLLER_TOKEN={token}\n"
-        f"    policy-controller-client --url {args.controller_api} nodes list --status active{RESET}"
-    )
+    if host.remote:
+        # An exported var doesn't cross ssh, so pass the token inline instead.
+        hint = (
+            f"    ssh {args.controller_ssh} 'policy-controller-client "
+            f"--url {args.controller_api} --token {token} "
+            "nodes list --status active'"
+        )
+    else:
+        hint = (
+            f"    export POLICY_CONTROLLER_TOKEN={token}\n"
+            f"    policy-controller-client --url {args.controller_api} "
+            "nodes list --status active"
+        )
+    print(f"{DIM}  rerun a client command with:\n{hint}{RESET}")
     if failed:
         print(f"{RED}  failed:         {' '.join(failed)}{RESET}")
         return 1
