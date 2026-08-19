@@ -732,8 +732,9 @@ the BPF tail call chosen by the dispatcher decides which inspector runs.
   and cross-packet CRYPTO reassembly against two real captured Firefox→YouTube
   Initial packets (committed as hex fixtures). The synthetic single-Initial path
   alone is not enough to catch reassembly regressions; the real-pcap fixture is.
-- **End-to-end (netsim)** — `tests/quic_sni_matching/` (UDP path) and
-  `tests/policy_sanity/test_sni_matching.py` (TCP path). Bring up a two-node
+- **End-to-end (netsim)** — `python/tests/sni_matching/`, covering both the TCP
+  path (scapy ClientHellos, `tls_sni_send.py`) and the UDP path (QUIC v1/v2
+  Initials via aioquic, `quic_sni_send.py`). Bring up a two-node
   topology, install SNI policy rules on the server, fire real ClientHellos from
   the client, and assert that the rule packet counter advances and a verdict
   appears in `flow_verdict_cache`.

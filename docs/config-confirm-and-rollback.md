@@ -195,7 +195,7 @@ throughout, so no policy is ever briefly more permissive than before.
   confirms APPLIED and drives the happy path).
 - Agent-side: `policy-node-agent/src/pending_change.rs` (watchdog fires a
   REVERTED confirm on timeout; commit removes the entry).
-- Integration: `netsim/tests/multi_node/test_config_rollback.py` installs a
+- Integration: `python/tests/multi_node/test_config_rollback.py` installs a
   rule that black-holes controller-bound traffic and verifies the node rolls
   it back when the handshake cannot complete, then reconnects to the
   controller cleanly.

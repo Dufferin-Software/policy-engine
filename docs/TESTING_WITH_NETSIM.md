@@ -1,9 +1,14 @@
 # Testing with Netsim
 
-This guide covers running the full integration test suite using `netsim`, a libvirt/QEMU-based
-network topology simulator. Tests spin up real Debian 13 VMs, install built packages, and
-verify end-to-end behavior including BPF program loading, traffic enforcement, IPS/IDS,
-IPFIX flow export, XDP forwarding, multi-node fleet management, and more.
+This guide covers running the integration test suites in `python/tests/`. They spin up real
+Debian 13 VMs, install the built packages, and verify end-to-end behavior including BPF
+program loading, traffic enforcement, IPS/IDS, IPFIX flow export, XDP forwarding, multi-node
+fleet management, and more.
+
+The VMs come from [netsim](https://github.com/Dufferin-Software/netsim), a libvirt/QEMU
+topology simulator this project depends on. netsim supplies the topology, VM lifecycle, SSH
+access and package installation as pytest fixtures; the suites themselves are ours. See
+`python/README.md` for the layout.
 
 ## Table of Contents
 
@@ -20,8 +25,6 @@ IPFIX flow export, XDP forwarding, multi-node fleet management, and more.
    - [persistence — State Across Restarts](#persistence--state-across-restarts)
    - [tls — HTTPS and Certificate Validation](#tls--https-and-certificate-validation)
    - [multi_node — Fleet Controller](#multi_node--fleet-controller)
-   - [two_node_iperf — Throughput](#two_node_iperf--throughput)
-   - [three_node_iperf — Multi-hop Throughput](#three_node_iperf--multi-hop-throughput)
    - [policy_performance — Rule Lookup Performance](#policy_performance--rule-lookup-performance)
    - [scale_test — Fleet Scale](#scale_test--fleet-scale)
 5. [Running Specific Tests](#running-specific-tests)
@@ -35,25 +38,36 @@ IPFIX flow export, XDP forwarding, multi-node fleet management, and more.
 ### Host Requirements
 
 - Linux host with KVM support (`/dev/kvm` accessible)
-- libvirt and QEMU installed
-- netsim installed and configured for user-mode sessions
+- libvirt and QEMU installed, and **not** using the AppArmor security driver — it blocks
+  QEMU from reading images under `~/.netsim`. Set `security_driver = "none"` in
+  `/etc/libvirt/qemu.conf` and restart `libvirtd`.
+- `libvirt-dev` and `pkg-config`, to build `libvirt-python`
+
+The suites live in this repo under `python/tests/`. netsim arrives as a dependency, so
+installing this project is all that is needed:
 
 ```bash
-cd netsim
-./setup-user-mode.sh    # configures libvirt user session + sudoers
 poetry install
+```
+
+The libvirt user session is configured once, with the script from a netsim checkout:
+
+```bash
+git clone git@github.com:Dufferin-Software/netsim.git
+netsim/setup-user-mode.sh    # configures libvirt user session + sudoers
 ```
 
 ### Verify Netsim Works
 
 ```bash
-netsim status
+poetry run netsim status
 ```
 
 ### Package Requirements
 
-Each test suite installs one or more `.deb` packages onto VMs via `--install-packages`. Build
-the packages you need before running tests (see [Building Packages](#building-packages)).
+Each suite's topology YAML names the `.deb` packages each of its nodes installs, and pytest
+resolves those globs against `--package-dir` before booting a single VM. Build the packages
+you need first (see [Building Packages](#building-packages)).
 
 ---
 
@@ -83,30 +97,30 @@ convenient.
 
 ## Common Workflow
 
-The standard lifecycle for every test suite is:
+Every suite runs the same way:
 
 ```bash
-cd netsim
+make deb                                    # .debs land in the parent directory
 
-# 1. Start the topology (boots VMs, waits for SSH)
-netsim start tests/<suite>/<suite>.yaml
-
-# 2. Run tests (installs packages on first run)
-python3 -m pytest tests/<suite>/ -v \
-    --install-packages /path/to/policy-engine.deb[,/path/to/other.deb]
-
-# 3. Re-run tests without reinstalling (faster iteration)
-python3 -m pytest tests/<suite>/ -v
-
-# 4. Destroy VMs when done
-netsim destroy tests/<suite>/<suite>.yaml
+poetry run pytest python/tests/<suite>/ --package-dir ..
 ```
 
-The `--install-packages` flag copies and installs the listed `.deb` files onto all VMs in
-the topology. Pass multiple packages as a comma-separated list.
+pytest owns the topology. The autouse `running_topology` fixture boots the VMs, installs
+each node's packages, configures interfaces, and destroys everything afterwards — including
+when a test fails. Boot takes about a minute per run.
 
-> **Tip:** Topology boot takes ~60s. Leave VMs running between test runs — `netsim start`
-> is idempotent and fast if VMs are already running.
+`--package-dir` is where the `.deb` files are. Each topology also names a default, so the
+flag can be dropped when the packages are where `dpkg-buildpackage` left them.
+
+Suites whose nodes declare per-feature package sets need `--feature` to say which build to
+install:
+
+```bash
+poetry run pytest python/tests/ips_ids/ --feature ips --package-dir ..
+```
+
+> **Tip:** `--pause-on-failure` keeps the topology up when a test fails and prints the
+> `ssh` command for each node.
 
 ---
 
@@ -114,17 +128,15 @@ the topology. Pass multiple packages as a comma-separated list.
 
 ### policy_sanity — Core Functionality
 
-**Topology:** `tests/policy_sanity/policy_sanity.yaml`  
+**Topology:** `python/tests/policy_sanity/policy_sanity.yaml`  
 **VMs:** 2 — `server` (policy-engine), `client` (traffic source)  
 **Network:** `net1` — 10.1.1.0/24, 2001:db8:1::/64
 
 **Package required:** `policy-engine`
 
 ```bash
-netsim start tests/policy_sanity/policy_sanity.yaml
-
-python3 -m pytest tests/policy_sanity/ -v \
-    --install-packages ../policy-engine_*.deb
+poetry run pytest python/tests/policy_sanity/ -v \
+    --package-dir ..
 ```
 
 **Test files and what they cover:**
@@ -146,17 +158,17 @@ python3 -m pytest tests/policy_sanity/ -v \
 
 ```bash
 # Run a specific test file
-python3 -m pytest tests/policy_sanity/test_sni_matching.py -v
+poetry run pytest python/tests/policy_sanity/test_sni_matching.py -v
 
 # Run a single test
-python3 -m pytest tests/policy_sanity/test_policy_sanity.py::test_ipv4_drop -v
+poetry run pytest python/tests/policy_sanity/test_policy_sanity.py::test_ipv4_drop -v
 ```
 
 ---
 
 ### ips_ids — Suricata IPS/IDS
 
-**Topology:** `tests/ips_ids/ips_ids.yaml`  
+**Topology:** `python/tests/ips_ids/ips_ids.yaml`  
 **VMs:** 2 — `server` (policy-engine + Suricata), `client` (traffic source)  
 **Network:** `net1` — 10.1.1.0/24, 2001:db8:1::/64  
 **Memory:** server=2GB (Suricata needs more RAM)
@@ -164,10 +176,8 @@ python3 -m pytest tests/policy_sanity/test_policy_sanity.py::test_ipv4_drop -v
 **Package required:** `policy-engine-ips` or `policy-engine-ips-ipfix`
 
 ```bash
-netsim start tests/ips_ids/ips_ids.yaml
-
-python3 -m pytest tests/ips_ids/ -v \
-    --install-packages ../policy-engine-ips_*.deb
+poetry run pytest python/tests/ips_ids/ -v \
+    --package-dir ..
 ```
 
 **Test files and what they cover:**
@@ -180,27 +190,25 @@ python3 -m pytest tests/ips_ids/ -v \
 
 ```bash
 # Run only IPS traffic tests
-python3 -m pytest tests/ips_ids/test_ips_traffic.py -v
+poetry run pytest python/tests/ips_ids/test_ips_traffic.py -v
 
 # Run with verbose Suricata log output
-python3 -m pytest tests/ips_ids/ -v -s
+poetry run pytest python/tests/ips_ids/ -v -s
 ```
 
 ---
 
 ### ipfix — Flow Export
 
-**Topology:** `tests/ipfix/ipfix.yaml`  
+**Topology:** `python/tests/ipfix/ipfix.yaml`  
 **VMs:** 2 — `server` (policy-engine with IPFIX), `client` (traffic source)  
 **Network:** `net1` — 10.1.1.0/24, 2001:db8:1::/64
 
 **Package required:** `policy-engine-ipfix` or `policy-engine-ips-ipfix`
 
 ```bash
-netsim start tests/ipfix/ipfix.yaml
-
-python3 -m pytest tests/ipfix/ -v \
-    --install-packages ../policy-engine-ipfix_*.deb
+poetry run pytest python/tests/ipfix/ -v \
+    --package-dir ..
 ```
 
 **Test files and what they cover:**
@@ -214,17 +222,15 @@ python3 -m pytest tests/ipfix/ -v \
 
 ### mac_matching — Layer 2 Filtering
 
-**Topology:** `tests/mac_matching/mac_matching.yaml`  
+**Topology:** `python/tests/mac_matching/mac_matching.yaml`  
 **VMs:** 2 — `server` (policy-engine), `client` (traffic source)  
 **Network:** `net1` — 10.2.1.0/24, 2001:db8:2::/64
 
 **Package required:** `policy-engine`
 
 ```bash
-netsim start tests/mac_matching/mac_matching.yaml
-
-python3 -m pytest tests/mac_matching/ -v \
-    --install-packages ../policy-engine_*.deb
+poetry run pytest python/tests/mac_matching/ -v \
+    --package-dir ..
 ```
 
 **Test file:** `test_mac_matching.py`
@@ -241,7 +247,7 @@ What is tested:
 
 ### xdp_forwarding — FIB Forwarding
 
-**Topology:** `tests/xdp_forwarding/xdp_forwarding.yaml`  
+**Topology:** `python/tests/xdp_forwarding/xdp_forwarding.yaml`  
 **VMs:** 3 — `client` (net1), `transit` (net1+net2, policy-engine), `server` (net2)  
 **Networks:** `net1` — 10.1.1.0/24 and `net2` — 10.1.2.0/24
 
@@ -251,10 +257,8 @@ with policy-engine attached on both interfaces.
 **Package required:** `policy-engine`
 
 ```bash
-netsim start tests/xdp_forwarding/xdp_forwarding.yaml
-
-python3 -m pytest tests/xdp_forwarding/ -v \
-    --install-packages ../policy-engine_*.deb
+poetry run pytest python/tests/xdp_forwarding/ -v \
+    --package-dir ..
 ```
 
 **Test file:** `test_xdp_forwarding.py`
@@ -271,17 +275,15 @@ What is tested:
 
 ### rule_lifecycle — TTL and Scheduled Rules
 
-**Topology:** `tests/rule_lifecycle/rule_lifecycle.yaml`  
+**Topology:** `python/tests/rule_lifecycle/rule_lifecycle.yaml`  
 **VMs:** 2 — `server` (policy-engine), `client` (traffic source)  
 **Network:** `net1` — 10.1.1.0/24, 2001:db8:1::/64
 
 **Package required:** `policy-engine`
 
 ```bash
-netsim start tests/rule_lifecycle/rule_lifecycle.yaml
-
-python3 -m pytest tests/rule_lifecycle/ -v \
-    --install-packages ../policy-engine_*.deb
+poetry run pytest python/tests/rule_lifecycle/ -v \
+    --package-dir ..
 ```
 
 **Test files and what they cover:**
@@ -299,17 +301,15 @@ python3 -m pytest tests/rule_lifecycle/ -v \
 
 ### persistence — State Across Restarts
 
-**Topology:** `tests/persistence/persistence.yaml`  
+**Topology:** `python/tests/persistence/persistence.yaml`  
 **VMs:** 2 — `server` (policy-engine), `client` (traffic source)  
 **Network:** `net1` — 10.1.1.0/24, 2001:db8:1::/64
 
 **Package required:** `policy-engine`
 
 ```bash
-netsim start tests/persistence/persistence.yaml
-
-python3 -m pytest tests/persistence/ -v \
-    --install-packages ../policy-engine_*.deb
+poetry run pytest python/tests/persistence/ -v \
+    --package-dir ..
 ```
 
 **Test file:** `test_state_persistence.py`
@@ -326,16 +326,14 @@ What is tested:
 
 ### tls — HTTPS and Certificate Validation
 
-**Topology:** `tests/tls/tls.yaml`  
+**Topology:** `python/tests/tls/tls.yaml`  
 **VMs:** 1 — `server` (policy-engine with TLS)
 
 **Package required:** `policy-engine`
 
 ```bash
-netsim start tests/tls/tls.yaml
-
-python3 -m pytest tests/tls/ -v \
-    --install-packages ../policy-engine_*.deb
+poetry run pytest python/tests/tls/ -v \
+    --package-dir ..
 ```
 
 **Test files and what they cover:**
@@ -349,7 +347,7 @@ python3 -m pytest tests/tls/ -v \
 
 ### multi_node — Fleet Controller
 
-**Topology:** `tests/multi_node/multi_node.yaml`  
+**Topology:** `python/tests/multi_node/multi_node.yaml`  
 **VMs:** 4 — `controller`, `node1`, `node2`, `node3`  
 **Networks:** `mgmt` — 10.10.0.0/24 (all VMs), `data` — 10.20.0.0/24 (nodes only)
 
@@ -360,10 +358,8 @@ This is the largest topology and exercises the complete fleet management workflo
 - On nodes: `policy-engine`, `policy-node-agent`
 
 ```bash
-netsim start tests/multi_node/multi_node.yaml
-
-python3 -m pytest tests/multi_node/ -v \
-    --install-packages \
+poetry run pytest python/tests/multi_node/ -v \
+    --package-dir ..
         /path/to/policy-engine_*.deb,\
         /path/to/policy-node-agent_*.deb,\
         /path/to/policy-controller_*.deb,\
@@ -427,13 +423,13 @@ Verifies certificate revocation.
 
 ```bash
 # Only enrollment tests
-python3 -m pytest tests/multi_node/test_multi_node.py::TestEnrollment -v
+poetry run pytest python/tests/multi_node/test_multi_node.py::TestEnrollment -v
 
 # Only config distribution
-python3 -m pytest tests/multi_node/test_multi_node.py::TestConfigDistribution -v
+poetry run pytest python/tests/multi_node/test_multi_node.py::TestConfigDistribution -v
 
 # Only decommission
-python3 -m pytest tests/multi_node/test_multi_node.py::TestDecommission -v
+poetry run pytest python/tests/multi_node/test_multi_node.py::TestDecommission -v
 ```
 
 **Fixture scoping:** All fixtures are `package`-scoped, meaning VMs are started once and
@@ -442,67 +438,24 @@ once; subsequent tests reuse the same enrolled state.
 
 ---
 
-### two_node_iperf — Throughput
+### iperf throughput — in the netsim repo
 
-**Topology:** `tests/two_node_iperf/two_node_iperf.yaml`  
-**VMs:** 2 — `server`, `client`
-
-**Package required:** `policy-engine`
-
-```bash
-netsim start tests/two_node_iperf/two_node_iperf.yaml
-
-python3 -m pytest tests/two_node_iperf/ -v \
-    --install-packages ../policy-engine_*.deb
-```
-
-**Test file:** `test_two_node_iperf.py`
-
-What is tested:
-- Baseline iperf3 throughput without policy-engine
-- Throughput with XDP attached (PASS rules only)
-- Throughput impact of DROP rules
-- Throughput impact of LOG rules
-- Verifies BPF processing overhead is within acceptable bounds
-
----
-
-### three_node_iperf — Multi-hop Throughput
-
-**Topology:** `tests/three_node_iperf/three_node_iperf.yaml`  
-**VMs:** 3 — `client`, `transit` (policy-engine + routing), `server`
-
-**Package required:** `policy-engine`
-
-```bash
-netsim start tests/three_node_iperf/three_node_iperf.yaml
-
-python3 -m pytest tests/three_node_iperf/ -v \
-    --install-packages ../policy-engine_*.deb
-```
-
-**Test file:** `test_three_node_iperf.py`
-
-What is tested:
-- Client → transit → server throughput without FIB forwarding (kernel routing)
-- Client → transit → server throughput with FIB forwarding enabled (XDP redirect)
-- Verifies FIB forwarding provides measurable throughput improvement
-- Verifies policy rules are enforced even with FIB forwarding active
+`two_node_iperf` and `three_node_iperf` measure raw and multi-hop throughput on a bare
+topology. They test netsim itself rather than policy-engine, so they live in the netsim
+repo under `tests/`.
 
 ---
 
 ### policy_performance — Rule Lookup Performance
 
-**Topology:** `tests/policy_performance/policy_performance.yaml`
+**Topology:** `python/tests/policy_performance/policy_performance.yaml`
 **VMs:** 2 — `server` (policy-engine), `client` (traffic source)
 
 **Package required:** `policy-engine`
 
 ```bash
-netsim start tests/policy_performance/policy_performance.yaml
-
-python3 -m pytest tests/policy_performance/ -v \
-    --install-packages ../policy-engine_*.deb
+poetry run pytest python/tests/policy_performance/ -v \
+    --package-dir ..
 ```
 
 **Test file:** `test_rule_performance.py`
@@ -515,7 +468,7 @@ What is tested:
 
 ### scale_test — Fleet Scale
 
-**Topology:** `tests/scale_test/scale_test.yaml`
+**Topology:** `python/tests/scale_test/scale_test.yaml`
 **VMs:** 2 — `controller` (policy-controller), `docker-host` (runs N engine+agent
 container pairs on a docker bridge)
 **Network:** `mgmt` — 10.10.0.0/24
@@ -534,10 +487,8 @@ make docker-images   # or whatever target builds the local images
 ```
 
 ```bash
-netsim start tests/scale_test/scale_test.yaml
-
-python3 -m pytest tests/scale_test/ -v \
-    --install-packages ../policy-controller_*.deb \
+poetry run pytest python/tests/scale_test/ -v \
+    --package-dir ..
     --scale-nodes 10
 ```
 
@@ -566,41 +517,41 @@ What is tested:
 ### By suite
 
 ```bash
-python3 -m pytest tests/policy_sanity/ -v
-python3 -m pytest tests/ips_ids/ -v
-python3 -m pytest tests/multi_node/ -v
+poetry run pytest python/tests/policy_sanity/ -v
+poetry run pytest python/tests/ips_ids/ -v
+poetry run pytest python/tests/multi_node/ -v
 ```
 
 ### By test class
 
 ```bash
-python3 -m pytest tests/multi_node/test_multi_node.py::TestEnrollment -v
+poetry run pytest python/tests/multi_node/test_multi_node.py::TestEnrollment -v
 ```
 
 ### By test name
 
 ```bash
-python3 -m pytest tests/policy_sanity/test_policy_sanity.py::test_ipv4_drop -v
-python3 -m pytest -k "test_sni" -v
-python3 -m pytest -k "ttl" -v
+poetry run pytest python/tests/policy_sanity/test_policy_sanity.py::test_ipv4_drop -v
+poetry run pytest -k "test_sni" -v
+poetry run pytest -k "ttl" -v
 ```
 
 ### With output captured (useful for debugging)
 
 ```bash
-python3 -m pytest tests/ips_ids/ -v -s
+poetry run pytest python/tests/ips_ids/ -v -s
 ```
 
 ### Re-run failed tests only
 
 ```bash
-python3 -m pytest tests/policy_sanity/ -v --lf
+poetry run pytest python/tests/policy_sanity/ -v --lf
 ```
 
 ### Parallel test execution
 
 ```bash
-python3 -m pytest tests/policy_sanity/ -v -n auto  # requires pytest-xdist
+poetry run pytest python/tests/policy_sanity/ -v -n auto  # requires pytest-xdist
 ```
 
 ---
@@ -654,16 +605,17 @@ curl -s -X POST -H 'Content-Type: application/json' \
 Add `-s` to see SSH command output and test logging:
 
 ```bash
-python3 -m pytest tests/multi_node/ -v -s --log-cli-level=DEBUG
+poetry run pytest python/tests/multi_node/ -v -s --log-cli-level=DEBUG
 ```
 
 ### Package installation failures
 
-If `--install-packages` fails, check that the `.deb` path is correct and the package is
-compatible with Debian 13 (Trixie):
+pytest validates every package glob before booting a VM, so a bad `--package-dir` or a
+missing build fails immediately with the offending pattern named. If installation itself
+fails, check the package is compatible with Debian 13 (Trixie):
 
 ```bash
-netsim connect tests/policy_sanity/policy_sanity.yaml server
+netsim connect python/tests/policy_sanity/policy_sanity.yaml server
 # Inside VM:
 dpkg -i /tmp/policy-engine_*.deb
 apt-get install -f
@@ -684,8 +636,6 @@ apt-get install -f
 | persistence | persistence.yaml | 2: server, client | net1: 10.1.1.0/24 + IPv6 | Reboot required |
 | tls | tls.yaml | 1: server | net1: 10.1.1.0/24 + IPv6 | |
 | multi_node | multi_node.yaml | 4: controller + node1/2/3 | mgmt: 10.10.0.0/24, data: 10.20.0.0/24 | Fleet tests |
-| two_node_iperf | two_node_iperf.yaml | 2: server, client | – | iperf3 required |
-| three_node_iperf | three_node_iperf.yaml | 3: client, transit, server | – | iperf3 required |
 | policy_performance | policy_performance.yaml | 2: server, client | net1: 10.1.1.0/24 + IPv6 | Rule-lookup perf |
 | scale_test | scale_test.yaml | 2: controller, docker-host | mgmt: 10.10.0.0/24 | Engine/agent run as Docker containers |
 
@@ -695,16 +645,18 @@ All VMs use the Debian 13 (Trixie) genericcloud amd64 image.
 
 ## Running All Test Suites
 
-Use the `tests/run_all.sh` wrapper. It auto-discovers every `tests/<name>/<name>.yaml`,
-selects the right `--install-packages` set per suite, starts/destroys the topology
-between suites, and prints a pass/fail summary at the end (takes 30–60 minutes).
+Use the `python/run_all.sh` wrapper. It auto-discovers every
+`python/tests/<name>/<name>.yaml`, runs the suites in sequence, and prints a pass/fail
+summary at the end (takes 30–60 minutes).
 
 ```bash
-cd netsim
-tests/run_all.sh ..             # PKG_DIR defaults to the parent directory
+python/run_all.sh                       # PKG_DIR defaults to ../..
 # or point at a staging dir of .debs:
-tests/run_all.sh /tmp/policy-packages
+python/run_all.sh /tmp/policy-packages
 ```
+
+Equivalently, `make test-integration`, or `make test-integration SUITE=policy_sanity`
+for one.
 
 Overrides (env vars):
 
