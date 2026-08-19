@@ -1,0 +1,78 @@
+name: "fleet-ips-ids"
+version: "1.0"
+package_dir: "../../../.."
+
+# Fleet-wide Suricata IPS/IDS: a controller managing two suricata-capable
+# engine nodes plus one plain (non-suricata) node for capability-gating tests.
+
+networks:
+  - name: "mgmt"
+    subnet: "10.10.0.0/24"
+    mtu: 1500
+
+  - name: "data"
+    subnet: "10.20.0.0/24"
+    mtu: 1500
+
+nodes:
+  # Controller node — runs policy-controller daemon.
+  - name: "controller"
+    image:
+      name: "debian-13-genericcloud"
+      url: "https://cloud.debian.org/images/cloud/trixie/20260413-2447/debian-13-genericcloud-amd64-20260413-2447.qcow2"
+      checksum: "3d020c868339c8387f6f40f63e6b5ccb6174e6f2963510cb51cacfd6618244e96549d1b60b3d629df3963cb5350c6dfaf5cf34998301aa578b9d455a76d3c434"
+    memory: 512
+    vcpus: 1
+    networks:
+      - "mgmt"
+    packages:
+      - "policy-controller_*.deb"
+      - "policy-controller-client_*.deb"
+
+  # node1 / node2: suricata-capable engines (policy-engine-ips) + agent.
+  - name: "node1"
+    image:
+      name: "debian-13-genericcloud"
+      url: "https://cloud.debian.org/images/cloud/trixie/20260413-2447/debian-13-genericcloud-amd64-20260413-2447.qcow2"
+      checksum: "3d020c868339c8387f6f40f63e6b5ccb6174e6f2963510cb51cacfd6618244e96549d1b60b3d629df3963cb5350c6dfaf5cf34998301aa578b9d455a76d3c434"
+    memory: 2048
+    vcpus: 2
+    networks:
+      - "mgmt"
+      - "data"
+    packages:
+      - "policy-engine-ips_*.deb"
+      - "policy-engine-client_*.deb"
+      - "policy-node-agent_*.deb"
+
+  - name: "node2"
+    image:
+      name: "debian-13-genericcloud"
+      url: "https://cloud.debian.org/images/cloud/trixie/20260413-2447/debian-13-genericcloud-amd64-20260413-2447.qcow2"
+      checksum: "3d020c868339c8387f6f40f63e6b5ccb6174e6f2963510cb51cacfd6618244e96549d1b60b3d629df3963cb5350c6dfaf5cf34998301aa578b9d455a76d3c434"
+    memory: 2048
+    vcpus: 2
+    networks:
+      - "mgmt"
+      - "data"
+    packages:
+      - "policy-engine-ips_*.deb"
+      - "policy-engine-client_*.deb"
+      - "policy-node-agent_*.deb"
+
+  # plain: a NON-suricata engine (plain policy-engine deb) for capability
+  # gating — setInspectMode / ruleset assignment must be rejected here.
+  - name: "plain"
+    image:
+      name: "debian-13-genericcloud"
+      url: "https://cloud.debian.org/images/cloud/trixie/20260413-2447/debian-13-genericcloud-amd64-20260413-2447.qcow2"
+      checksum: "3d020c868339c8387f6f40f63e6b5ccb6174e6f2963510cb51cacfd6618244e96549d1b60b3d629df3963cb5350c6dfaf5cf34998301aa578b9d455a76d3c434"
+    memory: 1024
+    vcpus: 2
+    networks:
+      - "mgmt"
+      - "data"
+    packages:
+      - "policy-engine_*.deb"
+      - "policy-engine-client_*.deb"
+      - "policy-node-agent_*.deb"

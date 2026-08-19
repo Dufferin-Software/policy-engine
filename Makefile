@@ -59,7 +59,8 @@ deb:
 	  cat debian/changelog.deb-orig; } > debian/changelog; \
 	$(if $(_DEB_PROFILES),DEB_BUILD_PROFILES="$(_DEB_PROFILES)" )dpkg-buildpackage --no-sign -uc -us -b
 
-.PHONY: verify-bpf lint lint-rust lint-bpf fmt coverage lint-web build-web ci
+.PHONY: verify-bpf lint lint-rust lint-bpf lint-python fmt fmt-python coverage \
+	lint-web build-web ci test-integration
 
 # Load BPF programs into the kernel to confirm the verifier accepts them.
 # Compiles from source with clang (matching libbpf_cargo flags), then uses
@@ -94,7 +95,7 @@ verify-bpf:
 	@echo "BPF verifier: all programs accepted (base + SURICATA_IPS)."
 
 # Run all linters
-lint: lint-rust lint-bpf
+lint: lint-rust lint-bpf lint-python
 
 # Rust linting: formatting check + clippy
 lint-rust:
@@ -115,6 +116,32 @@ lint-bpf:
 		else \
 			echo "clang-format not found; skipping format check for BPF files"; \
 		fi; \
+	fi
+
+# Python linting: ruff + mypy over python/ (the integration tests and clients)
+lint-python:
+	@command -v poetry >/dev/null || { echo "poetry not found in PATH"; exit 1; }
+	@echo "Running ruff..."
+	poetry run ruff check python/
+	poetry run ruff format --check python/
+	@echo "Running mypy..."
+	poetry run mypy
+
+# Format the Python sources in-place
+fmt-python:
+	poetry run ruff format python/
+	poetry run ruff check --fix python/
+
+# Integration tests. Needs libvirt (see python/README.md) and the .debs built
+# by `make deb`, which land in the parent directory.
+#
+#   make test-integration                        every suite
+#   make test-integration SUITE=policy_sanity    just one
+test-integration:
+	@if [ -n "$(SUITE)" ]; then \
+		poetry run pytest python/tests/$(SUITE)/ --package-dir ..; \
+	else \
+		python/run_all.sh; \
 	fi
 
 # Format both Rust and BPF sources in-place

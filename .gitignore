@@ -10,3 +10,8 @@
 node_modules
 __pycache__/
 *.pyc
+
+# Python integration tests
+.venv/
+pytest.log
+pytest-logs/

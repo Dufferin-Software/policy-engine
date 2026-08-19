@@ -1,0 +1,121 @@
+name: "rotation"
+version: "1.0"
+package_dir: "../../../.."
+
+networks:
+  - name: "mgmt"
+    subnet: "10.11.0.0/24"
+    mtu: 1500
+
+nodes:
+  # Controller node — runs policy-controller daemon
+  - name: "controller"
+    image:
+      name: "debian-13-genericcloud"
+      url: "https://cloud.debian.org/images/cloud/trixie/20260413-2447/debian-13-genericcloud-amd64-20260413-2447.qcow2"
+      checksum: "3d020c868339c8387f6f40f63e6b5ccb6174e6f2963510cb51cacfd6618244e96549d1b60b3d629df3963cb5350c6dfaf5cf34998301aa578b9d455a76d3c434"
+    memory: 512
+    vcpus: 1
+    networks:
+      - "mgmt"
+    packages:
+      - "policy-controller_*.deb"
+      - "policy-controller-client_*.deb"
+
+  # Managed nodes — run policy-engine + policy-node-agent.
+  #
+  # The rotation suite covers two kinds of credential-lifecycle behaviour:
+  #   * Per-node mechanics (single-node renewal + decommission TLS rejection).
+  #     These live in test_cert_renewal.py / test_tls_revocation.py and only
+  #     touch node1.
+  #   * Fleet-level revocation behaviour (sibling isolation, revoke-while-
+  #     offline, revocation persistence across controller restart). These
+  #     live in test_multi_node_revocation.py and decommission node2 / node3
+  #     so node1 stays available for the single-node tests regardless of
+  #     pytest collection order.
+  - name: "node1"
+    image:
+      name: "debian-13-genericcloud"
+      url: "https://cloud.debian.org/images/cloud/trixie/20260413-2447/debian-13-genericcloud-amd64-20260413-2447.qcow2"
+      checksum: "3d020c868339c8387f6f40f63e6b5ccb6174e6f2963510cb51cacfd6618244e96549d1b60b3d629df3963cb5350c6dfaf5cf34998301aa578b9d455a76d3c434"
+    memory: 1024
+    vcpus: 2
+    networks:
+      - "mgmt"
+    packages:
+      features:
+        vanilla:
+          - "policy-engine_*.deb"
+          - "policy-engine-client_*.deb"
+          - "policy-node-agent_*.deb"
+        ips:
+          - "policy-engine-ips_*.deb"
+          - "policy-engine-client_*.deb"
+          - "policy-node-agent_*.deb"
+        ipfix:
+          - "policy-engine-ipfix_*.deb"
+          - "policy-engine-client_*.deb"
+          - "policy-node-agent_*.deb"
+        ips-ipfix:
+          - "policy-engine-ips-ipfix_*.deb"
+          - "policy-engine-client_*.deb"
+          - "policy-node-agent_*.deb"
+
+
+  - name: "node2"
+    image:
+      name: "debian-13-genericcloud"
+      url: "https://cloud.debian.org/images/cloud/trixie/20260413-2447/debian-13-genericcloud-amd64-20260413-2447.qcow2"
+      checksum: "3d020c868339c8387f6f40f63e6b5ccb6174e6f2963510cb51cacfd6618244e96549d1b60b3d629df3963cb5350c6dfaf5cf34998301aa578b9d455a76d3c434"
+    memory: 1024
+    vcpus: 2
+    networks:
+      - "mgmt"
+    packages:
+      features:
+        vanilla:
+          - "policy-engine_*.deb"
+          - "policy-engine-client_*.deb"
+          - "policy-node-agent_*.deb"
+        ips:
+          - "policy-engine-ips_*.deb"
+          - "policy-engine-client_*.deb"
+          - "policy-node-agent_*.deb"
+        ipfix:
+          - "policy-engine-ipfix_*.deb"
+          - "policy-engine-client_*.deb"
+          - "policy-node-agent_*.deb"
+        ips-ipfix:
+          - "policy-engine-ips-ipfix_*.deb"
+          - "policy-engine-client_*.deb"
+          - "policy-node-agent_*.deb"
+
+
+  - name: "node3"
+    image:
+      name: "debian-13-genericcloud"
+      url: "https://cloud.debian.org/images/cloud/trixie/20260413-2447/debian-13-genericcloud-amd64-20260413-2447.qcow2"
+      checksum: "3d020c868339c8387f6f40f63e6b5ccb6174e6f2963510cb51cacfd6618244e96549d1b60b3d629df3963cb5350c6dfaf5cf34998301aa578b9d455a76d3c434"
+    memory: 1024
+    vcpus: 2
+    networks:
+      - "mgmt"
+    packages:
+      features:
+        vanilla:
+          - "policy-engine_*.deb"
+          - "policy-engine-client_*.deb"
+          - "policy-node-agent_*.deb"
+        ips:
+          - "policy-engine-ips_*.deb"
+          - "policy-engine-client_*.deb"
+          - "policy-node-agent_*.deb"
+        ipfix:
+          - "policy-engine-ipfix_*.deb"
+          - "policy-engine-client_*.deb"
+          - "policy-node-agent_*.deb"
+        ips-ipfix:
+          - "policy-engine-ips-ipfix_*.deb"
+          - "policy-engine-client_*.deb"
+          - "policy-node-agent_*.deb"
+
