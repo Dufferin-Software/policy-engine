@@ -62,6 +62,11 @@ selects which set a node installs where the topology declares several:
 poetry run pytest python/tests/ips_ids/ --feature ips --package-dir ..
 ```
 
+Run one suite at a time. `tests/` is a single Python package, so pytest resolves the
+package-scoped topology fixture once for the whole tree — naming two suites in one
+invocation makes the second run against the first one's VMs. `run_all.sh` invokes pytest
+once per suite for exactly this reason.
+
 Everything, with a summary table and per-suite logs in `pytest-logs/`:
 
 ```bash

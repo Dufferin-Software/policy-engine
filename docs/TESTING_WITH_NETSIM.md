@@ -119,6 +119,11 @@ install:
 poetry run pytest python/tests/ips_ids/ --feature ips --package-dir ..
 ```
 
+Run one suite per invocation. `python/tests/` is a single Python package, so pytest sets
+up the package-scoped topology once for the whole tree; naming two suites at once makes
+the second run against the first one's VMs. `python/run_all.sh` calls pytest once per
+suite for this reason.
+
 > **Tip:** `--pause-on-failure` keeps the topology up when a test fails and prints the
 > `ssh` command for each node.
 

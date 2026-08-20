@@ -66,7 +66,7 @@ for suite in $SUITES; do
 
   # pytest owns the topology: the autouse running_topology fixture boots the
   # VMs and destroys them again, including after a failure.
-  if ! python3 -m pytest "tests/$suite/" -v \
+  if ! poetry run pytest "tests/$suite/" -v \
       --package-dir "$PKG_DIR" 2>&1 | tee "$log"; then
     status=FAIL
   fi
