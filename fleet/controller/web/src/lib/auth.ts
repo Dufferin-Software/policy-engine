@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
+// Copyright (C) 2026 Peter Morrow <pdmorrow@gmail.com>
 
 // Operator-session token storage for controller-web. See
 // docs/login-flow.md for the full flow.

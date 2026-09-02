@@ -24,7 +24,7 @@ phase works. Also we should ideally update the Python clients in
 
 Lives in `python/`: the suites in `python/tests/<suite>/` and the Python clients they
 drive in `python/policy_engine_client/`. Each suite boots real VMs via
-[netsim](https://github.com/Dufferin-Software/netsim), which is a dependency and supplies
+[netsim](https://github.com/pdmorrow/netsim), which is a dependency and supplies
 the topology/SSH/package fixtures — see `python/README.md` and
 `docs/TESTING_WITH_NETSIM.md`.
 

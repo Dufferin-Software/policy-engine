@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Action-loop semantics for SNI matches.

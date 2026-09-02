@@ -5,7 +5,7 @@ Debian 13 VMs, install the built packages, and verify end-to-end behavior includ
 program loading, traffic enforcement, IPS/IDS, IPFIX flow export, XDP forwarding, multi-node
 fleet management, and more.
 
-The VMs come from [netsim](https://github.com/Dufferin-Software/netsim), a libvirt/QEMU
+The VMs come from [netsim](https://github.com/pdmorrow/netsim), a libvirt/QEMU
 topology simulator this project depends on. netsim supplies the topology, VM lifecycle, SSH
 access and package installation as pytest fixtures; the suites themselves are ours. See
 `python/README.md` for the layout.
@@ -53,7 +53,7 @@ poetry install
 The libvirt user session is configured once, with the script from a netsim checkout:
 
 ```bash
-git clone git@github.com:Dufferin-Software/netsim.git
+git clone git@github.com:pdmorrow/netsim.git
 netsim/setup-user-mode.sh    # configures libvirt user session + sudoers
 ```
 

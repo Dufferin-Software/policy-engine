@@ -15,7 +15,7 @@ packages = [{include = "policy_engine_client", from = "python"}]
 
 [tool.poetry.dependencies]
 python = ">=3.11,<4.0"
-netsim = {git = "ssh://git@github.com/Dufferin-Software/netsim.git", tag = "v0.2.0", extras = ["testkit"]}
+netsim = {git = "ssh://git@github.com/pdmorrow/netsim.git", tag = "v0.2.0", extras = ["testkit"]}
 
 [tool.poetry.group.dev.dependencies]
 ruff = "^0.14.14"

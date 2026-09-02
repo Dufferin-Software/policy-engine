@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Regression test: a controller-driven fleet rule must not echo back as a

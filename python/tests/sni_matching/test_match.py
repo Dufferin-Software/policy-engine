@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 End-to-end SNI matching: real handshake on the wire → BPF/userspace

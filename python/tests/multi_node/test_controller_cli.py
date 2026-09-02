@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 policy-controller-client CLI smoke tests.

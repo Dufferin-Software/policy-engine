@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Multi-node attach/detach and traffic enforcement tests.

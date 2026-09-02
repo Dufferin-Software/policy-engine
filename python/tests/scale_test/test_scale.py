@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Scale tests: enrollment and policy distribution across N Docker-based nodes.

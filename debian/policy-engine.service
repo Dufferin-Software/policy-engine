@@ -1,6 +1,6 @@
 [Unit]
 Description=XDP Policy Engine Server
-Documentation=https://github.com/dufferinsw/policy_engine
+Documentation=https://github.com/pdmorrow/policy-engine
 After=network.target
 # Ensure bpffs is mounted before we start; the pin directory is created by
 # tmpfiles.d (policy-engine.conf) which runs as part of sysinit.target.

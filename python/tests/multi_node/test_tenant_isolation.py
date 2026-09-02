@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Tenant isolation end-to-end (commit 03530bf, "controller: finish RBAC

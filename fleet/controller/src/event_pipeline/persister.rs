@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
+// Copyright (C) 2026 Peter Morrow <pdmorrow@gmail.com>
 
 //! Background task that subscribes to the event bus, parses each batch
 //! into typed [`PolicyEvent`]s, and appends them to the in-memory

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Send a single TLS ClientHello with a chosen SNI over a real TCP connection.

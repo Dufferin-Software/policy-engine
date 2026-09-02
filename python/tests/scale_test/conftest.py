@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Fixtures for scale testing: many policy-engine + policy-node-agent container

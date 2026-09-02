@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
+// Copyright (C) 2026 Peter Morrow <pdmorrow@gmail.com>
 
 //! Event pipeline: buffers policy match events shipped from agents over the
 //! gRPC `EventBatch` channel. Events are held in memory only — never

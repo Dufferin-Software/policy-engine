@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Phase 7 cert renewal — end-to-end on the netsim rotation topology.

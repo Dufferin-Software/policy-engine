@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Tests for the --interface filter on rule list, flush, and managed-rules commands.

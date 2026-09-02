@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
+// Copyright (C) 2026 Peter Morrow <pdmorrow@gmail.com>
 
 //! Detects local config changes on the policy-engine (e.g., rules added via CLI)
 //! by comparing current state against a known baseline.

@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Large-ClientHello path: ``bpf_skb_pull_data`` and ``SNI_PULL_MAX``.

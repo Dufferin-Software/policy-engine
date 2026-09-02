@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Fixtures for uRPF (unicast Reverse Path Forwarding) integration tests.

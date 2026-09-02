@@ -558,7 +558,7 @@ testkit = ["paramiko (>=3.0,<4.0)", "pytest (>=7.0,<8.0)"]
 
 [package.source]
 type = "git"
-url = "ssh://git@github.com/Dufferin-Software/netsim.git"
+url = "ssh://git@github.com/pdmorrow/netsim.git"
 reference = "v0.2.0"
 resolved_reference = "09a5fa0138cc1e567c83a14f2fdfa750a103aff3"
 
@@ -875,4 +875,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<4.0"
-content-hash = "8e0465e8e0641cea73feb7194aebbdd197f19c0b27a2bc1a0fa87853ff911af9"
+content-hash = "2765fc0345086c47edb52f56b1008001aa016d09c30208c1ba9e57bdab9e80ad"

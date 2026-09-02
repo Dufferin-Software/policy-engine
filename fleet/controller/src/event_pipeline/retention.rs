@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
+// Copyright (C) 2026 Peter Morrow <pdmorrow@gmail.com>
 
 //! Background retention task: deletes alert rows older than the tenant's
 //! `retention_s` (chunked to avoid long write locks on SQLite) and ages

@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 HTTP/3 ↔ TCP fallback story (real-world deployment footgun).

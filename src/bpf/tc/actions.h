@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 2026 Dufferin Software <support@dufferinsw.com> */
+/* Copyright (C) 2026 Peter Morrow <pdmorrow@gmail.com> */
 
 #pragma once
 

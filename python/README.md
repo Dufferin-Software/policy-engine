@@ -1,7 +1,7 @@
 # Integration tests
 
 End-to-end tests for policy-engine and the fleet controller, run against
-Debian VMs on a [netsim](https://github.com/Dufferin-Software/netsim)
+Debian VMs on a [netsim](https://github.com/pdmorrow/netsim)
 topology. Each suite is a directory holding its own topology YAML, its
 fixtures, and its tests.
 
@@ -34,7 +34,7 @@ Configure the libvirt user session once, using the script from a netsim
 checkout:
 
 ```bash
-git clone git@github.com:Dufferin-Software/netsim.git
+git clone git@github.com:pdmorrow/netsim.git
 netsim/setup-user-mode.sh
 ```
 

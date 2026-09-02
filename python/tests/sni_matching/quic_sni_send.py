@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Fire a single real QUIC v1 or v2 Initial packet with a chosen SNI.

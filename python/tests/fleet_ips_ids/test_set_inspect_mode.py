@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Fleet IPS/IDS: controller-driven inspect mode + per-interface enable.

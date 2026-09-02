@@ -1,10 +1,10 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: policy-engine-web
-Upstream-Contact: Dufferin Software <support@dufferinsw.com>
-Source: https://github.com/dufferinsw/policy_engine
+Upstream-Contact: Peter Morrow <pdmorrow@gmail.com>
+Source: https://github.com/pdmorrow/policy-engine
 
 Files: *
-Copyright: 2026 Dufferin Software
+Copyright: 2026 Peter Morrow
 License: GPL-2.0-or-later
 
 License: GPL-2.0-or-later

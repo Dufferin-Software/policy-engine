@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Fixtures for rule lifecycle (TTL, schedule, event stream) tests.

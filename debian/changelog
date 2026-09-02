@@ -7,4 +7,4 @@ policy-engine (0.1.0) unstable; urgency=medium
   * IPv4 and IPv6 support
   * Per-rule and global statistics
 
- -- Dufferin Software <support@dufferinsw.com>  Fri, 31 Jan 2026 12:00:00 +0000
+ -- Peter Morrow <pdmorrow@gmail.com>  Fri, 31 Jan 2026 12:00:00 +0000

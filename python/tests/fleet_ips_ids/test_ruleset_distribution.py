@@ -1,4 +1,4 @@
-# Copyright (c) Dufferin Software
+# Copyright (c) Peter Morrow
 
 """
 Fleet IPS/IDS: named Suricata ruleset distribution and drift reconcile.

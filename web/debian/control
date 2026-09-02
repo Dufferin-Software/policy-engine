@@ -1,12 +1,12 @@
 Source: policy-engine-web
 Section: net
 Priority: optional
-Maintainer: Dufferin Software <support@dufferinsw.com>
+Maintainer: Peter Morrow <pdmorrow@gmail.com>
 Build-Depends: debhelper-compat (= 13),
                nodejs (>= 18),
                npm
 Standards-Version: 4.6.2
-Homepage: https://github.com/dufferinsw/policy_engine
+Homepage: https://github.com/pdmorrow/policy-engine
 Rules-Requires-Root: no
 
 Package: policy-engine-web

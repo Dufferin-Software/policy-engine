@@ -14,7 +14,7 @@ Build-Depends: debhelper-compat (= 13),
                protobuf-compiler,
                libtss2-dev,
 Standards-Version: 4.6.2
-Homepage: https://github.com/dufferinsw/policy_engine
+Homepage: https://github.com/pdmorrow/policy-engine
 Rules-Requires-Root: no
 
 Package: policy-engine

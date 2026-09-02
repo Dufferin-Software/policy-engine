@@ -1,6 +1,6 @@
 [Unit]
 Description=Policy Node Agent
-Documentation=https://github.com/dufferinsw/policy_engine
+Documentation=https://github.com/pdmorrow/policy-engine
 After=network.target policy-engine.service
 Wants=policy-engine.service
 

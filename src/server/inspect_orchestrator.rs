@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Copyright (C) 2026 Dufferin Software <support@dufferinsw.com>
+// Copyright (C) 2026 Peter Morrow <pdmorrow@gmail.com>
 
 //! Suricata inspect orchestration: the system-level enable/disable sequence
 //! (veth pair, EVE consumer, Suricata config/timer) wrapped around the
